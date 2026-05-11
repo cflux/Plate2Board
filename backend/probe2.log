@@ -1,0 +1,14 @@
+WARNING: KICAD6_SYMBOL_DIR environment variable is missing, so the default KiCad symbol libraries won't be searched. @ [/host/<frozen importlib._bootstrap_external>:999=>/host/<frozen importlib._bootstrap>:488]
+WARNING: KICAD8_SYMBOL_DIR environment variable is missing, so the default KiCad symbol libraries won't be searched. @ [/host/<frozen importlib._bootstrap_external>:999=>/host/<frozen importlib._bootstrap>:488]
+WARNING: KICAD9_SYMBOL_DIR environment variable is missing, so the default KiCad symbol libraries won't be searched. @ [/host/<frozen importlib._bootstrap_external>:999=>/host/<frozen importlib._bootstrap>:488]
+WARNING: KICAD7_SYMBOL_DIR environment variable is missing, so the default KiCad symbol libraries won't be searched. @ [/host/<frozen importlib._bootstrap_external>:999=>/host/<frozen importlib._bootstrap>:488]
+WARNING: fp-lib-table file was not found. Component footprints are not available.
+WARNING: fp-lib-table file was not found. Component footprints are not available.
+WARNING: fp-lib-table file was not found. Component footprints are not available.
+WARNING: fp-lib-table file was not found. Component footprints are not available.
+INFO:   [auto_stub] power:  @ [/host/probe2.py:27]
+INFO:   [auto_stub] fanout>=2: N$2(2), ROW0(5), COL3(5), N$16(2), N$9(2), N$10(2), N$8(2), N$14(2), ROW1(5), N$12(2)... @ [/host/probe2.py:27]
+INFO: Schematic written to /tmp/tmp3dem16id/keyboard.kicad_sch @ [/host/probe2.py:27]
+INFO: 4 warnings found while generating schematic.
+INFO: 0 errors found while generating schematic.
+

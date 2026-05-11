@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+node_modules/
+dist/
+.vite/
+*.egg-info/
+
+# Session transcripts exported via /export
+*-this-session-is-being-continued-from-a-previous-c.txt
+
+# Per-user Claude Code settings (don't share auth-state across machines)
+.claude/settings.local.json

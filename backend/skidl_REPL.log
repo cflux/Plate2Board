@@ -1,0 +1,11 @@
+WARNING: KICAD6_SYMBOL_DIR environment variable is missing, so the default KiCad symbol libraries won't be searched. @ [/host/<frozen importlib._bootstrap_external>:999=>/host/<frozen importlib._bootstrap>:488]
+WARNING: KICAD8_SYMBOL_DIR environment variable is missing, so the default KiCad symbol libraries won't be searched. @ [/host/<frozen importlib._bootstrap_external>:999=>/host/<frozen importlib._bootstrap>:488]
+WARNING: KICAD9_SYMBOL_DIR environment variable is missing, so the default KiCad symbol libraries won't be searched. @ [/host/<frozen importlib._bootstrap_external>:999=>/host/<frozen importlib._bootstrap>:488]
+WARNING: KICAD7_SYMBOL_DIR environment variable is missing, so the default KiCad symbol libraries won't be searched. @ [/host/<frozen importlib._bootstrap_external>:999=>/host/<frozen importlib._bootstrap>:488]
+WARNING: fp-lib-table file was not found. Component footprints are not available.
+WARNING: fp-lib-table file was not found. Component footprints are not available.
+WARNING: fp-lib-table file was not found. Component footprints are not available.
+WARNING: fp-lib-table file was not found. Component footprints are not available.
+ERROR: Can't open file: Switch.
+ @ [/host/<string>:19]
+WARNING: Could not load KiCad schematic library "Switch", falling back to backup library. @ [/host/<string>:19]
