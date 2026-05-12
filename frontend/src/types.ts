@@ -1,8 +1,10 @@
-export type MatrixStrategy = 'row_first' | 'column_first' | 'stagger_aware'
+export type MatrixStrategy = 'row_first' | 'column_first' | 'stagger_aware' | 'auto'
 
 export type SwitchType = 'soldered' | 'hotswap'
 
 export type DiodeType = 'tht' | 'smd'
+
+export type StabilizerType = 'pcb_mount' | 'plate_mount'
 
 export interface SwitchDef {
   id: number
@@ -44,6 +46,12 @@ export interface UnclassifiedShape {
   rotation_deg: number
 }
 
+export interface McuPlacement {
+  cx_mm: number
+  cy_mm: number
+  rotation_deg: number
+}
+
 export interface ParseResult {
   svg_width_mm: number
   svg_height_mm: number
@@ -52,4 +60,7 @@ export interface ParseResult {
   stabilizers: StabilizerDef[]
   mounting_holes: MountingHoleDef[]
   unclassified: UnclassifiedShape[]
+  mcu_placement: McuPlacement | null
+  outline_grow_mm: number
+  matrix_strategy: MatrixStrategy
 }

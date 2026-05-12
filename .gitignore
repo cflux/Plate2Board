@@ -12,3 +12,8 @@ dist/
 
 # Per-user Claude Code settings (don't share auth-state across machines)
 .claude/settings.local.json
+
+# SKiDL test ERC output — generated on every backend test run
+backend/test_project.log
+backend/test_project.erc
+backend/test_project.net

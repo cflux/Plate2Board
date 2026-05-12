@@ -2,6 +2,7 @@ import type {
   DiodeType,
   MatrixStrategy,
   ParseResult,
+  StabilizerType,
   SwitchDef,
   SwitchType,
 } from '../types'
@@ -48,10 +49,12 @@ export function generatePcb(
   result: ParseResult,
   switchType: SwitchType = 'soldered',
   diodeType: DiodeType = 'tht',
+  stabilizerType: StabilizerType = 'pcb_mount',
 ): Promise<string> {
   const params = new URLSearchParams({
     switch_type: switchType,
     diode_type: diodeType,
+    stabilizer_type: stabilizerType,
   })
   return postBody(`/api/generate-pcb?${params}`, result)
 }
@@ -61,11 +64,13 @@ export async function generateProjectZip(
   projectName: string,
   switchType: SwitchType,
   diodeType: DiodeType,
+  stabilizerType: StabilizerType = 'pcb_mount',
 ): Promise<Blob> {
   const params = new URLSearchParams({
     project_name: projectName,
     switch_type: switchType,
     diode_type: diodeType,
+    stabilizer_type: stabilizerType,
   })
   const res = await fetch(`/api/generate-project?${params}`, {
     method: 'POST',

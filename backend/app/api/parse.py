@@ -4,7 +4,7 @@ from ..models.schemas import ParseResult, SvgParseError
 from ..services.svg_parser import parse_plate_svg
 
 MAX_SVG_BYTES = 1_000_000
-ALLOWED_STRATEGIES = {"row_first", "column_first", "stagger_aware"}
+ALLOWED_STRATEGIES = {"row_first", "column_first", "stagger_aware", "auto"}
 
 router = APIRouter()
 
@@ -12,7 +12,7 @@ router = APIRouter()
 @router.post("/parse", response_model=ParseResult)
 async def parse_svg(
     file: UploadFile = File(...),
-    matrix_strategy: str = Form("row_first"),
+    matrix_strategy: str = Form("auto"),
 ) -> ParseResult:
     if matrix_strategy not in ALLOWED_STRATEGIES:
         raise HTTPException(

@@ -1,7 +1,7 @@
 import pytest
 
 from app.models.schemas import SwitchDef
-from app.services.matrix import assign_matrix
+from app.services.matrix import assign_matrix, pick_best_strategy
 from app.services.svg_parser import parse_plate_svg
 
 
@@ -211,3 +211,59 @@ def test_stagger_aware_kbplate_chains_each_column(example_plate_svg: str) -> Non
         assert rows_in_col == list(range(len(col_switches))), (
             f"col {c} rows are not 0..N: {rows_in_col}"
         )
+
+
+def test_pick_best_strategy_axis_aligned_grid_breaks_tie_to_row_first() -> None:
+    """4 × 3 axis-aligned grid: row_first and column_first both produce
+    `|rows-cols|=1`; stagger_aware also matches. Declaration order
+    breaks the tie in favor of row_first."""
+    sws = [
+        _sw(r * 3 + c + 1, c * 19.05, r * 19.05)
+        for r in range(4) for c in range(3)
+    ]
+    assert pick_best_strategy(sws) == "row_first"
+
+
+def test_pick_best_strategy_does_not_mutate_input() -> None:
+    sws = [
+        _sw(1, 0.0, 0.0), _sw(2, 19.05, 0.0),
+        _sw(3, 0.0, 19.05), _sw(4, 19.05, 19.05),
+    ]
+    before = [(sw.row, sw.col) for sw in sws]
+    pick_best_strategy(sws)
+    after = [(sw.row, sw.col) for sw in sws]
+    assert before == after
+
+
+def test_auto_resolves_against_dactyl_picks_stagger_aware(
+    complex_example_svg: str,
+) -> None:
+    """Dactyl's row_first/column_first collapse the matrix; stagger_aware
+    is the only one producing a balanced shape. Auto must pick it."""
+    result = parse_plate_svg(complex_example_svg, matrix_strategy="auto")
+    assert result.matrix_strategy == "stagger_aware"
+
+
+def test_auto_resolves_against_kbplate_picks_row_first(
+    example_plate_svg: str,
+) -> None:
+    """Axis-aligned kbplate: row_first and column_first both give the same
+    score; auto picks row_first via declaration-order tie-break."""
+    result = parse_plate_svg(example_plate_svg, matrix_strategy="auto")
+    assert result.matrix_strategy == "row_first"
+
+
+def test_assign_matrix_returns_chosen_strategy_name() -> None:
+    sws = [_sw(1, 0.0, 0.0), _sw(2, 19.05, 0.0)]
+    assert assign_matrix(sws, strategy="row_first") == "row_first"
+    assert assign_matrix(sws, strategy="auto") in {
+        "row_first", "column_first", "stagger_aware",
+    }
+
+
+def test_parse_result_carries_chosen_matrix_strategy(example_plate_svg: str) -> None:
+    """Explicit strategies round-trip; auto resolves to a concrete name."""
+    explicit = parse_plate_svg(example_plate_svg, matrix_strategy="column_first")
+    assert explicit.matrix_strategy == "column_first"
+    auto = parse_plate_svg(example_plate_svg, matrix_strategy="auto")
+    assert auto.matrix_strategy in {"row_first", "column_first", "stagger_aware"}

@@ -4,7 +4,12 @@ from pydantic import BaseModel
 
 from ..models.schemas import ParseResult, SwitchDef
 from ..services.netlist import generate_netlist
-from ..services.pcb import DIODE_TYPES, SWITCH_TYPES, generate_pcb
+from ..services.pcb import (
+    DIODE_TYPES,
+    STABILIZER_TYPES,
+    SWITCH_TYPES,
+    generate_pcb,
+)
 from ..services.project import DEFAULT_PROJECT_NAME, generate_project_zip
 from ..services.schematic import generate_schematic
 
@@ -47,6 +52,7 @@ async def post_generate_pcb(
     req: ParseResult,
     switch_type: str = "soldered",
     diode_type: str = "tht",
+    stabilizer_type: str = "pcb_mount",
 ) -> PlainTextResponse:
     if not req.switches:
         raise HTTPException(
@@ -68,10 +74,19 @@ async def post_generate_pcb(
                 f"got {diode_type!r}"
             ),
         )
+    if stabilizer_type not in STABILIZER_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"stabilizer_type must be one of {sorted(STABILIZER_TYPES)}, "
+                f"got {stabilizer_type!r}"
+            ),
+        )
     text = generate_pcb(
         req,
         switch_type=switch_type,
         diode_type=diode_type,
+        stabilizer_type=stabilizer_type,
     )
     return PlainTextResponse(
         content=text,
@@ -87,6 +102,7 @@ async def post_generate_project(
     project_name: str = DEFAULT_PROJECT_NAME,
     switch_type: str = "soldered",
     diode_type: str = "tht",
+    stabilizer_type: str = "pcb_mount",
 ) -> Response:
     if not req.switches:
         raise HTTPException(
@@ -108,12 +124,21 @@ async def post_generate_project(
                 f"got {diode_type!r}"
             ),
         )
+    if stabilizer_type not in STABILIZER_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"stabilizer_type must be one of {sorted(STABILIZER_TYPES)}, "
+                f"got {stabilizer_type!r}"
+            ),
+        )
     try:
         zip_bytes = generate_project_zip(
             req,
             project_name=project_name,
             switch_type=switch_type,
             diode_type=diode_type,
+            stabilizer_type=stabilizer_type,
         )
     except Exception as exc:
         raise HTTPException(

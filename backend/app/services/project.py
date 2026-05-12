@@ -10,7 +10,7 @@ import re
 import zipfile
 
 from ..models.schemas import ParseResult
-from .pcb import DiodeType, SwitchType, generate_pcb
+from .pcb import DiodeType, StabilizerType, SwitchType, generate_pcb
 from .schematic import generate_schematic
 
 DEFAULT_PROJECT_NAME = "keyboard"
@@ -25,6 +25,7 @@ def generate_project_zip(
     project_name: str = DEFAULT_PROJECT_NAME,
     switch_type: SwitchType = "soldered",
     diode_type: DiodeType = "tht",
+    stabilizer_type: StabilizerType = "pcb_mount",
 ) -> bytes:
     project_name = _safe_name(project_name) or DEFAULT_PROJECT_NAME
 
@@ -33,6 +34,7 @@ def generate_project_zip(
         parse,
         switch_type=switch_type,
         diode_type=diode_type,
+        stabilizer_type=stabilizer_type,
     )
     pro_text = _project_file(project_name, _extract_root_uuid(sch_text))
 

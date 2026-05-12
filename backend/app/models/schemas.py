@@ -41,6 +41,12 @@ class UnclassifiedShape(BaseModel):
     rotation_deg: float = 0.0
 
 
+class McuPlacement(BaseModel):
+    cx_mm: float
+    cy_mm: float
+    rotation_deg: float = 0.0
+
+
 class ParseResult(BaseModel):
     svg_width_mm: float
     svg_height_mm: float
@@ -49,6 +55,9 @@ class ParseResult(BaseModel):
     stabilizers: list[StabilizerDef]
     mounting_holes: list[MountingHoleDef] = []
     unclassified: list[UnclassifiedShape]
+    mcu_placement: McuPlacement | None = None
+    outline_grow_mm: float = 0.0
+    matrix_strategy: str = "row_first"
 
 
 class SvgParseError(ValueError):

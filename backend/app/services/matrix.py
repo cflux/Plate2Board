@@ -13,6 +13,7 @@ ADJ_PERP_MAX_MM = 6.0  # max perpendicular drift over a 1U gap
 MAX_ROW_GAP = 2  # accept 1U or 2U gaps; lets a column bridge a missing row
 
 _VALID_STRATEGIES = ("row_first", "column_first", "stagger_aware")
+AUTO_STRATEGY = "auto"
 
 
 def row_major_refdes(switches: list[SwitchDef]) -> dict[int, int]:
@@ -43,8 +44,10 @@ def renumber_switches(switches: list[SwitchDef]) -> list[SwitchDef]:
     ]
 
 
-def assign_matrix(switches: list[SwitchDef], strategy: str = "row_first") -> None:
+def assign_matrix(switches: list[SwitchDef], strategy: str = "row_first") -> str:
     """Assign row/col indices in-place using one of three strategies.
+    Returns the actually-applied strategy name (`"auto"` resolves to one of
+    the three real strategies).
 
     - ``row_first``: group by ``cy_mm`` into rows (Y gap > ROW_TOLERANCE_MM
       starts a new row), sort each row by ``cx_mm``. Wins on axis-aligned
@@ -58,7 +61,12 @@ def assign_matrix(switches: list[SwitchDef], strategy: str = "row_first") -> Non
       on heavily column-staggered layouts (Dactyl) where simple X-clustering
       fails. Switches that don't chain (e.g. lone thumb keys) become their
       own single-key columns; the user can drag them in the matrix grid.
+    - ``auto``: try all three strategies on a snapshot and pick the one whose
+      resulting matrix is most square (smallest ``|rows − cols|``). Ties
+      broken by declaration order in ``_VALID_STRATEGIES``.
     """
+    if strategy == AUTO_STRATEGY:
+        strategy = pick_best_strategy(switches)
     if strategy == "row_first":
         _assign_row_first(switches)
     elif strategy == "column_first":
@@ -67,8 +75,45 @@ def assign_matrix(switches: list[SwitchDef], strategy: str = "row_first") -> Non
         _assign_stagger_aware(switches)
     else:
         raise ValueError(
-            f"unknown matrix strategy: {strategy!r} (expected one of {_VALID_STRATEGIES})"
+            f"unknown matrix strategy: {strategy!r} "
+            f"(expected one of {_VALID_STRATEGIES + (AUTO_STRATEGY,)})"
         )
+    return strategy
+
+
+def pick_best_strategy(switches: list[SwitchDef]) -> str:
+    """Snapshot the switches, run each real strategy on a deep copy, and
+    return the one whose matrix is most square AND most densely populated.
+
+    Score = `|rows - cols| + EMPTY_CELL_PENALTY * (rows * cols - N)`.
+    The balance term encodes the user's primary intent ("most even rows
+    and cols"); the empty-cell term breaks ties toward strategies that
+    fit the keys into a tighter grid. Without the penalty an axis-aligned
+    keyboard like kbplate would prefer a sparse 6 × 11 over a tidy
+    4 × 12 because |6−11| < |4−12| — visually unhelpful. Declaration
+    order in `_VALID_STRATEGIES` is the final tie-break."""
+    if not switches:
+        return _VALID_STRATEGIES[0]
+    n = len(switches)
+    best_name = _VALID_STRATEGIES[0]
+    best_score = float("inf")
+    for name in _VALID_STRATEGIES:
+        trial = [sw.model_copy(deep=True) for sw in switches]
+        if name == "row_first":
+            _assign_row_first(trial)
+        elif name == "column_first":
+            _assign_column_first(trial)
+        else:
+            _assign_stagger_aware(trial)
+        n_rows = len({sw.row for sw in trial})
+        n_cols = len({sw.col for sw in trial})
+        balance = abs(n_rows - n_cols)
+        empty_cells = n_rows * n_cols - n
+        score = balance + 0.5 * empty_cells
+        if score < best_score:
+            best_score = score
+            best_name = name
+    return best_name
 
 
 def _assign_row_first(switches: list[SwitchDef]) -> None:

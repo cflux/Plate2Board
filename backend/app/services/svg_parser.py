@@ -10,6 +10,7 @@ from shapely.geometry import MultiPoint, Point, Polygon
 from svgpathtools import parse_path
 
 from ..models.schemas import (
+    McuPlacement,
     MountingHoleDef,
     ParseResult,
     PcbOutline,
@@ -77,7 +78,7 @@ class _Subpath:
         return self.axis_ymax - self.axis_ymin
 
 
-def parse_plate_svg(svg_text: str, matrix_strategy: str = "row_first") -> ParseResult:
+def parse_plate_svg(svg_text: str, matrix_strategy: str = "auto") -> ParseResult:
     try:
         root = etree.fromstring(svg_text.encode("utf-8"))
     except etree.XMLSyntaxError as exc:
@@ -162,7 +163,17 @@ def parse_plate_svg(svg_text: str, matrix_strategy: str = "row_first") -> ParseR
 
     _orient_switches_against_stabs(switches, stabilizers)
     _orient_stabs_against_switches(switches, stabilizers)
-    assign_matrix(switches, strategy=matrix_strategy)
+    chosen_strategy = assign_matrix(switches, strategy=matrix_strategy)
+
+    # Default MCU placement: off the right edge of the plate, vertically
+    # centered. Same numbers `generate_pcb` used to compute internally — by
+    # populating the field at parse time the frontend can render an MCU
+    # marker on the preview and the user can drag it without a re-parse.
+    mcu_default = McuPlacement(
+        cx_mm=round(svg_w_mm + 12.0, 4),
+        cy_mm=round((svg_h_mm - 11 * 2.54) / 2, 4),
+        rotation_deg=0.0,
+    )
 
     return ParseResult(
         svg_width_mm=round(svg_w_mm, 4),
@@ -172,6 +183,8 @@ def parse_plate_svg(svg_text: str, matrix_strategy: str = "row_first") -> ParseR
         stabilizers=stabilizers,
         mounting_holes=mounting_holes,
         unclassified=unclassified,
+        mcu_placement=mcu_default,
+        matrix_strategy=chosen_strategy,
     )
 
 

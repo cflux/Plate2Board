@@ -347,6 +347,73 @@ header .tag {
   font-size: 0.85rem;
 }
 
+.toolbar-input {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: #98a0a8;
+  font-size: 0.85rem;
+}
+
+.toolbar-input input[type='number'] {
+  width: 70px;
+  background: #1d2129;
+  color: #d8dadf;
+  border: 1px solid #303640;
+  border-radius: 4px;
+  padding: 3px 6px;
+  font: inherit;
+}
+
+.toolbar-unit {
+  color: #6a727c;
+  font-size: 0.8rem;
+}
+
+.inspect-tooltip {
+  position: absolute;
+  background: rgba(15, 18, 24, 0.96);
+  color: #e8eaee;
+  border: 1px solid rgba(255, 220, 80, 0.65);
+  border-radius: 4px;
+  padding: 4px 8px;
+  font-family: 'JetBrains Mono', ui-monospace, Menlo, Consolas, monospace;
+  font-size: 0.78rem;
+  line-height: 1.35;
+  pointer-events: none;
+  z-index: 10;
+  white-space: nowrap;
+}
+
+.inspect-tooltip-label {
+  color: rgba(255, 220, 80, 0.95);
+  font-weight: 600;
+}
+
+.inspect-tooltip-coords {
+  color: #c8ccd2;
+}
+
+.inspect-cursor-coords {
+  position: absolute;
+  right: 8px;
+  bottom: 8px;
+  background: rgba(15, 18, 24, 0.85);
+  color: #c8ccd2;
+  border: 1px solid #2b313a;
+  border-radius: 4px;
+  padding: 3px 7px;
+  font-family: 'JetBrains Mono', ui-monospace, Menlo, Consolas, monospace;
+  font-size: 0.78rem;
+  pointer-events: none;
+  z-index: 9;
+}
+
+.inspect-mode-hint {
+  color: rgba(255, 220, 80, 0.95);
+  margin-left: 6px;
+}
+
 .toolbar .err {
   color: #e07070;
   font-size: 0.85rem;
@@ -466,9 +533,47 @@ header .tag {
   border-color: #3a78c2;
 }
 
+.matrix-cell.pad {
+  background: #0e1116;
+  border: 1.5px dashed #1f242c;
+  opacity: 0.75;
+}
+
+.matrix-cell.pad:hover {
+  border-color: #3a78c2;
+  opacity: 1;
+}
+
+.matrix-grid th.header-pad {
+  color: #4a525c;
+  font-style: italic;
+}
+
 .matrix-cell.selected {
   box-shadow: 0 0 0 2px rgba(255, 220, 80, 0.95);
   transform: scale(1.04);
+}
+
+.matrix-cell.anchor {
+  box-shadow: 0 0 0 2.5px rgba(255, 255, 255, 0.95),
+    0 0 0 4.5px rgba(255, 220, 80, 0.95);
+  z-index: 1;
+}
+
+.matrix-cell.drop-target {
+  outline: 2px dashed rgba(255, 220, 80, 0.95);
+  outline-offset: -2px;
+  background-color: rgba(255, 220, 80, 0.18) !important;
+}
+
+.matrix-cell.drop-blocked {
+  outline: 2px dashed rgba(220, 80, 80, 0.95);
+  outline-offset: -2px;
+  background-color: rgba(220, 80, 80, 0.22) !important;
+}
+
+.matrix-move-error {
+  margin-left: 14px;
 }
 
 .version-footer {

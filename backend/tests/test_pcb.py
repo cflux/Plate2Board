@@ -3,12 +3,13 @@ import re
 import pytest
 
 from app.models.schemas import (
+    McuPlacement,
+    MountingHoleDef,
     ParseResult,
     PcbOutline,
     StabilizerDef,
     SwitchDef,
     UnclassifiedShape,
-    MountingHoleDef,
 )
 from app.services.pcb import generate_pcb
 from app.services.svg_parser import parse_plate_svg
@@ -51,10 +52,12 @@ def test_empty_pcb_has_valid_skeleton() -> None:
 
 def test_single_switch_placed_at_parsed_coords() -> None:
     out = generate_pcb(_result(switches=[_sw(1, 19.05, 9.525, rotation=10.0)]))
-    # Switch footprint at exactly the parsed center, rotated 10°.
+    # Switch footprint at exactly the parsed center, rotated 10° CW visually
+    # to match SVG. SVG positive-CW is emitted as KiCad negative-CCW so the
+    # `(at)` angle is -10.
     assert re.search(
         r'\(footprint "Button_Switch_Keyboard:SW_Cherry_MX_1\.00u_PCB".*?'
-        r'\(at 19\.0500 9\.5250 10\.000\)',
+        r'\(at 19\.0500 9\.5250 -10\.000\)',
         out,
         re.DOTALL,
     )
@@ -77,7 +80,7 @@ def test_diode_offset_rotates_with_switch() -> None:
     m = re.search(
         r'\(footprint "Diode_THT:D_DO-35_SOD27_P7\.62mm_Horizontal"'
         r'\s*\(layer "F\.Cu"\)\s*\(uuid "[^"]+"\)\s*'
-        r'\(at ([-\d.]+) ([-\d.]+) ([\d.]+)\)',
+        r'\(at ([-\d.]+) ([-\d.]+) ([-\d.]+)\)',
         out,
     )
     assert m, "diode footprint not emitted"
@@ -95,50 +98,283 @@ def test_mounting_holes_become_npth() -> None:
     assert re.search(r"np_thru_hole circle.*?\(drill 2\.50\)", out, re.DOTALL)
 
 
-def test_stabilizer_cutout_mirrors_svg_geometry_exactly() -> None:
-    """Each stabilizer cutout in the SVG → one Edge.Cuts rectangle on the
-    PCB at the detected (cx, cy, width, height, rotation). No fixed-geometry
-    2U/6.25U/etc. footprint with internal pad spacing — we trust the plate."""
-    stab = StabilizerDef(
-        id=1, cx_mm=30.0, cy_mm=20.0, width_mm=14.0, height_mm=7.0, rotation_deg=0.0
-    )
-    out = generate_pcb(_result(switches=[_sw(1, 50, 50)], stabilizers=[stab]))
-
-    # New per-cutout footprint name; old hardcoded 2U name must be gone.
-    assert '"keeb-layout-bot:Stabilizer_Cutout"' in out
-    assert "Mounting_Keyboard_Stabilizer:Stabilizer_Cherry_MX_2.00u" not in out
-    assert "(at 30.0000 20.0000 0.000)" in out
-
-    stab_block = re.search(
-        r'\(footprint "keeb-layout-bot:Stabilizer_Cutout".+?\n\t\)',
+def test_mounting_hole_refdes_and_fab_text_hidden() -> None:
+    """Mounting holes are mechanical-only — their Reference (`MH{n}`) and
+    Value (`MountingHole`) properties exist for KiCad's bookkeeping but
+    should be hidden so silk and fab aren't cluttered with a label per
+    drill."""
+    holes = [MountingHoleDef(id=1, cx_mm=5.0, cy_mm=5.0, diameter_mm=2.5)]
+    out = generate_pcb(_result(switches=[_sw(1, 19.05, 9.525)], mounting_holes=holes))
+    mh_block = re.search(
+        r'\(footprint "MountingHole:MountingHole_2\.5mm".+?\n\t\)',
         out,
         re.DOTALL,
     )
-    assert stab_block, "stabilizer block missing"
+    assert mh_block, "mounting hole footprint missing"
+    block = mh_block.group(0)
+    # Both Reference and Value must carry the `hide` flag.
+    assert re.search(r'\(property "Reference" "MH1".+?hide', block)
+    assert re.search(r'\(property "Value" "MountingHole".+?hide', block)
+
+
+def _stab_pair_for_switch(
+    sw_id: int, sw_cx: float, sw_cy: float, half_spacing: float
+) -> list[StabilizerDef]:
+    """Two stab cutouts flanking a switch at ±half_spacing along X."""
+    return [
+        StabilizerDef(
+            id=sw_id * 10 + 1,
+            cx_mm=sw_cx - half_spacing,
+            cy_mm=sw_cy,
+            width_mm=14.0,
+            height_mm=7.0,
+            rotation_deg=0.0,
+        ),
+        StabilizerDef(
+            id=sw_id * 10 + 2,
+            cx_mm=sw_cx + half_spacing,
+            cy_mm=sw_cy,
+            width_mm=14.0,
+            height_mm=7.0,
+            rotation_deg=0.0,
+        ),
+    ]
+
+
+def test_pcb_mount_stab_emits_canonical_holes() -> None:
+    """PCB-mount stab: anchored on switch stem, 2 NPTH per detected side
+    (wire-clearance at +6.77, housing at -8.24) at the cutout's half_spacing
+    in switch-local coords."""
+    half_spacing = 11.938
+    stabs = _stab_pair_for_switch(1, 50.0, 50.0, half_spacing)
+    out = generate_pcb(
+        _result(switches=[_sw(1, 50, 50)], stabilizers=stabs),
+        stabilizer_type="pcb_mount",
+    )
+
+    assert '"keeb-layout-bot:Stabilizer_PCB_Mount"' in out
+    assert "(at 50.0000 50.0000 0.000)" in out
+
+    stab_block = re.search(
+        r'\(footprint "keeb-layout-bot:Stabilizer_PCB_Mount".+?\n\t\)',
+        out,
+        re.DOTALL,
+    )
+    assert stab_block
     block = stab_block.group(0)
 
-    # No electrical pads, no synthetic NPTHs.
-    assert not re.search(r'\(pad "[12]" ', block)
-    assert "(at -11.938" not in block
-    assert "(at 11.938" not in block
-
-    # Exactly 4 Edge.Cuts segments forming the rectangle.
-    edge_lines = re.findall(r'\(fp_line.+?\(layer "Edge\.Cuts"\)', block)
-    assert len(edge_lines) == 4
-
-    # Corners in local (footprint) frame: (±7, ±3.5) for a 14 × 7 mm cutout.
-    coords = re.findall(
-        r"\(start (-?\d+\.\d+) (-?\d+\.\d+)\) \(end (-?\d+\.\d+) (-?\d+\.\d+)\)",
+    # 4 NPTH holes: wire (3.0 mm) and housing (4.0 mm) on each side.
+    nptHs = re.findall(
+        r'\(pad "" np_thru_hole circle \(at ([-+\d.]+) ([-+\d.]+)\) '
+        r"\(size ([\d.]+) \3\) \(drill \3\)",
         block,
     )
-    seen_xs = {round(float(c[0]), 1) for c in coords} | {
-        round(float(c[2]), 1) for c in coords
-    }
-    seen_ys = {round(float(c[1]), 1) for c in coords} | {
-        round(float(c[3]), 1) for c in coords
-    }
-    assert seen_xs == {-7.0, 7.0}
-    assert seen_ys == {-3.5, 3.5}
+    assert len(nptHs) == 4
+    by_diameter: dict[float, list[tuple[float, float]]] = {}
+    for x, y, d in nptHs:
+        by_diameter.setdefault(float(d), []).append((float(x), float(y)))
+    assert sorted(by_diameter.keys()) == [3.0, 4.0]
+    # Wire holes at ±11.938, +6.77.
+    wire_pts = sorted(by_diameter[3.0])
+    assert wire_pts == sorted(
+        [(-half_spacing, 6.77), (half_spacing, 6.77)]
+    )
+    # Housing holes at ±11.938, -8.24.
+    housing_pts = sorted(by_diameter[4.0])
+    assert housing_pts == sorted(
+        [(-half_spacing, -8.24), (half_spacing, -8.24)]
+    )
+
+    # No Edge.Cuts segments — the plate cutout is not mirrored.
+    assert "Edge.Cuts" not in block
+
+
+def test_plate_mount_stab_emits_footprint_keepout_zone() -> None:
+    """Plate-mount stab: no drills, just an F.Cu footprint-keepout zone so
+    no other component can sit under the stab housing. Tracks/vias/pads/
+    copperpour remain allowed so routing can still pass through."""
+    stabs = _stab_pair_for_switch(1, 50.0, 50.0, 11.938)
+    out = generate_pcb(
+        _result(switches=[_sw(1, 50, 50)], stabilizers=stabs),
+        stabilizer_type="plate_mount",
+    )
+
+    assert '"keeb-layout-bot:Stabilizer_Plate_Mount"' in out
+    stab_block = re.search(
+        r'\(footprint "keeb-layout-bot:Stabilizer_Plate_Mount".+?\n\t\)',
+        out,
+        re.DOTALL,
+    )
+    assert stab_block
+    block = stab_block.group(0)
+
+    # No drills.
+    assert "np_thru_hole" not in block
+    assert "thru_hole" not in block
+
+    # Keepout zone on F.Cu disallowing only footprints.
+    assert '(layer "F.Cu")' in block
+    assert "(keepout" in block
+    assert "(footprints not_allowed)" in block
+    assert "(tracks allowed)" in block
+    assert "(vias allowed)" in block
+    assert "(pads allowed)" in block
+    assert "(copperpour allowed)" in block
+
+
+def test_stab_pairing_picks_nearest_switch() -> None:
+    """Two switches; stab cutouts flank the second one. The assembly should
+    anchor on switch 2, not switch 1."""
+    sws = [_sw(1, 0.0, 0.0), _sw(2, 100.0, 0.0)]
+    stabs = _stab_pair_for_switch(2, 100.0, 0.0, 11.938)
+    out = generate_pcb(_result(switches=sws, stabilizers=stabs))
+
+    # PCB-mount footprint anchored at switch 2's stem (100, 0).
+    assert "(at 100.0000 0.0000 0.000)" in out
+    # Exactly one stab assembly footprint (only switch 2 has stabs). Count
+    # the opening `(footprint "..."` token, not the name's appearance inside
+    # the Footprint property of common props.
+    stab_footprints = re.findall(
+        r'^\t\(footprint "keeb-layout-bot:Stabilizer_PCB_Mount"',
+        out,
+        re.MULTILINE,
+    )
+    assert len(stab_footprints) == 1
+    # Reference labels the owning switch.
+    assert '"ST2"' in out
+    assert '"ST1"' not in out
+
+
+def test_stab_pair_stays_together_when_row_is_sparse() -> None:
+    """6.25u spacebar pair: two stab cutouts 100 mm apart at the same Y,
+    with the keyboard row above containing more switches than the spacebar
+    row. The pair must end up on the spacebar (nearest to the *midpoint*),
+    NOT split across two different rows."""
+    # Spacebar at (121.4, 70). Row above has 5 switches spread across
+    # the same X range. The right stab cutout's *individual* nearest
+    # switch is in the row above; only the pair midpoint disambiguates.
+    spacebar = SwitchDef(id=99, cx_mm=121.4, cy_mm=70.0, row=4, col=5)
+    row_above = [
+        SwitchDef(id=i, cx_mm=x, cy_mm=50.0, row=3, col=i)
+        for i, x in enumerate([80.0, 100.0, 120.0, 140.0, 160.0])
+    ]
+    stabs = [
+        StabilizerDef(
+            id=1, cx_mm=71.4, cy_mm=68.2, width_mm=15, height_mm=7, rotation_deg=270
+        ),
+        StabilizerDef(
+            id=2, cx_mm=171.4, cy_mm=68.2, width_mm=15, height_mm=7, rotation_deg=270
+        ),
+    ]
+    out = generate_pcb(
+        _result(switches=row_above + [spacebar], stabilizers=stabs)
+    )
+
+    # Exactly one stab assembly footprint, anchored on the spacebar.
+    fps = re.findall(
+        r'^\t\(footprint "keeb-layout-bot:Stabilizer_PCB_Mount"',
+        out,
+        re.MULTILINE,
+    )
+    assert len(fps) == 1
+    # Anchored at the spacebar's stem (121.4, 70.0), not at a row-above switch.
+    assert "(at 121.4000 70.0000 0.000)" in out
+    # And the assembly contains four NPTH (both stab sides).
+    stab_block = re.search(
+        r'\(footprint "keeb-layout-bot:Stabilizer_PCB_Mount".+?\n\t\)',
+        out,
+        re.DOTALL,
+    ).group(0)
+    assert stab_block.count("np_thru_hole") == 4
+
+
+def test_stab_pairing_handles_rotated_switch() -> None:
+    """A switch rotated 30° (e.g. Dactyl thumb cluster) with two stab cutouts
+    at switch-local (±11.938, 0) lands them at different world Y values.
+    The rotation-invariant pairing (midpoint-on-stem + equidistant) must
+    still pair them and emit a single assembly with 4 NPTH."""
+    import math
+
+    rot_deg = 30.0
+    rot = math.radians(rot_deg)
+    half = 11.938
+    sw_cx, sw_cy = 100.0, 100.0
+    # Local (±half, 0) rotated by 30° into world coords.
+    left_cx = sw_cx + (-half) * math.cos(rot)
+    left_cy = sw_cy + (-half) * math.sin(rot)
+    right_cx = sw_cx + half * math.cos(rot)
+    right_cy = sw_cy + half * math.sin(rot)
+    # Sanity: world ΔY is ~11.9 mm — far past the old Y-tolerance bug.
+    assert abs(right_cy - left_cy) > 11.0
+
+    sw = SwitchDef(
+        id=1, cx_mm=sw_cx, cy_mm=sw_cy, row=0, col=0, rotation_deg=rot_deg
+    )
+    stabs = [
+        StabilizerDef(
+            id=1, cx_mm=left_cx, cy_mm=left_cy, width_mm=14, height_mm=7,
+            rotation_deg=rot_deg,
+        ),
+        StabilizerDef(
+            id=2, cx_mm=right_cx, cy_mm=right_cy, width_mm=14, height_mm=7,
+            rotation_deg=rot_deg,
+        ),
+    ]
+    out = generate_pcb(_result(switches=[sw], stabilizers=stabs))
+
+    fps = re.findall(
+        r'^\t\(footprint "keeb-layout-bot:Stabilizer_PCB_Mount"',
+        out,
+        re.MULTILINE,
+    )
+    assert len(fps) == 1
+    stab_block = re.search(
+        r'\(footprint "keeb-layout-bot:Stabilizer_PCB_Mount".+?\n\t\)',
+        out,
+        re.DOTALL,
+    ).group(0)
+    assert stab_block.count("np_thru_hole") == 4
+    # Local pad offsets should be Cherry canonical (±11.938 X, ±wire/housing Y),
+    # not the rotated world frame.
+    pads = re.findall(
+        r'np_thru_hole circle \(at\s+([-+\d.]+)\s+([-+\d.]+)\)', stab_block
+    )
+    xs = sorted({round(float(x), 3) for x, _ in pads})
+    ys = sorted({round(float(y), 2) for _, y in pads})
+    assert xs == [-half, half]
+    assert ys == [-8.24, 6.77]
+
+
+def test_svg_clockwise_rotation_emitted_as_negative_kicad_angle() -> None:
+    """SVG rotates clockwise for positive degrees; KiCad rotates counter-
+    clockwise. Every footprint we emit (switch, diode, stabilizer) for a
+    rotated switch must use a negative angle so the rendered PCB visually
+    matches the plate SVG."""
+    sw = _sw(1, 50.0, 50.0, rotation=15.0)
+    stabs = _stab_pair_for_switch(1, 50.0, 50.0, 11.938)
+    out = generate_pcb(_result(switches=[sw], stabilizers=stabs))
+
+    # All three footprint families carry -15.000 in their (at), not +15.000.
+    for fp_name in (
+        "Button_Switch_Keyboard:SW_Cherry_MX_1.00u_PCB",
+        "Diode_THT:D_DO-35_SOD27_P7.62mm_Horizontal",
+        "keeb-layout-bot:Stabilizer_PCB_Mount",
+    ):
+        m = re.search(
+            rf'\(footprint "{re.escape(fp_name)}".*?'
+            r"\(at [-\d.]+ [-\d.]+ (-?\d+\.\d+)\)",
+            out,
+            re.DOTALL,
+        )
+        assert m, f"{fp_name} footprint missing"
+        assert m.group(1) == "-15.000", (
+            f"{fp_name} angle {m.group(1)} — expected -15.000"
+        )
+
+
+def test_unknown_stabilizer_type_raises() -> None:
+    with pytest.raises(ValueError, match="stabilizer_type"):
+        generate_pcb(_result(switches=[_sw(1, 0, 0)]), stabilizer_type="custom")
 
 
 def test_outline_becomes_edge_cuts() -> None:
@@ -146,6 +382,63 @@ def test_outline_becomes_edge_cuts() -> None:
     # Bounding-box outline → 4 gr_line segments on Edge.Cuts.
     edge_lines = re.findall(r'gr_line.*?layer "Edge\.Cuts"', out)
     assert len(edge_lines) == 4
+
+
+def test_mcu_placement_default_matches_legacy_position() -> None:
+    """When `mcu_placement` is None on the parse, the generator falls back
+    to the legacy formula: off the right edge, vertically centered."""
+    parse = _result(switches=[_sw(1, 50, 25)], width=100.0, height=50.0)
+    parse.mcu_placement = None
+    out = generate_pcb(parse)
+    expected_x = 100.0 + 12.0  # svg_width + HEADER_GAP_MM
+    expected_y = (50.0 - 11 * 2.54) / 2
+    assert f"(at {expected_x:.4f} {expected_y:.4f} 0.000)" in out
+
+
+def test_mcu_placement_override_carries_through() -> None:
+    """User-supplied mcu_placement controls anchor and rotation. SVG-CW
+    rotation (90°) emits as KiCad CCW negative (-90.000)."""
+    parse = _result(switches=[_sw(1, 50, 25)])
+    parse.mcu_placement = McuPlacement(cx_mm=20.0, cy_mm=10.0, rotation_deg=90.0)
+    out = generate_pcb(parse)
+    # Pro Micro footprint anchored at (20, 10) with KiCad angle -90 (SVG CW = KiCad CCW negative).
+    assert re.search(
+        r'\(footprint "Module:Arduino_Pro_Micro".*?\(at 20\.0000 10\.0000 -90\.000\)',
+        out,
+        re.DOTALL,
+    )
+
+
+def test_outline_grow_dilates_edge_cuts() -> None:
+    """A 100 × 50 mm rectangular plate dilated by 5 mm should produce an
+    Edge.Cuts ring at (-5, -5)..(105, 55) — a 110 × 60 rectangle with
+    mitered corners (no arc segments)."""
+    parse = _result(switches=[_sw(1, 50, 25)], width=100.0, height=50.0)
+    parse.outline_grow_mm = 5.0
+    out = generate_pcb(parse)
+    edge_lines = re.findall(
+        r'gr_line \(start ([-+\d.]+) ([-+\d.]+)\) \(end ([-+\d.]+) ([-+\d.]+)\).+?Edge\.Cuts',
+        out,
+    )
+    assert len(edge_lines) == 4, f"expected 4 mitered edges, got {len(edge_lines)}"
+    xs = {round(float(c), 2) for seg in edge_lines for c in (seg[0], seg[2])}
+    ys = {round(float(c), 2) for seg in edge_lines for c in (seg[1], seg[3])}
+    assert xs == {-5.0, 105.0}, f"x extremes wrong: {xs}"
+    assert ys == {-5.0, 55.0}, f"y extremes wrong: {ys}"
+
+
+def test_outline_grow_zero_is_passthrough() -> None:
+    """outline_grow_mm == 0 must take the no-buffer path so generation
+    stays byte-identical to the pre-feature behavior (regression guard
+    against accidental Shapely round-trip)."""
+    parse_a = _result(switches=[_sw(1, 50, 25)])
+    parse_b = _result(switches=[_sw(1, 50, 25)])
+    parse_b.outline_grow_mm = 0.0
+    out_a = generate_pcb(parse_a)
+    out_b = generate_pcb(parse_b)
+    # Strip UUIDs (they're randomized per call) before comparing.
+    strip_uuid = re.compile(r'"uuid"\s+"[^"]+"|uuid "[^"]+"')
+    assert strip_uuid.sub("", out_a) == strip_uuid.sub("", out_b)
 
 
 def test_kbplate_full_pcb_has_every_switch_and_diode(example_plate_svg: str) -> None:
