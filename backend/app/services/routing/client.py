@@ -251,23 +251,31 @@ async def _start_job(client: httpx.AsyncClient, job_id: str) -> None:
 _PASS_LOG_RE = re.compile(
     r"Auto-router pass #(\d+).*?score of ([\d.]+)(?:\s*\((\d+)\s+unrouted\))?"
 )
+_FINAL_LOG_RE = re.compile(
+    r"Auto-router session (?:completed|cancelled): "
+    r"started with (\d+) unrouted nets.*?"
+    r"final score: ([\d.]+)(?:\s*\((\d+)\s+unrouted\))?"
+)
 
 
-async def _scrape_pass_info(client: httpx.AsyncClient, job_id: str) -> dict:
-    """Return ``{pass_number, score, unrouted_count, last_log}`` scraped from
-    the most recent pass-completion log line. Best-effort — if /logs fails
-    or returns nothing parseable, returns an empty dict."""
+async def _fetch_logs(client: httpx.AsyncClient, job_id: str) -> list[dict]:
+    """Best-effort fetch of the job's log entries. Returns [] on any error
+    so callers can treat empty + fetch-failure identically."""
     try:
         r = await client.get(f"/v1/jobs/{job_id}/logs")
         if r.status_code != 200:
-            return {}
+            return []
         logs = r.json()
     except (httpx.HTTPError, ValueError):
-        return {}
-    if not isinstance(logs, list):
-        return {}
-    # Walk backwards looking for the latest pass-completion line.
-    for entry in reversed(logs):
+        return []
+    return logs if isinstance(logs, list) else []
+
+
+async def _scrape_pass_info(client: httpx.AsyncClient, job_id: str) -> dict:
+    """Return ``{pass_number, score, unrouted, last_log}`` scraped from the
+    most recent pass-completion line. Used for live progress while routing
+    is still running."""
+    for entry in reversed(await _fetch_logs(client, job_id)):
         msg = entry.get("message") if isinstance(entry, dict) else str(entry)
         if not msg:
             continue
@@ -278,6 +286,26 @@ async def _scrape_pass_info(client: httpx.AsyncClient, job_id: str) -> dict:
                 "score": float(m.group(2)),
                 "unrouted": int(m.group(3)) if m.group(3) else 0,
                 "last_log": msg,
+            }
+    return {}
+
+
+async def _scrape_final_summary(client: httpx.AsyncClient, job_id: str) -> dict:
+    """Scrape the final "Auto-router session completed/cancelled" line to
+    get authoritative ``total`` + ``unrouted`` counts. Freerouting's
+    /output ``statistics`` block frequently returns null for these on
+    short jobs, so we fall back to the log line which always carries
+    them. Returns ``{}`` if the session hasn't ended yet."""
+    for entry in reversed(await _fetch_logs(client, job_id)):
+        msg = entry.get("message") if isinstance(entry, dict) else str(entry)
+        if not msg:
+            continue
+        m = _FINAL_LOG_RE.search(msg)
+        if m:
+            return {
+                "total": int(m.group(1)),
+                "score": float(m.group(2)),
+                "unrouted": int(m.group(3)) if m.group(3) else 0,
             }
     return {}
 
@@ -310,6 +338,22 @@ async def _wait_for_output(
             body = r.json()
             stats = _parse_stats(body.get("statistics"))
             ses_text = _decode_b64(body["data"])
+            # Freerouting often returns null/0 for routed_net_count and
+            # unrouted_net_count even when the log clearly reports both.
+            # The final summary line is authoritative — fall back to it so
+            # the UI sees real "K of N routed" numbers instead of zeros.
+            summary = await _scrape_final_summary(client, job_id)
+            if summary:
+                if stats.total_net_count == 0 and summary.get("total"):
+                    stats.unrouted_net_count = summary["unrouted"]
+                    stats.routed_net_count = summary["total"] - summary["unrouted"]
+                # Even when /output stats exist, trust the log's unrouted
+                # count if it's higher (freerouting sometimes reports
+                # routed_net_count > 0 with unrouted_net_count=null).
+                elif summary["unrouted"] > stats.unrouted_net_count:
+                    stats.unrouted_net_count = summary["unrouted"]
+                    if summary.get("total"):
+                        stats.routed_net_count = summary["total"] - summary["unrouted"]
             return ses_text, stats
         if r.status_code == 202:
             # In-progress with partial output. Update stats + progress.

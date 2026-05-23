@@ -394,25 +394,15 @@ async def _run_routed_job(
             project_name.replace("..", "").replace("/", "").replace("\\", "")
             or DEFAULT_PROJECT_NAME
         )
-        # Prefer freerouting's per-net stats when present. Freerouting
-        # sometimes reports null/0 for the per-net counts on quick jobs
-        # (especially when score=1000 is reached in pass 1) — in that case
-        # fall back to the segment + via counts from the SES splice so the
-        # UI still shows meaningful numbers.
-        routed_net = route_result.stats.routed_net_count
-        unrouted_net = route_result.stats.unrouted_net_count
-        total_net = route_result.stats.total_net_count
-        via_count = route_result.stats.via_count or splice_stats.via_count
-        if routed_net == 0 and total_net == 0:
-            # Use splice counts: routed = segments emitted (each ratsnest
-            # closed maps to ≥1 segment), total = routed + unrouted_net.
-            routed_net = splice_stats.routed_count
-            total_net = routed_net + unrouted_net
+        # `route_result.stats` already reconciles /output's statistics
+        # with the log's final-summary line, so the per-net counts here
+        # are trustworthy. Via count we take from whichever source has
+        # it (the SES splice always knows; /output sometimes does too).
         stats = routing_jobs.RouteStats(
-            routed_count=routed_net,
-            unrouted_count=unrouted_net,
-            total_count=total_net,
-            via_count=via_count,
+            routed_count=route_result.stats.routed_net_count,
+            unrouted_count=route_result.stats.unrouted_net_count,
+            total_count=route_result.stats.total_net_count,
+            via_count=route_result.stats.via_count or splice_stats.via_count,
         )
         await store.update(
             job_id,
