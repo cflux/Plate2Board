@@ -10,6 +10,7 @@ from ..services.pcb import (
     SWITCH_TYPES,
     generate_pcb,
 )
+from ..services.plate_svg import generate_plate_svg
 from ..services.project import DEFAULT_PROJECT_NAME, generate_project_zip
 from ..services.schematic import generate_schematic
 
@@ -92,6 +93,24 @@ async def post_generate_pcb(
         content=text,
         headers={
             "Content-Disposition": 'attachment; filename="keyboard.kicad_pcb"'
+        },
+    )
+
+
+@router.post("/generate-plate-svg", response_class=PlainTextResponse)
+async def post_generate_plate_svg(req: ParseResult) -> PlainTextResponse:
+    """Emit a clean plate SVG from the parsed result, using the grown
+    outline polygon as the plate border when `outline_grow_mm > 0`."""
+    if not req.switches:
+        raise HTTPException(
+            status_code=400, detail="cannot generate plate SVG from zero switches"
+        )
+    text = generate_plate_svg(req)
+    return PlainTextResponse(
+        content=text,
+        media_type="image/svg+xml",
+        headers={
+            "Content-Disposition": 'attachment; filename="keyboard-plate.svg"'
         },
     )
 

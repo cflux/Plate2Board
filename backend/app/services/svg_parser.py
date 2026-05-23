@@ -78,7 +78,11 @@ class _Subpath:
         return self.axis_ymax - self.axis_ymin
 
 
-def parse_plate_svg(svg_text: str, matrix_strategy: str = "auto") -> ParseResult:
+def parse_plate_svg(
+    svg_text: str,
+    matrix_strategy: str = "auto",
+    svg_unit_override: str | None = None,
+) -> ParseResult:
     try:
         root = etree.fromstring(svg_text.encode("utf-8"))
     except etree.XMLSyntaxError as exc:
@@ -90,7 +94,15 @@ def parse_plate_svg(svg_text: str, matrix_strategy: str = "auto") -> ParseResult
     if not subpaths:
         raise SvgParseError("SVG has no path sub-paths")
 
-    mm_per_unit = _detect_mm_scale(root, svg_w_units, subpaths)
+    if svg_unit_override and svg_unit_override != "auto":
+        if svg_unit_override not in _UNIT_TO_MM:
+            raise SvgParseError(
+                f"unknown svg_unit_override: {svg_unit_override!r}"
+            )
+        mm_per_unit = _UNIT_TO_MM[svg_unit_override]
+        detected_unit = svg_unit_override
+    else:
+        mm_per_unit, detected_unit = _detect_mm_scale(root, svg_w_units, subpaths)
     if mm_per_unit != 1.0:
         for sub in subpaths:
             _scale_subpath(sub, mm_per_unit)
@@ -165,13 +177,22 @@ def parse_plate_svg(svg_text: str, matrix_strategy: str = "auto") -> ParseResult
     _orient_stabs_against_switches(switches, stabilizers)
     chosen_strategy = assign_matrix(switches, strategy=matrix_strategy)
 
-    # Default MCU placement: off the right edge of the plate, vertically
-    # centered. Same numbers `generate_pcb` used to compute internally — by
-    # populating the field at parse time the frontend can render an MCU
-    # marker on the preview and the user can drag it without a re-parse.
+    # Default MCU placement: near the plate's top-right corner, fully
+    # inside the plate so it's visible in the preview viewBox (which is
+    # plate-anchored). Pin 1 sits so the Pro Micro body (18 × 33 mm with
+    # offsets -0.11, -1.5 from pin 1) lands ~5 mm inside the top and right
+    # edges. The user can drag/rotate from there.
+    PRO_MICRO_BODY_W_MM = 18.0
+    PRO_MICRO_BODY_X_OFF = -0.11
+    PRO_MICRO_BODY_Y_OFF = -1.5
+    EDGE_MARGIN_MM = 5.0
+    # cx + BODY_X_OFF + BODY_W = svg_w_mm - EDGE_MARGIN_MM
+    mcu_default_cx = svg_w_mm - EDGE_MARGIN_MM - PRO_MICRO_BODY_X_OFF - PRO_MICRO_BODY_W_MM
+    # cy + BODY_Y_OFF = EDGE_MARGIN_MM
+    mcu_default_cy = EDGE_MARGIN_MM - PRO_MICRO_BODY_Y_OFF
     mcu_default = McuPlacement(
-        cx_mm=round(svg_w_mm + 12.0, 4),
-        cy_mm=round((svg_h_mm - 11 * 2.54) / 2, 4),
+        cx_mm=round(max(PRO_MICRO_BODY_W_MM / 2, mcu_default_cx), 4),
+        cy_mm=round(mcu_default_cy, 4),
         rotation_deg=0.0,
     )
 
@@ -185,6 +206,8 @@ def parse_plate_svg(svg_text: str, matrix_strategy: str = "auto") -> ParseResult
         unclassified=unclassified,
         mcu_placement=mcu_default,
         matrix_strategy=chosen_strategy,
+        detected_svg_unit=detected_unit,
+        mm_per_unit=round(mm_per_unit, 6),
     )
 
 
@@ -338,12 +361,20 @@ def _sample_transformed_points(
 
 def _detect_mm_scale(
     root: etree._Element, viewbox_w: float, subpaths: list[_Subpath]
-) -> float:
-    width_mm = _parse_length_mm(root.get("width"))
+) -> tuple[float, str]:
+    """Return `(mm_per_unit, unit_label)`. The label is the explicit SVG
+    unit when the `width` attribute carries one (mm/cm/in/pt/pc), or
+    `"inferred"` when the scale was derived from the switch-cutout
+    heuristic, or `"unitless"` when neither path produced a scale and we
+    fell back to 1.0."""
+    width_attr = root.get("width")
+    width_mm = _parse_length_mm(width_attr)
     if width_mm is not None and viewbox_w > 0:
         ratio = width_mm / viewbox_w
         if 0.01 < ratio < 100.0:
-            return ratio
+            unit_match = _LENGTH_RE.match(width_attr or "")
+            unit = (unit_match.group(2).lower() if unit_match else "") or "mm"
+            return ratio, unit
 
     sizes: list[float] = []
     for sub in subpaths:
@@ -354,12 +385,22 @@ def _detect_mm_scale(
             sizes.append(sub.mabb.long_mm)
 
     if not sizes:
-        return 1.0
+        return 1.0, "unitless"
 
     typical = statistics.median(sizes)
     if typical < 1e-6:
-        return 1.0
-    return SWITCH_DIM_MM / typical
+        return 1.0, "unitless"
+    return SWITCH_DIM_MM / typical, "inferred"
+
+
+# Conversion factors for the unit-override form field.
+_UNIT_TO_MM: dict[str, float] = {
+    "mm": 1.0,
+    "cm": 10.0,
+    "in": 25.4,
+    "pt": 25.4 / 72.0,
+    "pc": 25.4 / 6.0,
+}
 
 
 _LENGTH_RE = re.compile(r"^\s*([+-]?\d*\.?\d+)\s*([a-zA-Z%]*)\s*$")

@@ -427,6 +427,45 @@ def test_outline_grow_dilates_edge_cuts() -> None:
     assert ys == {-5.0, 55.0}, f"y extremes wrong: {ys}"
 
 
+def test_edited_outline_replaces_parsed_outline() -> None:
+    """When `edited_outline_path_d` is set with no growth, the PCB
+    Edge.Cuts uses that polygon verbatim — even concave notches survive."""
+    parse = _result(switches=[_sw(1, 50, 25)], width=100.0, height=50.0)
+    parse.edited_outline_path_d = (
+        "M -1 -1 L 101 -1 L 101 51 L 60 51 L 60 40 L 40 40 L 40 51 L -1 51 Z"
+    )
+    parse.outline_grow_mm = 0.0
+    out = generate_pcb(parse)
+    edges = re.findall(
+        r'gr_line \(start ([-+\d.]+) ([-+\d.]+)\) \(end ([-+\d.]+) ([-+\d.]+)\)',
+        out,
+    )
+    coords = {(round(float(s), 1), round(float(t), 1)) for seg in edges for s, t in [(seg[0], seg[1]), (seg[2], seg[3])]}
+    # Notch coordinates must be present verbatim.
+    assert (60.0, 40.0) in coords
+    assert (40.0, 40.0) in coords
+
+
+def test_edited_outline_plus_grow_dilates_the_edited_polygon() -> None:
+    """outline_grow_mm should still work on top of an edited polygon —
+    dilating it rather than the parsed outline. Confirms grow is not
+    silently ignored after edits."""
+    parse = _result(switches=[_sw(1, 50, 25)], width=100.0, height=50.0)
+    # 80×40 mm rect centered in the parse's 100×50 viewport.
+    parse.edited_outline_path_d = "M 10 5 L 90 5 L 90 45 L 10 45 Z"
+    parse.outline_grow_mm = 3.0
+    out = generate_pcb(parse)
+    edges = re.findall(
+        r'gr_line \(start ([-+\d.]+) ([-+\d.]+)\) \(end ([-+\d.]+) ([-+\d.]+)\)',
+        out,
+    )
+    xs = {round(float(c), 1) for seg in edges for c in (seg[0], seg[2])}
+    ys = {round(float(c), 1) for seg in edges for c in (seg[1], seg[3])}
+    # Edited rect (10..90 × 5..45) dilated 3 mm → (7..93 × 2..48).
+    assert xs == {7.0, 93.0}
+    assert ys == {2.0, 48.0}
+
+
 def test_outline_grow_zero_is_passthrough() -> None:
     """outline_grow_mm == 0 must take the no-buffer path so generation
     stays byte-identical to the pre-feature behavior (regression guard

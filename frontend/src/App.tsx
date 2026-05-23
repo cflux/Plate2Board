@@ -2,10 +2,12 @@ import { useEffect, useState } from 'react'
 import { UploadStep } from './components/UploadStep'
 import { SvgPreview } from './components/SvgPreview'
 import { MatrixGrid } from './components/MatrixGrid'
+import { NumberInput } from './components/NumberInput'
 import { OrientationHelp } from './components/OrientationHelp'
 import {
   generateNetlist,
   generatePcb,
+  generatePlateSvg,
   generateProjectZip,
   generateSchematic,
   getBackendVersion,
@@ -32,6 +34,11 @@ export function App() {
   const [diodeType, setDiodeType] = useState<DiodeType>('tht')
   const [stabilizerType, setStabilizerType] = useState<StabilizerType>('pcb_mount')
   const [inspectMode, setInspectMode] = useState<boolean>(false)
+  const [editPlateMode, setEditPlateMode] = useState<boolean>(false)
+  const [selectedOutlineNodeIdx, setSelectedOutlineNodeIdx] = useState<number | null>(null)
+  const [selectedHoleId, setSelectedHoleId] = useState<number | null>(null)
+  const [addingHole, setAddingHole] = useState<boolean>(false)
+  const [unitOverride, setUnitOverride] = useState<string>('auto')
   const [redetectError, setRedetectError] = useState<string | null>(null)
   const [selectedSwitchIds, setSelectedSwitchIds] = useState<number[]>([])
   const [moveError, setMoveError] = useState<string | null>(null)
@@ -52,6 +59,10 @@ export function App() {
     setOriginalStabs(r.stabilizers.map((s) => ({ ...s })))
     setRedetectError(null)
     setSelectedSwitchIds([])
+    setSelectedOutlineNodeIdx(null)
+    setSelectedHoleId(null)
+    setEditPlateMode(false)
+    setAddingHole(false)
   }
 
   async function redetect(newStrategy: MatrixStrategy) {
@@ -61,7 +72,7 @@ export function App() {
     }
     setRedetectError(null)
     try {
-      const r = await parseSvg(file, newStrategy)
+      const r = await parseSvg(file, newStrategy, unitOverride)
       setResult(r)
       setOriginalSwitches(r.switches.map((s) => ({ ...s })))
       setOriginalStabs(r.stabilizers.map((s) => ({ ...s })))
@@ -234,6 +245,230 @@ export function App() {
     setResult({ ...result, outline_grow_mm: Math.max(0, mm) })
   }
 
+  // Pro Micro body dims + offsets (mm) — must match SvgPreview.tsx. The
+  // body is 18 × 33 mm with pin 1 inset (-0.11, -1.5) from the top-left
+  // corner. USB connector center sits at the body's width midpoint on
+  // the USB-end edge — i.e. local (BODY_X + W/2, BODY_Y).
+  const MCU_BODY_W_MM = 18.0
+  const MCU_BODY_X_OFFSET = -0.11
+  const MCU_BODY_Y_OFFSET = -1.5
+
+  function rotateLocal(lx: number, ly: number, rotDeg: number): { x: number; y: number } {
+    const r = (rotDeg * Math.PI) / 180
+    const cos = Math.cos(r)
+    const sin = Math.sin(r)
+    return { x: lx * cos - ly * sin, y: lx * sin + ly * cos }
+  }
+
+  // USB jack reference: body's width midpoint sitting on the USB-end edge
+  // — i.e. local (BODY_X + W/2, BODY_Y). Rotated by the MCU's rotation
+  // and translated by its pin-1 anchor for the world coord.
+  function getUsbJackWorld(): { x: number; y: number } | null {
+    if (!result?.mcu_placement) return null
+    const m = result.mcu_placement
+    const off = rotateLocal(
+      MCU_BODY_X_OFFSET + MCU_BODY_W_MM / 2,
+      MCU_BODY_Y_OFFSET,
+      m.rotation_deg,
+    )
+    return { x: m.cx_mm + off.x, y: m.cy_mm + off.y }
+  }
+
+  function setUsbJackWorld(newX: number, newY: number) {
+    if (!result?.mcu_placement) return
+    const m = result.mcu_placement
+    const off = rotateLocal(
+      MCU_BODY_X_OFFSET + MCU_BODY_W_MM / 2,
+      MCU_BODY_Y_OFFSET,
+      m.rotation_deg,
+    )
+    // anchor + off = usb → anchor = usb - off
+    updateMcu({ cx_mm: newX - off.x, cy_mm: newY - off.y })
+  }
+
+  // ============================================================
+  // Edit-plate mode: outline node editing + mounting hole CRUD
+  // ============================================================
+
+  function parseOutlineVerts(pathD: string): Array<{ x: number; y: number }> {
+    // Tokenize an M/L/Z polygon path (the only shape our backend emits) into
+    // a deduplicated vertex list. Mirrors `parsePathVertices` in SvgPreview.
+    const tokens = pathD.match(/[MLHVZmlhvz]|-?\d+(?:\.\d+)?/g) ?? []
+    const out: Array<{ x: number; y: number }> = []
+    const seen = new Set<string>()
+    let cmd = ''
+    let i = 0
+    while (i < tokens.length) {
+      const t = tokens[i]
+      if (/^[MLHVZmlhvz]$/.test(t)) {
+        cmd = t.toUpperCase()
+        i++
+        continue
+      }
+      if (cmd === 'M' || cmd === 'L') {
+        const x = parseFloat(tokens[i++])
+        const y = parseFloat(tokens[i++])
+        if (Number.isFinite(x) && Number.isFinite(y)) {
+          const key = `${x.toFixed(4)},${y.toFixed(4)}`
+          if (!seen.has(key)) {
+            seen.add(key)
+            out.push({ x, y })
+          }
+        }
+      } else {
+        i++
+      }
+    }
+    return out
+  }
+
+  function vertsToPathD(verts: Array<{ x: number; y: number }>): string {
+    if (verts.length === 0) return ''
+    const [v0, ...rest] = verts
+    return (
+      `M ${v0.x.toFixed(4)} ${v0.y.toFixed(4)} ` +
+      rest.map((v) => `L ${v.x.toFixed(4)} ${v.y.toFixed(4)}`).join(' ') +
+      ' Z'
+    )
+  }
+
+  function enterEditPlateMode() {
+    if (!result) return
+    setEditPlateMode(true)
+    if (result.edited_outline_path_d) return // already initialized
+    // Seed the editable polygon from the parsed outline only. `outline_grow_mm`
+    // is an independent dilation applied on top of the base outline by both
+    // the backend and the SvgPreview overlay, so seeding the editable polygon
+    // with the pre-grown shape would cause grow to be applied twice.
+    const baseVerts = parseOutlineVerts(result.pcb_outline.path_d)
+    setResult({
+      ...result,
+      edited_outline_path_d: vertsToPathD(baseVerts),
+    })
+  }
+
+  function exitEditPlateMode() {
+    setEditPlateMode(false)
+    setAddingHole(false)
+    setSelectedOutlineNodeIdx(null)
+    setSelectedHoleId(null)
+  }
+
+  function resetEditedOutline() {
+    if (!result) return
+    setSelectedOutlineNodeIdx(null)
+    // Re-seed the editable polygon from the parsed outline so node handles
+    // stay on screen for further editing. `outline_grow_mm` is layered on top
+    // by the renderer / backend, so we deliberately don't bake it in here.
+    const baseVerts = parseOutlineVerts(result.pcb_outline.path_d)
+    setResult({ ...result, edited_outline_path_d: vertsToPathD(baseVerts) })
+  }
+
+  function setOutlineVerts(verts: Array<{ x: number; y: number }>) {
+    if (!result) return
+    setResult({ ...result, edited_outline_path_d: vertsToPathD(verts) })
+  }
+
+  function moveOutlineNode(idx: number, x: number, y: number) {
+    if (!result?.edited_outline_path_d) return
+    const verts = parseOutlineVerts(result.edited_outline_path_d)
+    if (idx < 0 || idx >= verts.length) return
+    verts[idx] = { x, y }
+    setOutlineVerts(verts)
+  }
+
+  function insertOutlineNode(edgeIdx: number, x: number, y: number) {
+    if (!result?.edited_outline_path_d) return
+    const verts = parseOutlineVerts(result.edited_outline_path_d)
+    // Insert AFTER index `edgeIdx`, so the new node becomes idx (edgeIdx + 1).
+    verts.splice(edgeIdx + 1, 0, { x, y })
+    setOutlineVerts(verts)
+    setSelectedOutlineNodeIdx(edgeIdx + 1)
+  }
+
+  function deleteOutlineNode(idx: number) {
+    if (!result?.edited_outline_path_d) return
+    const verts = parseOutlineVerts(result.edited_outline_path_d)
+    if (verts.length <= 3) return // keep a valid polygon
+    verts.splice(idx, 1)
+    setOutlineVerts(verts)
+    setSelectedOutlineNodeIdx(null)
+  }
+
+  function addMountingHole(cx: number, cy: number, diameter = 3.5) {
+    if (!result) return
+    const nextId =
+      result.mounting_holes.reduce((m, h) => Math.max(m, h.id), 0) + 1
+    const hole = { id: nextId, cx_mm: cx, cy_mm: cy, diameter_mm: diameter }
+    setResult({ ...result, mounting_holes: [...result.mounting_holes, hole] })
+    setSelectedHoleId(nextId)
+    setAddingHole(false)
+  }
+
+  function moveMountingHole(id: number, cx: number, cy: number) {
+    if (!result) return
+    setResult({
+      ...result,
+      mounting_holes: result.mounting_holes.map((h) =>
+        h.id === id ? { ...h, cx_mm: cx, cy_mm: cy } : h,
+      ),
+    })
+  }
+
+  function setMountingHoleDiameter(id: number, diameter: number) {
+    if (!result) return
+    setResult({
+      ...result,
+      mounting_holes: result.mounting_holes.map((h) =>
+        h.id === id ? { ...h, diameter_mm: Math.max(0.5, diameter) } : h,
+      ),
+    })
+  }
+
+  function deleteMountingHole(id: number) {
+    if (!result) return
+    setResult({
+      ...result,
+      mounting_holes: result.mounting_holes.filter((h) => h.id !== id),
+    })
+    if (selectedHoleId === id) setSelectedHoleId(null)
+  }
+
+  // Delete key removes the currently-selected outline node or hole while in
+  // edit-plate mode.
+  useEffect(() => {
+    if (!editPlateMode) return
+    function onKey(e: KeyboardEvent) {
+      if (e.key !== 'Delete' && e.key !== 'Backspace') return
+      // Don't fire when the user is typing in an input.
+      const tag = (e.target as HTMLElement | null)?.tagName?.toLowerCase()
+      if (tag === 'input' || tag === 'textarea') return
+      if (selectedHoleId !== null) {
+        e.preventDefault()
+        deleteMountingHole(selectedHoleId)
+      } else if (selectedOutlineNodeIdx !== null) {
+        e.preventDefault()
+        deleteOutlineNode(selectedOutlineNodeIdx)
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [editPlateMode, selectedHoleId, selectedOutlineNodeIdx, result])
+
+  async function setUnitOverrideAndReparse(newUnit: string) {
+    setUnitOverride(newUnit)
+    if (!file) return
+    setRedetectError(null)
+    try {
+      const r = await parseSvg(file, strategy, newUnit)
+      setResult(r)
+      setOriginalSwitches(r.switches.map((s) => ({ ...s })))
+      setOriginalStabs(r.stabilizers.map((s) => ({ ...s })))
+    } catch (err) {
+      setRedetectError(err instanceof Error ? err.message : String(err))
+    }
+  }
+
   function resetRotations() {
     if (!result) return
     setResult({
@@ -244,11 +479,11 @@ export function App() {
   }
 
   const [busyExport, setBusyExport] = useState<
-    null | 'net' | 'sch' | 'pcb' | 'zip'
+    null | 'net' | 'sch' | 'pcb' | 'zip' | 'plate'
   >(null)
 
   async function downloadFile(
-    kind: 'net' | 'sch' | 'pcb',
+    kind: 'net' | 'sch' | 'pcb' | 'plate',
     fetcher: () => Promise<string>,
     extension: string,
   ): Promise<void> {
@@ -291,6 +526,14 @@ export function App() {
       'pcb',
       () => generatePcb(result!, switchType, diodeType, stabilizerType),
       'kicad_pcb',
+    )
+  }
+
+  function downloadPlateSvg() {
+    return downloadFile(
+      'plate',
+      () => generatePlateSvg(result!),
+      'plate.svg',
     )
   }
 
@@ -448,36 +691,58 @@ export function App() {
               <span className="toolbar-label">MCU (Pro Micro):</span>
               <label className="toolbar-input">
                 X
-                <input
-                  type="number"
-                  step="0.1"
-                  value={result.mcu_placement.cx_mm.toFixed(2)}
-                  onChange={(e) => updateMcu({ cx_mm: parseFloat(e.target.value) || 0 })}
+                <NumberInput
+                  step={0.1}
+                  value={result.mcu_placement.cx_mm}
+                  onChange={(n) => updateMcu({ cx_mm: n })}
                   title="X position (mm) of Pro Micro pin 1 (USB end). Drag the marker on the preview for coarse placement, fine-tune here."
                 />
               </label>
               <label className="toolbar-input">
                 Y
-                <input
-                  type="number"
-                  step="0.1"
-                  value={result.mcu_placement.cy_mm.toFixed(2)}
-                  onChange={(e) => updateMcu({ cy_mm: parseFloat(e.target.value) || 0 })}
+                <NumberInput
+                  step={0.1}
+                  value={result.mcu_placement.cy_mm}
+                  onChange={(n) => updateMcu({ cy_mm: n })}
                   title="Y position (mm) of Pro Micro pin 1 (USB end)."
                 />
               </label>
               <label className="toolbar-input">
                 Rotation
-                <input
-                  type="number"
-                  step="1"
-                  value={result.mcu_placement.rotation_deg.toFixed(1)}
-                  onChange={(e) =>
-                    updateMcu({ rotation_deg: parseFloat(e.target.value) || 0 })
-                  }
+                <NumberInput
+                  step={1}
+                  decimals={1}
+                  value={result.mcu_placement.rotation_deg}
+                  onChange={(n) => updateMcu({ rotation_deg: n })}
                   title="Rotation in degrees, SVG convention (clockwise positive). Pin 1 / USB end of the marker faces the direction USB will exit."
                 />
               </label>
+              {(() => {
+                const usb = getUsbJackWorld()
+                if (!usb) return null
+                return (
+                  <>
+                    <label className="toolbar-input">
+                      USB X
+                      <NumberInput
+                        step={0.1}
+                        value={usb.x}
+                        onChange={(n) => setUsbJackWorld(n, usb.y)}
+                        title="X coordinate (mm) of the USB-jack center. Computed from the pin-1 anchor + the module body width (17.78 mm) under the current rotation. Editing this slides the entire MCU so the USB lands at the entered X."
+                      />
+                    </label>
+                    <label className="toolbar-input">
+                      USB Y
+                      <NumberInput
+                        step={0.1}
+                        value={usb.y}
+                        onChange={(n) => setUsbJackWorld(usb.x, n)}
+                        title="Y coordinate (mm) of the USB-jack center — sits on the pin-1 edge of the module body. Editing this slides the entire MCU so the USB lands at the entered Y."
+                      />
+                    </label>
+                  </>
+                )
+              })()}
             </div>
           )}
           <div className="toolbar toolbar-strategy">
@@ -493,17 +758,127 @@ export function App() {
           <div className="toolbar toolbar-strategy">
             <span className="toolbar-label">Outline grow:</span>
             <label className="toolbar-input">
-              <input
-                type="number"
-                step="0.5"
+              <NumberInput
+                step={0.5}
                 min={0}
                 max={50}
-                value={result.outline_grow_mm.toFixed(1)}
-                onChange={(e) => setOutlineGrow(parseFloat(e.target.value) || 0)}
+                decimals={1}
+                value={result.outline_grow_mm}
+                onChange={(n) => setOutlineGrow(n)}
                 title="Dilate the PCB outline by N mm on all four sides. Useful when the plate SVG has zero clearance around the outermost cutouts and you need room for screw bosses or perimeter routing."
               />
               <span className="toolbar-unit">mm</span>
             </label>
+            <button
+              onClick={downloadPlateSvg}
+              disabled={busyExport !== null}
+              title="Export a clean plate SVG with the (possibly grown) outline and all switch / stab / mounting-hole cutouts. Hairline-stroked, fill-less — ready for laser cutting."
+            >
+              {busyExport === 'plate' ? 'Generating…' : 'Download plate SVG'}
+            </button>
+          </div>
+          <div className="toolbar toolbar-strategy">
+            <span className="toolbar-label">Plate edit:</span>
+            <button
+              className={editPlateMode ? 'active' : ''}
+              onClick={() =>
+                editPlateMode ? exitEditPlateMode() : enterEditPlateMode()
+              }
+              title="Edit the plate outline (drag, add, or delete vertices) and mounting holes. When growth was applied, the grown polygon becomes editable; the original parsed outline stays visible as a dashed reference."
+            >
+              {editPlateMode ? 'Editing (exit)' : 'Edit plate'}
+            </button>
+            {editPlateMode && (
+              <>
+                <button
+                  className={addingHole ? 'active' : ''}
+                  onClick={() => setAddingHole(!addingHole)}
+                  title="Arm hole-placement: the next click on the preview adds a mounting hole at that point."
+                >
+                  + Hole
+                </button>
+                {result.edited_outline_path_d && (
+                  <button
+                    onClick={resetEditedOutline}
+                    title="Discard outline edits and revert to the parsed outline (plus any outline_grow_mm)."
+                  >
+                    Reset outline
+                  </button>
+                )}
+                {selectedOutlineNodeIdx !== null && (() => {
+                  const verts = result.edited_outline_path_d
+                    ? parseOutlineVerts(result.edited_outline_path_d)
+                    : []
+                  const v = verts[selectedOutlineNodeIdx]
+                  if (!v) return null
+                  return (
+                    <>
+                      <label className="toolbar-input">
+                        Node X
+                        <NumberInput
+                          step={0.1}
+                          value={v.x}
+                          onChange={(n) =>
+                            moveOutlineNode(selectedOutlineNodeIdx, n, v.y)
+                          }
+                        />
+                      </label>
+                      <label className="toolbar-input">
+                        Y
+                        <NumberInput
+                          step={0.1}
+                          value={v.y}
+                          onChange={(n) =>
+                            moveOutlineNode(selectedOutlineNodeIdx, v.x, n)
+                          }
+                        />
+                      </label>
+                    </>
+                  )
+                })()}
+                {selectedHoleId !== null && (() => {
+                  const h = result.mounting_holes.find(
+                    (m) => m.id === selectedHoleId,
+                  )
+                  if (!h) return null
+                  return (
+                    <>
+                      <label className="toolbar-input">
+                        Hole ⌀
+                        <NumberInput
+                          step={0.1}
+                          min={0.5}
+                          value={h.diameter_mm}
+                          onChange={(n) => setMountingHoleDiameter(h.id, n)}
+                        />
+                        <span className="toolbar-unit">mm</span>
+                      </label>
+                      <button
+                        onClick={() => deleteMountingHole(h.id)}
+                        title="Delete this mounting hole (Delete / Backspace also works)."
+                      >
+                        Delete hole
+                      </button>
+                    </>
+                  )
+                })()}
+              </>
+            )}
+            <span className="toolbar-label" style={{ marginLeft: 18 }}>
+              Unit:
+            </span>
+            <select
+              value={unitOverride}
+              onChange={(e) => setUnitOverrideAndReparse(e.target.value)}
+              title={`Detected SVG unit: ${result.detected_svg_unit} (×${result.mm_per_unit} mm/unit). Override here if the heuristic picked wrong — re-parses the file under the new unit.`}
+            >
+              <option value="auto">Auto ({result.detected_svg_unit})</option>
+              <option value="mm">mm</option>
+              <option value="cm">cm</option>
+              <option value="in">in</option>
+              <option value="pt">pt</option>
+              <option value="pc">pc</option>
+            </select>
           </div>
           <div className="toolbar toolbar-export">
             <span className="toolbar-label">Export:</span>
@@ -551,6 +926,24 @@ export function App() {
               updateMcu({ cx_mm: Math.round(cx * 1000) / 1000, cy_mm: Math.round(cy * 1000) / 1000 })
             }
             inspectMode={inspectMode}
+            editPlateMode={editPlateMode}
+            addingHole={addingHole}
+            selectedOutlineNodeIdx={selectedOutlineNodeIdx}
+            selectedHoleId={selectedHoleId}
+            onSelectOutlineNode={setSelectedOutlineNodeIdx}
+            onSelectHole={setSelectedHoleId}
+            onMoveOutlineNode={(idx, x, y) =>
+              moveOutlineNode(idx, Math.round(x * 1000) / 1000, Math.round(y * 1000) / 1000)
+            }
+            onInsertOutlineNode={(edgeIdx, x, y) =>
+              insertOutlineNode(edgeIdx, Math.round(x * 1000) / 1000, Math.round(y * 1000) / 1000)
+            }
+            onAddHole={(x, y) =>
+              addMountingHole(Math.round(x * 1000) / 1000, Math.round(y * 1000) / 1000)
+            }
+            onMoveHole={(id, x, y) =>
+              moveMountingHole(id, Math.round(x * 1000) / 1000, Math.round(y * 1000) / 1000)
+            }
           />
           <MatrixGrid
             result={result}

@@ -52,6 +52,8 @@ export interface McuPlacement {
   rotation_deg: number
 }
 
+export type SvgUnit = 'auto' | 'mm' | 'cm' | 'in' | 'pt' | 'pc'
+
 export interface ParseResult {
   svg_width_mm: number
   svg_height_mm: number
@@ -63,4 +65,7 @@ export interface ParseResult {
   mcu_placement: McuPlacement | null
   outline_grow_mm: number
   matrix_strategy: MatrixStrategy
+  edited_outline_path_d: string | null
+  detected_svg_unit: string
+  mm_per_unit: number
 }

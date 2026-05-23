@@ -11,14 +11,48 @@ interface Props {
   onFlipStab: (id: number) => void
   onMcuMove?: (cx: number, cy: number) => void
   inspectMode?: boolean
+  editPlateMode?: boolean
+  addingHole?: boolean
+  selectedOutlineNodeIdx?: number | null
+  selectedHoleId?: number | null
+  onSelectOutlineNode?: (idx: number | null) => void
+  onSelectHole?: (id: number | null) => void
+  onMoveOutlineNode?: (idx: number, x: number, y: number) => void
+  onInsertOutlineNode?: (edgeIdx: number, x: number, y: number) => void
+  onAddHole?: (x: number, y: number) => void
+  onMoveHole?: (id: number, x: number, y: number) => void
 }
 
-// Pro Micro module body dimensions in mm, matching the backend footprint.
-// Pin 1 is the anchor (top-left in local frame); the USB connector sits at
-// local Y = 0 — the pin-1 short edge.
-const MCU_BODY_W_MM = 17.78
-const MCU_BODY_H_MM = 27.94
+const SNAP_AXIS_TOL_MM = 2.0
+
+// SparkFun Pro Micro module — the PCB itself measures 18 × 33 mm, with the
+// 2 × 12 pin grid (17.78 × 27.94 mm) inset asymmetrically: pin 1 sits
+// ~1.5 mm from the USB-end of the board and ~0.11 mm from the left long
+// edge. Pin 1 is the anchor (local (0, 0)); the body extends to (BODY_X,
+// BODY_Y) → (BODY_X + W, BODY_Y + H). The USB connector protrudes
+// MCU_USB_NOTCH_MM further beyond the board's USB-end edge.
+//
+// Through-hole pads at the body's long edges have ~0.85 mm radius and
+// stick out past the body by ~0.74 mm on each side. The dashed marker
+// envelope is the union of the body rect + pad clearance so placing the
+// marker's edge against a plate edge keeps every pad inside the board.
+const MCU_BODY_W_MM = 18.0
+const MCU_BODY_H_MM = 33.0
+const MCU_BODY_X_OFFSET = -0.11
+const MCU_BODY_Y_OFFSET = -1.5
+const MCU_PIN_GRID_W = 17.78
+const MCU_PIN_GRID_H = 27.94
+const MCU_PAD_RADIUS_MM = 0.85
 const MCU_USB_NOTCH_MM = 4.0
+// Marker envelope = union of body extent and pad-clearance extent.
+const MCU_MARKER_X = Math.min(MCU_BODY_X_OFFSET, -MCU_PAD_RADIUS_MM)
+const MCU_MARKER_Y = Math.min(MCU_BODY_Y_OFFSET, -MCU_PAD_RADIUS_MM)
+const MCU_MARKER_W =
+  Math.max(MCU_BODY_X_OFFSET + MCU_BODY_W_MM, MCU_PIN_GRID_W + MCU_PAD_RADIUS_MM) -
+  MCU_MARKER_X
+const MCU_MARKER_H =
+  Math.max(MCU_BODY_Y_OFFSET + MCU_BODY_H_MM, MCU_PIN_GRID_H + MCU_PAD_RADIUS_MM) -
+  MCU_MARKER_Y
 
 // Inspect mode: how close (in world mm) the cursor must be to a feature
 // before the readout snaps to it.
@@ -53,22 +87,6 @@ function centerRectCorners(
   })
 }
 
-function anchoredRectCorners(
-  ax: number, ay: number, w: number, h: number, rotDeg: number,
-): Array<{ x: number; y: number }> {
-  // Anchor at the top-left of the local rect (matches the MCU footprint
-  // convention: pin 1 at local (0, 0), body extends to (+W, +H)).
-  return [
-    { lx: 0, ly: 0 },
-    { lx: w, ly: 0 },
-    { lx: w, ly: h },
-    { lx: 0, ly: h },
-  ].map(({ lx, ly }) => {
-    const r = rotateAroundOrigin(lx, ly, rotDeg)
-    return { x: ax + r.x, y: ay + r.y }
-  })
-}
-
 function parsePathVertices(pathD: string): Array<{ x: number; y: number }> {
   // Tokenize SVG path commands + numbers. The backend currently emits only
   // M / L / Z (see `_rect_path`); we still tolerate H/V/h/v/m/l skipped pairs
@@ -98,6 +116,89 @@ function parsePathVertices(pathD: string): Array<{ x: number; y: number }> {
     } else {
       // Skip a value for unsupported commands (H/V) so we don't desync.
       i++
+    }
+  }
+  return out
+}
+
+// Mitered outward offset of a closed polygon. Mirrors Shapely's
+// `buffer(growMm, join_style=2)` behavior for convex / mild-concave shapes.
+//
+// For each vertex we displace its two adjacent edges outward by `growMm`
+// (along their outward unit normals) and intersect the displaced edges to
+// find the new vertex. Parallel-edge degenerate cases get a simple
+// translation by the average outward normal. Spikes from tight reflex
+// angles are clipped with a miter limit so very acute concave corners
+// don't blow up; for plate outlines this fallback rarely fires.
+function offsetPolygon(
+  verts: Array<{ x: number; y: number }>,
+  growMm: number,
+  miterLimit = 10,
+): Array<{ x: number; y: number }> {
+  const n = verts.length
+  if (n < 3 || growMm === 0) return verts.slice()
+  // Signed area: positive for CCW, negative for CW.
+  let area = 0
+  for (let i = 0; i < n; i++) {
+    const a = verts[i]
+    const b = verts[(i + 1) % n]
+    area += a.x * b.y - b.x * a.y
+  }
+  // SVG Y is down, so a polygon that visually winds clockwise has POSITIVE
+  // signed area here. Pick the outward-normal sign so the offset goes away
+  // from the polygon centroid regardless of the input winding.
+  const outwardSign = area >= 0 ? 1 : -1
+  type Edge = { px: number; py: number; nx: number; ny: number }
+  const edges: Edge[] = []
+  for (let i = 0; i < n; i++) {
+    const a = verts[i]
+    const b = verts[(i + 1) % n]
+    const dx = b.x - a.x
+    const dy = b.y - a.y
+    const len = Math.hypot(dx, dy) || 1
+    // Outward normal = rotate edge direction by 90° using outwardSign.
+    const nx = (outwardSign * dy) / len
+    const ny = (outwardSign * -dx) / len
+    edges.push({ px: a.x + nx * growMm, py: a.y + ny * growMm, nx, ny })
+  }
+  const out: Array<{ x: number; y: number }> = []
+  for (let i = 0; i < n; i++) {
+    const e1 = edges[(i - 1 + n) % n]
+    const e2 = edges[i]
+    // Edge directions are perpendicular to the outward normals.
+    const d1x = -e1.ny
+    const d1y = e1.nx
+    const d2x = -e2.ny
+    const d2y = e2.nx
+    // Intersect line (e1.p, dir d1) with line (e2.p, dir d2):
+    //   e1.p + t1 * d1 = e2.p + t2 * d2
+    const det = d1x * d2y - d1y * d2x
+    let nvx: number, nvy: number
+    if (Math.abs(det) < 1e-9) {
+      // Parallel edges (collinear or 180° turn) — just translate the
+      // original vertex by the average outward normal × growMm.
+      const ax = (e1.nx + e2.nx) * 0.5
+      const ay = (e1.ny + e2.ny) * 0.5
+      const m = Math.hypot(ax, ay) || 1
+      nvx = verts[i].x + (ax / m) * growMm
+      nvy = verts[i].y + (ay / m) * growMm
+    } else {
+      const dx = e2.px - e1.px
+      const dy = e2.py - e1.py
+      const t1 = (dx * d2y - dy * d2x) / det
+      nvx = e1.px + t1 * d1x
+      nvy = e1.py + t1 * d1y
+    }
+    // Miter limit: if the new vertex is unreasonably far from the original,
+    // replace it with two bevel vertices (one per offset edge).
+    const dxFromOrig = nvx - verts[i].x
+    const dyFromOrig = nvy - verts[i].y
+    const dist = Math.hypot(dxFromOrig, dyFromOrig)
+    if (dist > miterLimit * growMm) {
+      out.push({ x: e1.px, y: e1.py })
+      out.push({ x: e2.px, y: e2.py })
+    } else {
+      out.push({ x: nvx, y: nvy })
     }
   }
   return out
@@ -141,10 +242,23 @@ export function SvgPreview({
   onFlipStab,
   onMcuMove,
   inspectMode = false,
+  editPlateMode = false,
+  addingHole = false,
+  selectedOutlineNodeIdx = null,
+  selectedHoleId = null,
+  onSelectOutlineNode,
+  onSelectHole,
+  onMoveOutlineNode,
+  onInsertOutlineNode,
+  onAddHole,
+  onMoveHole,
 }: Props) {
   const [svgUrl, setSvgUrl] = useState<string | null>(null)
   const overlayRef = useRef<SVGSVGElement | null>(null)
   const mcuDragRef = useRef<{ pointerId: number; offsetX: number; offsetY: number } | null>(null)
+  const nodeDragRef = useRef<{ pointerId: number; idx: number } | null>(null)
+  const holeDragRef = useRef<{ pointerId: number; id: number } | null>(null)
+  const [snapGuide, setSnapGuide] = useState<{ x: number | null; y: number | null } | null>(null)
   const [altHeld, setAltHeld] = useState(false)
   const [inspectInfo, setInspectInfo] = useState<{
     cursor: { x: number; y: number }
@@ -152,6 +266,9 @@ export function SvgPreview({
   } | null>(null)
 
   const effectiveInspect = inspectMode || altHeld
+  // While editing the plate, inspect-mode hover is suppressed so handles don't
+  // get visually crowded by the inspect crosshair.
+  const inspectActive = effectiveInspect && !editPlateMode
 
   useEffect(() => {
     function onKeyDown(e: KeyboardEvent) {
@@ -174,8 +291,8 @@ export function SvgPreview({
   }, [])
 
   useEffect(() => {
-    if (!effectiveInspect) setInspectInfo(null)
-  }, [effectiveInspect])
+    if (!inspectActive) setInspectInfo(null)
+  }, [inspectActive])
 
   useEffect(() => {
     const url = URL.createObjectURL(file)
@@ -184,30 +301,35 @@ export function SvgPreview({
   }, [file])
 
   const { svg_width_mm: w, svg_height_mm: h } = result
-  // Expand viewBox so the MCU marker and grown outline render even when they
-  // sit outside the plate's natural bounds.
+  // Plate-anchored viewBox: derived solely from the plate bbox + a fixed
+  // margin and any outline_grow_mm / user-edited outline vertices. The MCU
+  // and mounting holes are deliberately *excluded* — dragging them never
+  // shifts the canvas. Placing them outside the plate is an invalid
+  // layout anyway; if they end up clipped, drag them back in.
+  const VIEW_MARGIN_MM = 2.0
   const padded = useMemo(() => {
-    let xmin = 0
-    let ymin = 0
-    let xmax = w
-    let ymax = h
+    let xmin = -VIEW_MARGIN_MM
+    let ymin = -VIEW_MARGIN_MM
+    let xmax = w + VIEW_MARGIN_MM
+    let ymax = h + VIEW_MARGIN_MM
     if (result.outline_grow_mm > 0) {
-      xmin = Math.min(xmin, -result.outline_grow_mm)
-      ymin = Math.min(ymin, -result.outline_grow_mm)
-      xmax = Math.max(xmax, w + result.outline_grow_mm)
-      ymax = Math.max(ymax, h + result.outline_grow_mm)
+      xmin = Math.min(xmin, -result.outline_grow_mm - VIEW_MARGIN_MM)
+      ymin = Math.min(ymin, -result.outline_grow_mm - VIEW_MARGIN_MM)
+      xmax = Math.max(xmax, w + result.outline_grow_mm + VIEW_MARGIN_MM)
+      ymax = Math.max(ymax, h + result.outline_grow_mm + VIEW_MARGIN_MM)
     }
-    if (result.mcu_placement) {
-      // Conservative: max possible extent of the body around the anchor under
-      // any rotation = diagonal of the bounding rect.
-      const r = Math.hypot(MCU_BODY_W_MM, MCU_BODY_H_MM + MCU_USB_NOTCH_MM)
-      xmin = Math.min(xmin, result.mcu_placement.cx_mm - r)
-      ymin = Math.min(ymin, result.mcu_placement.cy_mm - r)
-      xmax = Math.max(xmax, result.mcu_placement.cx_mm + r)
-      ymax = Math.max(ymax, result.mcu_placement.cy_mm + r)
+    if (result.edited_outline_path_d) {
+      // User-edited outline can extend past the original viewBox.
+      const editVerts = parsePathVertices(result.edited_outline_path_d)
+      for (const v of editVerts) {
+        xmin = Math.min(xmin, v.x)
+        ymin = Math.min(ymin, v.y)
+        xmax = Math.max(xmax, v.x)
+        ymax = Math.max(ymax, v.y)
+      }
     }
     return { xmin, ymin, w: xmax - xmin, h: ymax - ymin }
-  }, [w, h, result.outline_grow_mm, result.mcu_placement])
+  }, [w, h, result.outline_grow_mm, result.mcu_placement, result.edited_outline_path_d])
   const viewBox = `${padded.xmin} ${padded.ymin} ${padded.w} ${padded.h}`
   const dotR = Math.min(w, h) * 0.012
   const tickLen = Math.min(w, h) * 0.045
@@ -235,7 +357,7 @@ export function SvgPreview({
   }, [result.switches])
 
   function handleSwitchClick(e: MouseEvent<SVGElement>, id: number) {
-    if (effectiveInspect) return
+    if (inspectActive || editPlateMode) return
     e.preventDefault()
     e.stopPropagation()
     const delta = e.shiftKey ? -90 : 90
@@ -244,13 +366,19 @@ export function SvgPreview({
   }
 
   function handleStabClick(e: MouseEvent<SVGElement>, id: number) {
-    if (effectiveInspect) return
+    if (inspectActive || editPlateMode) return
     e.preventDefault()
     e.stopPropagation()
     onFlipStab(id)
   }
 
-  function clientToMm(e: ReactPointerEvent<SVGElement> | PointerEvent): { x: number; y: number } | null {
+  function clientToMm(
+    e:
+      | ReactPointerEvent<SVGElement>
+      | PointerEvent
+      | MouseEvent<SVGElement>
+      | { clientX: number; clientY: number },
+  ): { x: number; y: number } | null {
     const svg = overlayRef.current
     if (!svg) return null
     const rect = svg.getBoundingClientRect()
@@ -266,7 +394,7 @@ export function SvgPreview({
   }
 
   function handleMcuPointerDown(e: ReactPointerEvent<SVGElement>) {
-    if (effectiveInspect) return
+    if (inspectActive || editPlateMode) return
     if (!onMcuMove || !result.mcu_placement) return
     const pos = clientToMm(e)
     if (!pos) return
@@ -286,18 +414,303 @@ export function SvgPreview({
     if (!onMcuMove) return
     const pos = clientToMm(e)
     if (!pos) return
-    onMcuMove(pos.x - drag.offsetX, pos.y - drag.offsetY)
+    let nx = pos.x - drag.offsetX
+    let ny = pos.y - drag.offsetY
+    if (altHeld && result.mcu_placement) {
+      const snapped = snapMcuBodyToPlateEdges(nx, ny, result.mcu_placement.rotation_deg)
+      nx = snapped.x
+      ny = snapped.y
+      setSnapGuide(snapped.guide)
+    } else {
+      setSnapGuide(null)
+    }
+    onMcuMove(nx, ny)
+  }
+
+  // Effective plate snap lines: every axis-aligned edge of the final
+  // outline polygon (edited if present, else parsed; then dilated by
+  // outline_grow_mm), plus every vertex's X and Y as fallback snap
+  // candidates so modified (non-axis-aligned) edges still register their
+  // endpoints as alignment cues.
+  function getPlateSnapLines(): { xs: number[]; ys: number[] } {
+    const basePath =
+      result.edited_outline_path_d || result.pcb_outline.path_d
+    let verts = parsePathVertices(basePath)
+    if (verts.length < 3) {
+      // Fall back to the SVG viewBox rectangle.
+      verts = [
+        { x: 0, y: 0 },
+        { x: w, y: 0 },
+        { x: w, y: h },
+        { x: 0, y: h },
+      ]
+    }
+    if (result.outline_grow_mm > 0) {
+      verts = offsetPolygon(verts, result.outline_grow_mm)
+    }
+    const eps = 0.05
+    const xs = new Set<number>()
+    const ys = new Set<number>()
+    for (let i = 0; i < verts.length; i++) {
+      const a = verts[i]
+      const b = verts[(i + 1) % verts.length]
+      if (Math.abs(a.x - b.x) < eps) {
+        xs.add(Number(a.x.toFixed(4)))
+      } else if (Math.abs(a.y - b.y) < eps) {
+        ys.add(Number(a.y.toFixed(4)))
+      }
+    }
+    for (const v of verts) {
+      xs.add(Number(v.x.toFixed(4)))
+      ys.add(Number(v.y.toFixed(4)))
+    }
+    return {
+      xs: [...xs].sort((p, q) => p - q),
+      ys: [...ys].sort((p, q) => p - q),
+    }
+  }
+
+  function snapMcuBodyToPlateEdges(
+    cx: number,
+    cy: number,
+    rotDeg: number,
+  ): { x: number; y: number; guide: { x: number | null; y: number | null } } {
+    // Compute the MCU body's axis-aligned bbox in world coords at the
+    // candidate (cx, cy) and current rotation. Then nudge (cx, cy) so the
+    // nearest body bbox edge aligns with any axis-aligned plate edge
+    // within SNAP_AXIS_TOL_MM.
+    const rad = (rotDeg * Math.PI) / 180
+    const cos = Math.cos(rad)
+    const sin = Math.sin(rad)
+    const corners: Array<[number, number]> = [
+      [MCU_BODY_X_OFFSET, MCU_BODY_Y_OFFSET],
+      [MCU_BODY_X_OFFSET + MCU_BODY_W_MM, MCU_BODY_Y_OFFSET],
+      [MCU_BODY_X_OFFSET + MCU_BODY_W_MM, MCU_BODY_Y_OFFSET + MCU_BODY_H_MM],
+      [MCU_BODY_X_OFFSET, MCU_BODY_Y_OFFSET + MCU_BODY_H_MM],
+    ]
+    let bodyXmin = Infinity
+    let bodyXmax = -Infinity
+    let bodyYmin = Infinity
+    let bodyYmax = -Infinity
+    for (const [lx, ly] of corners) {
+      const wx = cx + lx * cos - ly * sin
+      const wy = cy + lx * sin + ly * cos
+      bodyXmin = Math.min(bodyXmin, wx)
+      bodyXmax = Math.max(bodyXmax, wx)
+      bodyYmin = Math.min(bodyYmin, wy)
+      bodyYmax = Math.max(bodyYmax, wy)
+    }
+    const { xs: plateXs, ys: plateYs } = getPlateSnapLines()
+    let bestDx = 0
+    let bestAxisDx = Infinity
+    let guideX: number | null = null
+    for (const bodyX of [bodyXmin, bodyXmax]) {
+      for (const plateX of plateXs) {
+        const d = plateX - bodyX
+        if (Math.abs(d) <= SNAP_AXIS_TOL_MM && Math.abs(d) < bestAxisDx) {
+          bestAxisDx = Math.abs(d)
+          bestDx = d
+          guideX = plateX
+        }
+      }
+    }
+    let bestDy = 0
+    let bestAxisDy = Infinity
+    let guideY: number | null = null
+    for (const bodyY of [bodyYmin, bodyYmax]) {
+      for (const plateY of plateYs) {
+        const d = plateY - bodyY
+        if (Math.abs(d) <= SNAP_AXIS_TOL_MM && Math.abs(d) < bestAxisDy) {
+          bestAxisDy = Math.abs(d)
+          bestDy = d
+          guideY = plateY
+        }
+      }
+    }
+    return { x: cx + bestDx, y: cy + bestDy, guide: { x: guideX, y: guideY } }
   }
 
   function handleMcuPointerUp(e: ReactPointerEvent<SVGElement>) {
     if (mcuDragRef.current?.pointerId === e.pointerId) {
       mcuDragRef.current = null
+      setSnapGuide(null)
       try {
         e.currentTarget.releasePointerCapture(e.pointerId)
       } catch {
         // ignore
       }
     }
+  }
+
+  // ----------- Edit-plate mode helpers ------------------------------------
+
+  // Current outline vertices for edit mode (drives handles + snap targets).
+  const editedOutlineVerts = useMemo<Array<{ x: number; y: number }> | null>(() => {
+    if (!editPlateMode || !result.edited_outline_path_d) return null
+    return parsePathVertices(result.edited_outline_path_d)
+  }, [editPlateMode, result.edited_outline_path_d])
+
+  // Build the Alt-snap target set: every outline vertex's X and every
+  // mounting-hole center's X (and the same for Y). Each entry omits the
+  // node/hole that's currently being dragged so a feature doesn't snap to
+  // its own coords.
+  function buildSnapAxes(excludeNodeIdx: number | null, excludeHoleId: number | null) {
+    const xs: number[] = []
+    const ys: number[] = []
+    if (editedOutlineVerts) {
+      editedOutlineVerts.forEach((v, i) => {
+        if (i === excludeNodeIdx) return
+        xs.push(v.x)
+        ys.push(v.y)
+      })
+    }
+    for (const h of result.mounting_holes) {
+      if (h.id === excludeHoleId) continue
+      xs.push(h.cx_mm)
+      ys.push(h.cy_mm)
+    }
+    return { xs, ys }
+  }
+
+  function snapToAxes(
+    x: number,
+    y: number,
+    excludeNodeIdx: number | null,
+    excludeHoleId: number | null,
+  ): { x: number; y: number; guideX: number | null; guideY: number | null } {
+    const { xs, ys } = buildSnapAxes(excludeNodeIdx, excludeHoleId)
+    let snappedX = x
+    let snappedY = y
+    let guideX: number | null = null
+    let guideY: number | null = null
+    let bestDx = SNAP_AXIS_TOL_MM
+    for (const tx of xs) {
+      const d = Math.abs(tx - x)
+      if (d < bestDx) {
+        bestDx = d
+        snappedX = tx
+        guideX = tx
+      }
+    }
+    let bestDy = SNAP_AXIS_TOL_MM
+    for (const ty of ys) {
+      const d = Math.abs(ty - y)
+      if (d < bestDy) {
+        bestDy = d
+        snappedY = ty
+        guideY = ty
+      }
+    }
+    return { x: snappedX, y: snappedY, guideX, guideY }
+  }
+
+  function handleNodePointerDown(e: ReactPointerEvent<SVGElement>, idx: number) {
+    if (!editPlateMode || !onMoveOutlineNode) return
+    e.stopPropagation()
+    e.preventDefault()
+    nodeDragRef.current = { pointerId: e.pointerId, idx }
+    e.currentTarget.setPointerCapture(e.pointerId)
+    onSelectOutlineNode?.(idx)
+    onSelectHole?.(null)
+  }
+
+  function handleNodePointerMove(e: ReactPointerEvent<SVGElement>) {
+    const drag = nodeDragRef.current
+    if (!drag || drag.pointerId !== e.pointerId) return
+    const pos = clientToMm(e)
+    if (!pos) return
+    if (altHeld) {
+      const snapped = snapToAxes(pos.x, pos.y, drag.idx, null)
+      setSnapGuide({ x: snapped.guideX, y: snapped.guideY })
+      onMoveOutlineNode?.(drag.idx, snapped.x, snapped.y)
+    } else {
+      setSnapGuide(null)
+      onMoveOutlineNode?.(drag.idx, pos.x, pos.y)
+    }
+  }
+
+  function handleNodePointerUp(e: ReactPointerEvent<SVGElement>) {
+    if (nodeDragRef.current?.pointerId === e.pointerId) {
+      nodeDragRef.current = null
+      setSnapGuide(null)
+      try {
+        e.currentTarget.releasePointerCapture(e.pointerId)
+      } catch {
+        // ignore
+      }
+    }
+  }
+
+  function handleEdgeClick(e: MouseEvent<SVGElement>, edgeIdx: number) {
+    if (!editPlateMode || !onInsertOutlineNode || !editedOutlineVerts) return
+    e.stopPropagation()
+    e.preventDefault()
+    const a = editedOutlineVerts[edgeIdx]
+    const b = editedOutlineVerts[(edgeIdx + 1) % editedOutlineVerts.length]
+    onInsertOutlineNode(edgeIdx, (a.x + b.x) / 2, (a.y + b.y) / 2)
+  }
+
+  function handleHolePointerDown(e: ReactPointerEvent<SVGElement>, id: number) {
+    if (!editPlateMode || !onMoveHole) return
+    e.stopPropagation()
+    e.preventDefault()
+    holeDragRef.current = { pointerId: e.pointerId, id }
+    e.currentTarget.setPointerCapture(e.pointerId)
+    onSelectHole?.(id)
+    onSelectOutlineNode?.(null)
+  }
+
+  function handleHolePointerMove(e: ReactPointerEvent<SVGElement>) {
+    const drag = holeDragRef.current
+    if (!drag || drag.pointerId !== e.pointerId) return
+    const pos = clientToMm(e)
+    if (!pos) return
+    if (altHeld) {
+      const snapped = snapToAxes(pos.x, pos.y, null, drag.id)
+      setSnapGuide({ x: snapped.guideX, y: snapped.guideY })
+      onMoveHole?.(drag.id, snapped.x, snapped.y)
+    } else {
+      setSnapGuide(null)
+      onMoveHole?.(drag.id, pos.x, pos.y)
+    }
+  }
+
+  function handleHolePointerUp(e: ReactPointerEvent<SVGElement>) {
+    if (holeDragRef.current?.pointerId === e.pointerId) {
+      holeDragRef.current = null
+      setSnapGuide(null)
+      try {
+        e.currentTarget.releasePointerCapture(e.pointerId)
+      } catch {
+        // ignore
+      }
+    }
+  }
+
+  function handleOverlayClick(e: MouseEvent<SVGSVGElement>) {
+    // In edit mode, a click on the SVG either places a new hole (if armed)
+    // or clears node/hole selection on empty-canvas clicks.
+    if (!editPlateMode) return
+    if (addingHole && onAddHole) {
+      // Hole placement ignores what's underneath the cursor — the plate
+      // outline path has a translucent fill that would otherwise swallow
+      // every click on the plate area. Node / hole / edge handlers all
+      // stopPropagation on pointerdown, so they won't reach this click.
+      const pos = clientToMm(e)
+      if (!pos) return
+      if (altHeld) {
+        const snapped = snapToAxes(pos.x, pos.y, null, null)
+        onAddHole(snapped.x, snapped.y)
+      } else {
+        onAddHole(pos.x, pos.y)
+      }
+      return
+    }
+    // Otherwise only treat as a "clear selection" gesture when the click
+    // truly landed on empty canvas, not on a child element.
+    if (e.target !== e.currentTarget) return
+    onSelectOutlineNode?.(null)
+    onSelectHole?.(null)
   }
 
   // Inspect-mode snap targets: corners of every rectangular feature + centers
@@ -326,19 +739,19 @@ export function SvgPreview({
           label: isCorner ? 'Plate corner' : `Plate node ${idx + 1}`,
         })
       })
-      // Grown outline (only when growth > 0). Today the backend always emits
-      // a rectangular path so a bbox dilation is exact; for future non-rect
-      // outlines this falls back to the dilated bbox of the same vertices.
+      // Grown outline (only when growth > 0). True mitered offset of the
+      // outline polygon — same algorithm the dashed-overlay path uses, so
+      // every snap target matches what the user sees.
       if (result.outline_grow_mm > 0) {
-        const g = result.outline_grow_mm
-        for (const [x, y] of [
-          [xmin - g, ymin - g],
-          [xmax + g, ymin - g],
-          [xmax + g, ymax + g],
-          [xmin - g, ymax + g],
-        ]) {
-          out.push({ kind: 'corner', x, y, label: 'Grown outline corner' })
-        }
+        const grownVerts = offsetPolygon(verts, result.outline_grow_mm)
+        grownVerts.forEach((v, idx) =>
+          out.push({
+            kind: 'corner',
+            x: v.x,
+            y: v.y,
+            label: `Grown outline node ${idx + 1}`,
+          }),
+        )
       }
     }
     // Switch fab corners (14×14 mm centered on switch, rotated).
@@ -353,12 +766,37 @@ export function SvgPreview({
         out.push({ kind: 'corner', x: c.x, y: c.y, label: `Stab${s.id} corner` })
       }
     }
-    // MCU body corners — anchored at pin 1 (top-left of local frame), so
-    // corners walk (0,0)→(W,0)→(W,H)→(0,H) before rotation.
+    // MCU body corners + pad-clearance envelope corners. Pin 1 is the
+    // anchor; body corners walk from (BODY_X, BODY_Y) → (BODY_X+W, BODY_Y+H).
     if (result.mcu_placement) {
       const m = result.mcu_placement
-      for (const c of anchoredRectCorners(m.cx_mm, m.cy_mm, MCU_BODY_W_MM, MCU_BODY_H_MM, m.rotation_deg)) {
-        out.push({ kind: 'corner', x: c.x, y: c.y, label: 'MCU corner' })
+      const rad = (m.rotation_deg * Math.PI) / 180
+      const cos = Math.cos(rad)
+      const sin = Math.sin(rad)
+      const localCornerSets: Array<[number, number, string]> = []
+      for (const [lx, ly] of [
+        [MCU_BODY_X_OFFSET, MCU_BODY_Y_OFFSET],
+        [MCU_BODY_X_OFFSET + MCU_BODY_W_MM, MCU_BODY_Y_OFFSET],
+        [MCU_BODY_X_OFFSET + MCU_BODY_W_MM, MCU_BODY_Y_OFFSET + MCU_BODY_H_MM],
+        [MCU_BODY_X_OFFSET, MCU_BODY_Y_OFFSET + MCU_BODY_H_MM],
+      ]) {
+        localCornerSets.push([lx, ly, 'MCU body corner'])
+      }
+      for (const [lx, ly] of [
+        [MCU_MARKER_X, MCU_MARKER_Y],
+        [MCU_MARKER_X + MCU_MARKER_W, MCU_MARKER_Y],
+        [MCU_MARKER_X + MCU_MARKER_W, MCU_MARKER_Y + MCU_MARKER_H],
+        [MCU_MARKER_X, MCU_MARKER_Y + MCU_MARKER_H],
+      ]) {
+        localCornerSets.push([lx, ly, 'MCU outline corner'])
+      }
+      for (const [lx, ly, label] of localCornerSets) {
+        out.push({
+          kind: 'corner',
+          x: m.cx_mm + lx * cos - ly * sin,
+          y: m.cy_mm + lx * sin + ly * cos,
+          label,
+        })
       }
       // Pin 1 / USB anchor itself — also useful to snap to.
       out.push({ kind: 'corner', x: m.cx_mm, y: m.cy_mm, label: 'MCU pin 1 (USB)' })
@@ -387,7 +825,7 @@ export function SvgPreview({
   }
 
   function handleOverlayPointerMove(e: ReactPointerEvent<SVGSVGElement>) {
-    if (!effectiveInspect) return
+    if (!inspectActive) return
     const pos = clientToMm(e)
     if (!pos) return
     setInspectInfo({ cursor: pos, target: findNearestSnap(pos.x, pos.y) })
@@ -415,22 +853,34 @@ export function SvgPreview({
     }
   }
 
-  // Grown outline: parse the original rect path for its bounds, then expand
-  // by outline_grow_mm on all four sides. Only renders when growth is > 0.
-  const grownOutline = useMemo(() => {
+  // Grown outline: true mitered offset of the active base outline (the
+  // user-edited polygon if any, else the parsed outline). For a rectangular
+  // outline this still produces a rectangle `grow` mm bigger; for a
+  // polygonal outline the halo follows every notch — matching what
+  // Shapely's buffer() will emit into Edge.Cuts on the PCB side.
+  const grownOutlineVerts = useMemo(() => {
     const grow = result.outline_grow_mm
     if (!grow || grow <= 0) return null
-    const nums = result.pcb_outline.path_d.match(/-?\d+(?:\.\d+)?/g)?.map(Number) ?? []
-    if (nums.length < 8) return null
-    const xs = [nums[0], nums[2], nums[4], nums[6]]
-    const ys = [nums[1], nums[3], nums[5], nums[7]]
-    return {
-      x0: Math.min(...xs) - grow,
-      y0: Math.min(...ys) - grow,
-      x1: Math.max(...xs) + grow,
-      y1: Math.max(...ys) + grow,
-    }
-  }, [result.outline_grow_mm, result.pcb_outline.path_d])
+    const basePath =
+      result.edited_outline_path_d || result.pcb_outline.path_d
+    const verts = parsePathVertices(basePath)
+    if (verts.length < 3) return null
+    return offsetPolygon(verts, grow)
+  }, [
+    result.outline_grow_mm,
+    result.pcb_outline.path_d,
+    result.edited_outline_path_d,
+  ])
+
+  const grownOutlinePath = useMemo(() => {
+    if (!grownOutlineVerts || grownOutlineVerts.length < 3) return null
+    const [v0, ...rest] = grownOutlineVerts
+    return (
+      `M ${v0.x.toFixed(4)} ${v0.y.toFixed(4)} ` +
+      rest.map((v) => `L ${v.x.toFixed(4)} ${v.y.toFixed(4)}`).join(' ') +
+      ' Z'
+    )
+  }, [grownOutlineVerts])
 
   return (
     <div className="preview">
@@ -444,12 +894,14 @@ export function SvgPreview({
             style={{
               // Position the plate image within the (possibly padded) stage
               // so MCU markers / grown outlines outside the plate render in
-              // the surrounding padded region.
+              // the surrounding padded region. `inset: auto` must come FIRST
+              // — it's shorthand for top/right/bottom/left and would clobber
+              // our explicit left/top if declared after them.
+              inset: 'auto',
               left: `${((-padded.xmin) / padded.w) * 100}%`,
               top: `${((-padded.ymin) / padded.h) * 100}%`,
               width: `${(w / padded.w) * 100}%`,
               height: `${(h / padded.h) * 100}%`,
-              inset: 'auto',
             }}
           />
         )}
@@ -459,24 +911,45 @@ export function SvgPreview({
           viewBox={viewBox}
           preserveAspectRatio="xMidYMid meet"
           xmlns="http://www.w3.org/2000/svg"
-          style={{ cursor: effectiveInspect ? 'crosshair' : undefined }}
+          style={{
+            cursor:
+              inspectActive || (editPlateMode && addingHole)
+                ? 'crosshair'
+                : undefined,
+          }}
           onPointerMove={handleOverlayPointerMove}
           onPointerLeave={handleOverlayPointerLeave}
+          onClick={handleOverlayClick}
         >
-          {grownOutline && (
-            <rect
-              x={grownOutline.x0}
-              y={grownOutline.y0}
-              width={grownOutline.x1 - grownOutline.x0}
-              height={grownOutline.y1 - grownOutline.y0}
+          {/* Outline rendering — three independent dashed/solid layers:
+              1. Grown halo around whichever base outline is active (only
+                 when outline_grow_mm > 0); dashed.
+              2. Original parsed outline (only when the user has edits, so
+                 they can see what changed); dashed.
+              3. Active base outline (edited if present, else parsed);
+                 solid.
+              The dashed grown halo is what the PCB Edge.Cuts will use when
+              grow > 0 — applied on top of whatever base outline is active. */}
+          {grownOutlinePath && (
+            <path
+              d={grownOutlinePath}
               fill="rgba(220, 50, 50, 0.04)"
               stroke="rgba(220, 50, 50, 0.55)"
               strokeWidth={stroke * 0.8}
               strokeDasharray={`${stroke * 4} ${stroke * 3}`}
             />
           )}
+          {result.edited_outline_path_d && (
+            <path
+              d={result.pcb_outline.path_d}
+              fill="none"
+              stroke="rgba(220, 50, 50, 0.55)"
+              strokeWidth={stroke * 0.8}
+              strokeDasharray={`${stroke * 4} ${stroke * 3}`}
+            />
+          )}
           <path
-            d={result.pcb_outline.path_d}
+            d={result.edited_outline_path_d || result.pcb_outline.path_d}
             fill="rgba(220, 50, 50, 0.10)"
             stroke="rgba(220, 50, 50, 0.85)"
             strokeWidth={stroke}
@@ -602,21 +1075,46 @@ export function SvgPreview({
             )
           })}
 
-          {result.mounting_holes.map((h) => (
-            <circle
-              key={`mh-${h.id}`}
-              cx={h.cx_mm}
-              cy={h.cy_mm}
-              r={h.diameter_mm / 2}
-              fill="rgba(180, 180, 190, 0.55)"
-              stroke="rgba(80, 90, 110, 0.95)"
-              strokeWidth={stroke * 0.7}
-            >
-              <title>
-                mounting hole #{h.id} — ⌀{h.diameter_mm.toFixed(2)} mm
-              </title>
-            </circle>
-          ))}
+          {result.mounting_holes.map((h) => {
+            const isSelected = editPlateMode && selectedHoleId === h.id
+            return (
+              <g key={`mh-${h.id}`}>
+                <circle
+                  cx={h.cx_mm}
+                  cy={h.cy_mm}
+                  r={h.diameter_mm / 2}
+                  fill="rgba(180, 180, 190, 0.55)"
+                  stroke={
+                    isSelected
+                      ? 'rgba(255, 220, 80, 0.95)'
+                      : 'rgba(80, 90, 110, 0.95)'
+                  }
+                  strokeWidth={
+                    isSelected ? stroke * 1.6 : stroke * 0.7
+                  }
+                  style={{ cursor: editPlateMode ? 'grab' : 'default' }}
+                  onPointerDown={
+                    editPlateMode
+                      ? (e) => handleHolePointerDown(e, h.id)
+                      : undefined
+                  }
+                  onPointerMove={
+                    editPlateMode ? handleHolePointerMove : undefined
+                  }
+                  onPointerUp={
+                    editPlateMode ? handleHolePointerUp : undefined
+                  }
+                  onPointerCancel={
+                    editPlateMode ? handleHolePointerUp : undefined
+                  }
+                >
+                  <title>
+                    mounting hole #{h.id} — ⌀{h.diameter_mm.toFixed(2)} mm
+                  </title>
+                </circle>
+              </g>
+            )
+          })}
 
           {result.unclassified.map((u) => (
             <circle
@@ -644,20 +1142,42 @@ export function SvgPreview({
               onPointerUp={handleMcuPointerUp}
               onPointerCancel={handleMcuPointerUp}
             >
-              {/* USB notch protruding from local Y = 0 (pin-1 short edge). */}
+              {/* USB notch protruding past the body's USB-end edge. */}
               <rect
-                x={result.mcu_placement.cx_mm + MCU_BODY_W_MM * 0.30}
-                y={result.mcu_placement.cy_mm - MCU_USB_NOTCH_MM}
+                x={
+                  result.mcu_placement.cx_mm +
+                  MCU_BODY_X_OFFSET +
+                  MCU_BODY_W_MM * 0.30
+                }
+                y={
+                  result.mcu_placement.cy_mm +
+                  MCU_BODY_Y_OFFSET -
+                  MCU_USB_NOTCH_MM
+                }
                 width={MCU_BODY_W_MM * 0.40}
                 height={MCU_USB_NOTCH_MM}
                 fill="rgba(60, 60, 70, 0.95)"
                 stroke="rgba(20, 20, 30, 0.95)"
                 strokeWidth={stroke * 0.6}
               />
-              {/* Module body (17.78 × 27.94 mm, anchored at pin 1). */}
+              {/* Pad-clearance envelope: union of body + pin-pad extent.
+                  Placing this outline against the plate edge keeps every
+                  pad safely inside the board. */}
               <rect
-                x={result.mcu_placement.cx_mm}
-                y={result.mcu_placement.cy_mm}
+                x={result.mcu_placement.cx_mm + MCU_MARKER_X}
+                y={result.mcu_placement.cy_mm + MCU_MARKER_Y}
+                width={MCU_MARKER_W}
+                height={MCU_MARKER_H}
+                fill="rgba(40, 70, 200, 0.10)"
+                stroke="rgba(40, 70, 200, 0.55)"
+                strokeWidth={stroke * 0.6}
+                strokeDasharray={`${stroke * 2} ${stroke * 2}`}
+              />
+              {/* Module body (18 × 33 mm). Pin 1 sits at the anchor, with
+                  the body extending up and out around it per the offsets. */}
+              <rect
+                x={result.mcu_placement.cx_mm + MCU_BODY_X_OFFSET}
+                y={result.mcu_placement.cy_mm + MCU_BODY_Y_OFFSET}
                 width={MCU_BODY_W_MM}
                 height={MCU_BODY_H_MM}
                 fill="rgba(40, 70, 200, 0.20)"
@@ -676,13 +1196,14 @@ export function SvgPreview({
                 <title>
                   Pro Micro U1 — pin 1 (USB end){'\n'}
                   ({result.mcu_placement.cx_mm.toFixed(2)}, {result.mcu_placement.cy_mm.toFixed(2)}) mm{'\n'}
+                  body {MCU_BODY_W_MM.toFixed(2)} × {MCU_BODY_H_MM.toFixed(2)} mm{'\n'}
                   rotation {result.mcu_placement.rotation_deg.toFixed(1)}°
                 </title>
               </circle>
             </g>
           )}
 
-          {effectiveInspect && inspectInfo?.target && (
+          {inspectActive && inspectInfo?.target && (
             <g className="inspect-crosshair" pointerEvents="none">
               <circle
                 cx={inspectInfo.target.x}
@@ -710,8 +1231,88 @@ export function SvgPreview({
               />
             </g>
           )}
+
+          {/* Edit-plate handles: edge midpoints (insert) + vertices (drag). */}
+          {editPlateMode && editedOutlineVerts && editedOutlineVerts.length >= 2 && (
+            <g className="outline-edit-handles">
+              {editedOutlineVerts.map((v, idx) => {
+                const next = editedOutlineVerts[(idx + 1) % editedOutlineVerts.length]
+                const mx = (v.x + next.x) / 2
+                const my = (v.y + next.y) / 2
+                return (
+                  <circle
+                    key={`edge-${idx}`}
+                    cx={mx}
+                    cy={my}
+                    r={dotR * 0.9}
+                    fill="rgba(80, 200, 130, 0.55)"
+                    stroke="rgba(20, 110, 60, 0.95)"
+                    strokeWidth={stroke * 0.6}
+                    style={{ cursor: 'copy' }}
+                    onClick={(e) => handleEdgeClick(e, idx)}
+                  >
+                    <title>
+                      add node on edge {idx} → ({mx.toFixed(2)}, {my.toFixed(2)})
+                    </title>
+                  </circle>
+                )
+              })}
+              {editedOutlineVerts.map((v, idx) => {
+                const isSel = selectedOutlineNodeIdx === idx
+                return (
+                  <circle
+                    key={`node-${idx}`}
+                    cx={v.x}
+                    cy={v.y}
+                    r={dotR * 1.2}
+                    fill={isSel ? 'rgba(255, 220, 80, 0.95)' : 'rgba(220, 100, 100, 0.9)'}
+                    stroke="white"
+                    strokeWidth={stroke * 0.8}
+                    style={{ cursor: 'grab' }}
+                    onPointerDown={(e) => handleNodePointerDown(e, idx)}
+                    onPointerMove={handleNodePointerMove}
+                    onPointerUp={handleNodePointerUp}
+                    onPointerCancel={handleNodePointerUp}
+                  >
+                    <title>
+                      outline node {idx} — ({v.x.toFixed(2)}, {v.y.toFixed(2)})
+                      {'\n'}drag to move · Alt to snap · Delete to remove
+                    </title>
+                  </circle>
+                )
+              })}
+            </g>
+          )}
+
+          {/* Alt-snap guide lines (rendered during a node or hole drag). */}
+          {snapGuide && (
+            <g pointerEvents="none">
+              {snapGuide.x !== null && (
+                <line
+                  x1={snapGuide.x}
+                  y1={padded.ymin}
+                  x2={snapGuide.x}
+                  y2={padded.ymin + padded.h}
+                  stroke="rgba(255, 220, 80, 0.7)"
+                  strokeWidth={stroke * 0.6}
+                  strokeDasharray={`${stroke * 3} ${stroke * 2}`}
+                />
+              )}
+              {snapGuide.y !== null && (
+                <line
+                  x1={padded.xmin}
+                  y1={snapGuide.y}
+                  x2={padded.xmin + padded.w}
+                  y2={snapGuide.y}
+                  stroke="rgba(255, 220, 80, 0.7)"
+                  strokeWidth={stroke * 0.6}
+                  strokeDasharray={`${stroke * 3} ${stroke * 2}`}
+                />
+              )}
+            </g>
+          )}
         </svg>
-        {effectiveInspect && inspectInfo && (() => {
+        {inspectActive && inspectInfo && (() => {
           const anchor = inspectInfo.target ?? inspectInfo.cursor
           const pix = mmToStagePixel(anchor.x, anchor.y)
           if (!pix) return null
@@ -742,7 +1343,7 @@ export function SvgPreview({
             </div>
           )
         })()}
-        {effectiveInspect && inspectInfo && (
+        {inspectActive && inspectInfo && (
           <div className="inspect-cursor-coords">
             cursor: {inspectInfo.cursor.x.toFixed(2)}, {inspectInfo.cursor.y.toFixed(2)} mm
             {altHeld && !inspectMode && (
@@ -769,8 +1370,22 @@ export function SvgPreview({
           </span>
         )}
         <span>
-          <span className="dot dot-outline" /> PCB outline
+          <span className="dot dot-outline" />{' '}
+          {result.edited_outline_path_d
+            ? 'PCB outline (edited)'
+            : 'PCB outline'}
         </span>
+        {result.edited_outline_path_d && (
+          <span>
+            <span className="dot dot-outline-dashed" /> original outline
+          </span>
+        )}
+        {result.outline_grow_mm > 0 && (
+          <span>
+            <span className="dot dot-outline-dashed" /> grown outline (+
+            {result.outline_grow_mm.toFixed(1)} mm)
+          </span>
+        )}
         <span>
           <span className="line-swatch line-swatch-row" /> rows ({rowLines.length})
         </span>

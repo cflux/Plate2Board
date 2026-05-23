@@ -5,6 +5,7 @@ from ..services.svg_parser import parse_plate_svg
 
 MAX_SVG_BYTES = 1_000_000
 ALLOWED_STRATEGIES = {"row_first", "column_first", "stagger_aware", "auto"}
+ALLOWED_UNITS = {"auto", "mm", "cm", "in", "pt", "pc"}
 
 router = APIRouter()
 
@@ -13,6 +14,7 @@ router = APIRouter()
 async def parse_svg(
     file: UploadFile = File(...),
     matrix_strategy: str = Form("auto"),
+    svg_unit_override: str = Form("auto"),
 ) -> ParseResult:
     if matrix_strategy not in ALLOWED_STRATEGIES:
         raise HTTPException(
@@ -20,6 +22,14 @@ async def parse_svg(
             detail=(
                 f"matrix_strategy must be one of {sorted(ALLOWED_STRATEGIES)}, "
                 f"got {matrix_strategy!r}"
+            ),
+        )
+    if svg_unit_override not in ALLOWED_UNITS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"svg_unit_override must be one of {sorted(ALLOWED_UNITS)}, "
+                f"got {svg_unit_override!r}"
             ),
         )
     raw = await file.read()
@@ -30,6 +40,10 @@ async def parse_svg(
     except UnicodeDecodeError as exc:
         raise HTTPException(status_code=400, detail=f"SVG must be UTF-8 text: {exc}")
     try:
-        return parse_plate_svg(svg_text, matrix_strategy=matrix_strategy)
+        return parse_plate_svg(
+            svg_text,
+            matrix_strategy=matrix_strategy,
+            svg_unit_override=svg_unit_override,
+        )
     except SvgParseError as exc:
         raise HTTPException(status_code=400, detail=str(exc))

@@ -90,13 +90,19 @@ export async function generateProjectZip(
   return res.blob()
 }
 
+export function generatePlateSvg(result: ParseResult): Promise<string> {
+  return postBody('/api/generate-plate-svg', result)
+}
+
 export async function parseSvg(
   file: File,
   strategy: MatrixStrategy = 'row_first',
+  unitOverride: string = 'auto',
 ): Promise<ParseResult> {
   const body = new FormData()
   body.append('file', file)
   body.append('matrix_strategy', strategy)
+  body.append('svg_unit_override', unitOverride)
   const res = await fetch('/api/parse', { method: 'POST', body })
   if (!res.ok) {
     let detail = res.statusText

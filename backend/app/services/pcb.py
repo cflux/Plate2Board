@@ -135,7 +135,11 @@ def generate_pcb(
     for hole in parse.mounting_holes:
         out.append(_mounting_hole_footprint(hole))
 
-    out.extend(_edge_cuts(parse.pcb_outline.path_d, parse.outline_grow_mm))
+    # User-edited outline (from edit-plate mode) replaces the parsed
+    # outline as the base shape; `outline_grow_mm` still dilates whichever
+    # base is in use, so the grow slider keeps working after edits.
+    base_outline = parse.edited_outline_path_d or parse.pcb_outline.path_d
+    out.extend(_edge_cuts(base_outline, parse.outline_grow_mm))
 
     out.append(")")
     return "\n".join(out) + "\n"

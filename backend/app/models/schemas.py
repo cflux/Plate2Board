@@ -58,6 +58,14 @@ class ParseResult(BaseModel):
     mcu_placement: McuPlacement | None = None
     outline_grow_mm: float = 0.0
     matrix_strategy: str = "row_first"
+    # User-edited outline polygon (set when the user is in edit-plate mode).
+    # When non-null, every generator uses this verbatim instead of applying
+    # `outline_grow_mm` to `pcb_outline.path_d`.
+    edited_outline_path_d: str | None = None
+    # Unit info — the parser detects the SVG's unit (mm / cm / in / pt / pc /
+    # px-inferred via switch-cutout heuristic) and reports it for the UI.
+    detected_svg_unit: str = "mm"
+    mm_per_unit: float = 1.0
 
 
 class SvgParseError(ValueError):

@@ -449,6 +449,14 @@ header .tag {
   height: 8px;
 }
 
+.legend .dot-outline-dashed {
+  background: transparent;
+  border: 2px dashed rgba(220, 50, 50, 0.7);
+  border-radius: 2px;
+  width: 12px;
+  height: 8px;
+}
+
 .matrix-grid-wrapper {
   margin-top: 16px;
 }
