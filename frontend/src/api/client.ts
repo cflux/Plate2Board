@@ -41,8 +41,16 @@ export function generateNetlist(switches: SwitchDef[]): Promise<string> {
   return postBody('/api/generate-netlist', { switches })
 }
 
-export function generateSchematic(switches: SwitchDef[]): Promise<string> {
-  return postBody('/api/generate-schematic', { switches })
+export function generateSchematic(
+  switches: SwitchDef[],
+  switchType: SwitchType = 'soldered',
+  diodeType: DiodeType = 'tht',
+): Promise<string> {
+  const params = new URLSearchParams({
+    switch_type: switchType,
+    diode_type: diodeType,
+  })
+  return postBody(`/api/generate-schematic?${params}`, { switches })
 }
 
 export function generatePcb(

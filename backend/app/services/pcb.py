@@ -35,7 +35,7 @@ DIODE_OFFSET_MM = 5.5
 HEADER_GAP_MM = 12.0
 TRACE_WIDTH_MM = 0.25
 MCU_REF = "U1"
-MCU_FOOTPRINT = "Module:Arduino_Pro_Micro"
+MCU_FOOTPRINT = "keeb:Arduino_Pro_Micro"
 
 # KiCad page sizes (landscape, mm). We pick the smallest one the board+grow
 # extents fit inside with a 20 mm margin so the title block + page border
@@ -386,14 +386,14 @@ def _switch_soldered(sw: SwitchDef, nets: dict[str, int]) -> str:
     link_name = f"NET-SW{sw.id}-D{sw.id}"
     rot = _kicad_angle(sw.rotation_deg)
     return (
-        f'\t(footprint "Button_Switch_Keyboard:SW_Cherry_MX_1.00u_PCB"\n'
+        f'\t(footprint "keeb:SW_Cherry_MX_PCB_1.00u"\n'
         f'\t\t(layer "F.Cu")\n'
         f'\t\t(uuid "{fp_uuid}")\n'
         f"\t\t(at {sw.cx_mm:.4f} {sw.cy_mm:.4f} {rot:.3f})\n"
         f'\t\t(descr "Cherry MX 1U keyswitch, PCB-mount, soldered")\n'
         f'\t\t(tags "Cherry MX Keyboard Keyswitch Switch PCB")\n'
         f"\t\t(attr through_hole)\n"
-        + _common_props(ref, "SW_Push", "Button_Switch_Keyboard:SW_Cherry_MX_1.00u_PCB", rot)
+        + _common_props(ref, "SW_Push", "keeb:SW_Cherry_MX_PCB_1.00u", rot)
         + _silk_keycap()
         + _fab_switch_body(rot)
         + _crtyd_keycap("F")
@@ -415,14 +415,14 @@ def _switch_hotswap(sw: SwitchDef, nets: dict[str, int]) -> str:
     link_name = f"NET-SW{sw.id}-D{sw.id}"
     rot = _kicad_angle(sw.rotation_deg)
     return (
-        f'\t(footprint "Switch_Keyboard_Hotswap_Kailh:SW_Hotswap_Kailh_MX_1.00u"\n'
+        f'\t(footprint "keeb:SW_Hotswap_Kailh_MX_1.00u"\n'
         f'\t\t(layer "F.Cu")\n'
         f'\t\t(uuid "{fp_uuid}")\n'
         f"\t\t(at {sw.cx_mm:.4f} {sw.cy_mm:.4f} {rot:.3f})\n"
         f'\t\t(descr "Cherry MX 1U keyswitch, Kailh CPG151101S11 hotswap socket on B.Cu")\n'
         f'\t\t(tags "Cherry MX Keyboard Hotswap Kailh")\n'
         f"\t\t(attr smd)\n"
-        + _common_props(ref, "SW_Push", "Switch_Keyboard_Hotswap_Kailh:SW_Hotswap_Kailh_MX_1.00u", rot)
+        + _common_props(ref, "SW_Push", "keeb:SW_Hotswap_Kailh_MX_1.00u", rot)
         + _silk_keycap()
         + _fab_switch_body(rot)
         + _crtyd_keycap("F")
@@ -594,7 +594,7 @@ def _diode_footprint_tht(sw: SwitchDef, nets: dict[str, int]) -> str:
     cx, cy = _diode_position(sw)
     rot = _kicad_angle(sw.rotation_deg)
     return (
-        f'\t(footprint "Diode_THT:D_DO-35_SOD27_P7.62mm_Horizontal"\n'
+        f'\t(footprint "keeb:D_DO-35_SOD27_P7.62mm_Horizontal"\n'
         f'\t\t(layer "F.Cu")\n'
         f'\t\t(uuid "{fp_uuid}")\n'
         f"\t\t(at {cx:.4f} {cy:.4f} {rot:.3f})\n"
@@ -604,7 +604,7 @@ def _diode_footprint_tht(sw: SwitchDef, nets: dict[str, int]) -> str:
         + _common_props(
             ref,
             "1N4148",
-            "Diode_THT:D_DO-35_SOD27_P7.62mm_Horizontal",
+            "keeb:D_DO-35_SOD27_P7.62mm_Horizontal",
             rot,
             text_offset_y=1.8,
         )
@@ -642,7 +642,7 @@ def _diode_footprint_smd(
     cx, cy = _smd_diode_position(sw, switch_type)
     rot = _kicad_angle((sw.rotation_deg + 90) % 360)
     return (
-        f'\t(footprint "Diode_SMD:D_SOD-123"\n'
+        f'\t(footprint "keeb:D_SOD-123"\n'
         f'\t\t(layer "B.Cu")\n'
         f'\t\t(uuid "{fp_uuid}")\n'
         f"\t\t(at {cx:.4f} {cy:.4f} {rot:.3f})\n"
@@ -652,7 +652,7 @@ def _diode_footprint_smd(
         + _common_props(
             ref,
             "1N4148",
-            "Diode_SMD:D_SOD-123",
+            "keeb:D_SOD-123",
             rot,
             side="B",
             text_offset_y=1.8,
@@ -989,7 +989,7 @@ def _stabilizer_pcb_mount(
         )
 
     return (
-        f'\t(footprint "keeb-layout-bot:Stabilizer_PCB_Mount"\n'
+        f'\t(footprint "keeb:Stabilizer_PCB_Mount"\n'
         f'\t\t(layer "F.Cu")\n'
         f'\t\t(uuid "{fp_uuid}")\n'
         f"\t\t(at {switch.cx_mm:.4f} {switch.cy_mm:.4f} {rot:.3f})\n"
@@ -1000,7 +1000,7 @@ def _stabilizer_pcb_mount(
         + _common_props(
             ref,
             "Stab_PCB_Mount",
-            "keeb-layout-bot:Stabilizer_PCB_Mount",
+            "keeb:Stabilizer_PCB_Mount",
             rot,
             text_offset_y=12.0,
         )
@@ -1045,7 +1045,7 @@ def _stabilizer_plate_mount(
     )
 
     return (
-        f'\t(footprint "keeb-layout-bot:Stabilizer_Plate_Mount"\n'
+        f'\t(footprint "keeb:Stabilizer_Plate_Mount"\n'
         f'\t\t(layer "F.Cu")\n'
         f'\t\t(uuid "{fp_uuid}")\n'
         f"\t\t(at {switch.cx_mm:.4f} {switch.cy_mm:.4f} {rot:.3f})\n"
@@ -1056,7 +1056,7 @@ def _stabilizer_plate_mount(
         + _common_props(
             ref,
             "Stab_Plate_Mount",
-            "keeb-layout-bot:Stabilizer_Plate_Mount",
+            "keeb:Stabilizer_Plate_Mount",
             rot,
             text_offset_y=12.0,
         )
@@ -1093,7 +1093,7 @@ def _mounting_hole_footprint(hole: MountingHoleDef) -> str:
     # silk so the board doesn't get cluttered with "MH1 / MountingHole" labels
     # around every drill. KiCad still requires the properties to exist.
     return (
-        f'\t(footprint "MountingHole:MountingHole_{drill:.1f}mm"\n'
+        f'\t(footprint "keeb:MountingHole_{drill:.1f}mm"\n'
         f'\t\t(layer "F.Cu")\n'
         f'\t\t(uuid "{fp_uuid}")\n'
         f"\t\t(at {hole.cx_mm:.4f} {hole.cy_mm:.4f} 0)\n"
@@ -1104,7 +1104,7 @@ def _mounting_hole_footprint(hole: MountingHoleDef) -> str:
         f"\t\t\t(effects (font (size 1 1) (thickness 0.15))))\n"
         f'\t\t(property "Value" "MountingHole" (at 0 0 0) (layer "F.Fab") hide (uuid "{_u()}")\n'
         f"\t\t\t(effects (font (size 1 1) (thickness 0.15))))\n"
-        f'\t\t(property "Footprint" "MountingHole:MountingHole_{drill:.1f}mm" (at 0 0 0) (layer "F.Fab") hide (uuid "{_u()}")\n'
+        f'\t\t(property "Footprint" "keeb:MountingHole_{drill:.1f}mm" (at 0 0 0) (layer "F.Fab") hide (uuid "{_u()}")\n'
         f"\t\t\t(effects (font (size 1.27 1.27))))\n"
         f'\t\t(pad "" np_thru_hole circle (at 0 0) (size {pad:.2f} {pad:.2f}) (drill {drill:.2f})\n'
         f'\t\t\t(layers "*.Cu" "*.Mask") (uuid "{_u()}"))\n'

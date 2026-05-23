@@ -65,7 +65,7 @@ def test_single_switch_placed_at_parsed_coords() -> None:
     # to match SVG. SVG positive-CW is emitted as KiCad negative-CCW so the
     # `(at)` angle is -10.
     assert re.search(
-        r'\(footprint "Button_Switch_Keyboard:SW_Cherry_MX_1\.00u_PCB".*?'
+        r'\(footprint "keeb:SW_Cherry_MX_PCB_1\.00u".*?'
         r'\(at 19\.0500 9\.5250 -10\.000\)',
         out,
         re.DOTALL,
@@ -74,7 +74,7 @@ def test_single_switch_placed_at_parsed_coords() -> None:
     assert '"SW1"' in out
     assert '"D1"' in out
     assert '"U1"' in out
-    assert "Module:Arduino_Pro_Micro" in out
+    assert "keeb:Arduino_Pro_Micro" in out
     # Minimum nets: COL0, ROW0, NET-SW1-D1.
     assert '(net 1 "ROW0")' in out
     assert '(net 2 "COL0")' in out
@@ -87,7 +87,7 @@ def test_diode_offset_rotates_with_switch() -> None:
     sw = _sw(1, 50.0, 50.0, rotation=90.0)
     out = generate_pcb(_result(switches=[sw]))
     m = re.search(
-        r'\(footprint "Diode_THT:D_DO-35_SOD27_P7\.62mm_Horizontal"'
+        r'\(footprint "keeb:D_DO-35_SOD27_P7\.62mm_Horizontal"'
         r'\s*\(layer "F\.Cu"\)\s*\(uuid "[^"]+"\)\s*'
         r'\(at ([-\d.]+) ([-\d.]+) ([-\d.]+)\)',
         out,
@@ -115,7 +115,7 @@ def test_mounting_hole_refdes_and_fab_text_hidden() -> None:
     holes = [MountingHoleDef(id=1, cx_mm=5.0, cy_mm=5.0, diameter_mm=2.5)]
     out = generate_pcb(_result(switches=[_sw(1, 19.05, 9.525)], mounting_holes=holes))
     mh_block = re.search(
-        r'\(footprint "MountingHole:MountingHole_2\.5mm".+?\n\t\)',
+        r'\(footprint "keeb:MountingHole_2\.5mm".+?\n\t\)',
         out,
         re.DOTALL,
     )
@@ -161,11 +161,11 @@ def test_pcb_mount_stab_emits_canonical_holes() -> None:
         stabilizer_type="pcb_mount",
     )
 
-    assert '"keeb-layout-bot:Stabilizer_PCB_Mount"' in out
+    assert '"keeb:Stabilizer_PCB_Mount"' in out
     assert "(at 50.0000 50.0000 0.000)" in out
 
     stab_block = re.search(
-        r'\(footprint "keeb-layout-bot:Stabilizer_PCB_Mount".+?\n\t\)',
+        r'\(footprint "keeb:Stabilizer_PCB_Mount".+?\n\t\)',
         out,
         re.DOTALL,
     )
@@ -208,9 +208,9 @@ def test_plate_mount_stab_emits_footprint_keepout_zone() -> None:
         stabilizer_type="plate_mount",
     )
 
-    assert '"keeb-layout-bot:Stabilizer_Plate_Mount"' in out
+    assert '"keeb:Stabilizer_Plate_Mount"' in out
     stab_block = re.search(
-        r'\(footprint "keeb-layout-bot:Stabilizer_Plate_Mount".+?\n\t\)',
+        r'\(footprint "keeb:Stabilizer_Plate_Mount".+?\n\t\)',
         out,
         re.DOTALL,
     )
@@ -244,7 +244,7 @@ def test_stab_pairing_picks_nearest_switch() -> None:
     # the opening `(footprint "..."` token, not the name's appearance inside
     # the Footprint property of common props.
     stab_footprints = re.findall(
-        r'^\t\(footprint "keeb-layout-bot:Stabilizer_PCB_Mount"',
+        r'^\t\(footprint "keeb:Stabilizer_PCB_Mount"',
         out,
         re.MULTILINE,
     )
@@ -281,7 +281,7 @@ def test_stab_pair_stays_together_when_row_is_sparse() -> None:
 
     # Exactly one stab assembly footprint, anchored on the spacebar.
     fps = re.findall(
-        r'^\t\(footprint "keeb-layout-bot:Stabilizer_PCB_Mount"',
+        r'^\t\(footprint "keeb:Stabilizer_PCB_Mount"',
         out,
         re.MULTILINE,
     )
@@ -290,7 +290,7 @@ def test_stab_pair_stays_together_when_row_is_sparse() -> None:
     assert "(at 121.4000 70.0000 0.000)" in out
     # And the assembly contains four NPTH (both stab sides).
     stab_block = re.search(
-        r'\(footprint "keeb-layout-bot:Stabilizer_PCB_Mount".+?\n\t\)',
+        r'\(footprint "keeb:Stabilizer_PCB_Mount".+?\n\t\)',
         out,
         re.DOTALL,
     ).group(0)
@@ -332,13 +332,13 @@ def test_stab_pairing_handles_rotated_switch() -> None:
     out = generate_pcb(_result(switches=[sw], stabilizers=stabs))
 
     fps = re.findall(
-        r'^\t\(footprint "keeb-layout-bot:Stabilizer_PCB_Mount"',
+        r'^\t\(footprint "keeb:Stabilizer_PCB_Mount"',
         out,
         re.MULTILINE,
     )
     assert len(fps) == 1
     stab_block = re.search(
-        r'\(footprint "keeb-layout-bot:Stabilizer_PCB_Mount".+?\n\t\)',
+        r'\(footprint "keeb:Stabilizer_PCB_Mount".+?\n\t\)',
         out,
         re.DOTALL,
     ).group(0)
@@ -365,9 +365,9 @@ def test_svg_clockwise_rotation_emitted_as_negative_kicad_angle() -> None:
 
     # All three footprint families carry -15.000 in their (at), not +15.000.
     for fp_name in (
-        "Button_Switch_Keyboard:SW_Cherry_MX_1.00u_PCB",
-        "Diode_THT:D_DO-35_SOD27_P7.62mm_Horizontal",
-        "keeb-layout-bot:Stabilizer_PCB_Mount",
+        "keeb:SW_Cherry_MX_PCB_1.00u",
+        "keeb:D_DO-35_SOD27_P7.62mm_Horizontal",
+        "keeb:Stabilizer_PCB_Mount",
     ):
         m = re.search(
             rf'\(footprint "{re.escape(fp_name)}".*?'
@@ -412,7 +412,7 @@ def test_mcu_placement_override_carries_through() -> None:
     out = generate_pcb(parse)
     # Pro Micro footprint anchored at (20, 10) with KiCad angle -90 (SVG CW = KiCad CCW negative).
     assert re.search(
-        r'\(footprint "Module:Arduino_Pro_Micro".*?\(at 20\.0000 10\.0000 -90\.000\)',
+        r'\(footprint "keeb:Arduino_Pro_Micro".*?\(at 20\.0000 10\.0000 -90\.000\)',
         out,
         re.DOTALL,
     )
@@ -505,7 +505,7 @@ def test_kbplate_full_pcb_has_every_switch_and_diode(example_plate_svg: str) -> 
         assert f'"D{sw.id}"' in out
 
     # Pro Micro module footprint (24-pin, 2 × 12 thru-hole).
-    assert "Module:Arduino_Pro_Micro" in out
+    assert "keeb:Arduino_Pro_Micro" in out
     assert '"U1"' in out
 
 
@@ -522,7 +522,7 @@ def test_hotswap_emits_smd_socket_pads_on_b_cu() -> None:
     """Hotswap variant has B.Cu SMD pads where the Kailh socket clips on,
     plus enlarged 3 mm NPTH at the switch pin positions for socket-arm clearance."""
     out = generate_pcb(_result(switches=[_sw(1, 50, 50)]), switch_type="hotswap")
-    assert '"Switch_Keyboard_Hotswap_Kailh:SW_Hotswap_Kailh_MX_1.00u"' in out
+    assert '"keeb:SW_Hotswap_Kailh_MX_1.00u"' in out
     # SMD pad 1 on B.Cu at (-7.085, -2.54).
     assert re.search(
         r'\(pad "1" smd rect \(at -7\.085 -2\.54\) \(size 2\.55 2\.5\)\s*'
@@ -557,7 +557,7 @@ def test_unknown_switch_type_raises() -> None:
 
 def test_smd_diode_emits_sod123_on_b_cu() -> None:
     out = generate_pcb(_result(switches=[_sw(1, 50, 50)]), diode_type="smd")
-    assert '"Diode_SMD:D_SOD-123"' in out
+    assert '"keeb:D_SOD-123"' in out
     # Pads on B.Cu, no thru-hole drill.
     assert re.search(
         r'\(pad "1" smd rect \(at -1\.65 0\) \(size 1\.0 0\.6\)\s*'
@@ -565,13 +565,13 @@ def test_smd_diode_emits_sod123_on_b_cu() -> None:
         out,
     )
     # No THT diode present.
-    assert "Diode_THT:D_DO-35" not in out
+    assert "keeb:D_DO-35" not in out
 
 
 def test_tht_diode_remains_default() -> None:
     out = generate_pcb(_result(switches=[_sw(1, 50, 50)]))
-    assert "Diode_THT:D_DO-35_SOD27_P7.62mm_Horizontal" in out
-    assert "Diode_SMD:D_SOD-123" not in out
+    assert "keeb:D_DO-35_SOD27_P7.62mm_Horizontal" in out
+    assert "keeb:D_SOD-123" not in out
 
 
 def test_unknown_diode_type_raises() -> None:
@@ -631,7 +631,7 @@ def test_centering_shifts_switch_to_page_center_on_a4() -> None:
     # A4 (page center 148.5, 105) minus board half (50, 25) → switch lands at
     # (98.5, 80) in page coords.
     m = re.search(
-        r'\(footprint "Button_Switch_Keyboard:SW_Cherry_MX_1\.00u_PCB".*?'
+        r'\(footprint "keeb:SW_Cherry_MX_PCB_1\.00u".*?'
         r'\(at ([-\d.]+) ([-\d.]+)',
         out, re.DOTALL,
     )

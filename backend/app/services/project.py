@@ -10,6 +10,7 @@ import re
 import zipfile
 
 from ..models.schemas import ParseResult
+from .embed_footprints import extract_kicad_mod_templates, fp_lib_table_text
 from .pcb import DiodeType, StabilizerType, SwitchType, generate_pcb
 from .schematic import generate_schematic
 
@@ -36,7 +37,9 @@ def generate_project_zip(
     regenerated."""
     project_name = _safe_name(project_name) or DEFAULT_PROJECT_NAME
 
-    sch_text = generate_schematic(parse.switches)
+    sch_text = generate_schematic(
+        parse.switches, switch_type=switch_type, diode_type=diode_type,
+    )
     if pcb_text_override is not None:
         pcb_text = pcb_text_override
     else:
@@ -48,11 +51,24 @@ def generate_project_zip(
         )
     pro_text = _project_file(project_name, _extract_root_uuid(sch_text))
 
+    # Embedded footprint library: one .kicad_mod per unique footprint
+    # name in the PCB, plus an fp-lib-table at the project root pointing
+    # KiCad at it. Without this, "Update PCB from Schematic" fails per-
+    # symbol with "footprint not found" because KiCad can't resolve the
+    # `keeb:` library reference from the inline pcb footprints alone.
+    fp_templates = extract_kicad_mod_templates(pcb_text)
+
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.writestr(f"{project_name}/{project_name}.kicad_pro", pro_text)
         zf.writestr(f"{project_name}/{project_name}.kicad_sch", sch_text)
         zf.writestr(f"{project_name}/{project_name}.kicad_pcb", pcb_text)
+        zf.writestr(f"{project_name}/fp-lib-table", fp_lib_table_text())
+        for bare_name, mod_text in fp_templates.items():
+            zf.writestr(
+                f"{project_name}/footprints.pretty/{bare_name}.kicad_mod",
+                mod_text,
+            )
     return buf.getvalue()
 
 

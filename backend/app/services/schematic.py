@@ -15,12 +15,16 @@ import tempfile
 from pathlib import Path
 
 from ..models.schemas import SwitchDef
+from .footprints import (
+    DiodeType,
+    SwitchType,
+    diode_footprint,
+    mcu_footprint,
+    switch_footprint,
+)
 from .matrix import renumber_switches
 
-SW_FOOTPRINT = "Button_Switch_Keyboard:SW_Cherry_MX_PCB_1.00u"
-DIODE_FOOTPRINT = "Diode_THT:D_DO-35_SOD27_P7.62mm_Horizontal"
 MCU_REF = "U1"
-MCU_FOOTPRINT = "Module:Arduino_Pro_Micro"
 KICAD_SYMBOL_DIR = os.environ.get("KICAD_SYMBOL_DIR", "/usr/share/kicad/symbols")
 KEEB_SYMBOL_DIR = os.environ.get("KEEB_SYMBOL_DIR", "/opt/keeb-symbols")
 
@@ -34,7 +38,16 @@ PRO_MICRO_GPIO_PINS = [
 ]
 
 
-def generate_schematic(switches: list[SwitchDef]) -> str:
+def generate_schematic(
+    switches: list[SwitchDef],
+    *,
+    switch_type: SwitchType = "soldered",
+    diode_type: DiodeType = "tht",
+) -> str:
+    """Emit the .kicad_sch text. `switch_type` / `diode_type` select the
+    footprint property that's written into each symbol — they MUST match
+    the values passed to `generate_pcb`, otherwise "Update PCB from
+    Schematic" mis-resolves footprints and fails per-component."""
     if not switches:
         raise ValueError("cannot generate schematic from zero switches")
 
@@ -62,16 +75,18 @@ def generate_schematic(switches: list[SwitchDef]) -> str:
         )
 
     SW = skidl.Part(
-        "Switch", "SW_Push", dest=skidl.TEMPLATE, footprint=SW_FOOTPRINT
+        "Switch", "SW_Push", dest=skidl.TEMPLATE,
+        footprint=switch_footprint(switch_type),
     )
     D = skidl.Part(
-        "Diode", "1N4148", dest=skidl.TEMPLATE, footprint=DIODE_FOOTPRINT
+        "Diode", "1N4148", dest=skidl.TEMPLATE,
+        footprint=diode_footprint(diode_type),
     )
     mcu = skidl.Part(
         "Keyboard_MCU",
         "ProMicro",
         ref=MCU_REF,
-        footprint=MCU_FOOTPRINT,
+        footprint=mcu_footprint(),
     )
 
     row_nets = {r: skidl.Net(f"ROW{r}") for r in rows}

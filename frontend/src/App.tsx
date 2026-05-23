@@ -611,7 +611,7 @@ export function App() {
   function downloadSchematic() {
     return downloadFile(
       'sch',
-      () => generateSchematic(result!.switches),
+      () => generateSchematic(result!.switches, switchType, diodeType),
       'kicad_sch',
     )
   }

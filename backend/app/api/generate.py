@@ -40,13 +40,29 @@ async def post_generate_netlist(req: NetlistRequest) -> PlainTextResponse:
 
 
 @router.post("/generate-schematic", response_class=PlainTextResponse)
-async def post_generate_schematic(req: NetlistRequest) -> PlainTextResponse:
+async def post_generate_schematic(
+    req: NetlistRequest,
+    switch_type: str = "soldered",
+    diode_type: str = "tht",
+) -> PlainTextResponse:
     if not req.switches:
         raise HTTPException(
             status_code=400, detail="cannot generate schematic from zero switches"
         )
+    if switch_type not in SWITCH_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"switch_type must be one of {sorted(SWITCH_TYPES)}, got {switch_type!r}",
+        )
+    if diode_type not in DIODE_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"diode_type must be one of {sorted(DIODE_TYPES)}, got {diode_type!r}",
+        )
     try:
-        text = generate_schematic(req.switches)
+        text = generate_schematic(
+            req.switches, switch_type=switch_type, diode_type=diode_type,
+        )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"SKiDL failed: {exc}") from exc
     return PlainTextResponse(
