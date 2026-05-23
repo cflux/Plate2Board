@@ -36,6 +36,18 @@ HEADER_GAP_MM = 12.0
 TRACE_WIDTH_MM = 0.25
 MCU_REF = "U1"
 MCU_FOOTPRINT = "Module:Arduino_Pro_Micro"
+
+# KiCad page sizes (landscape, mm). We pick the smallest one the board+grow
+# extents fit inside with a 20 mm margin so the title block + page border
+# never overlap the board.
+PAPER_SIZES_MM: tuple[tuple[str, float, float], ...] = (
+    ("A4", 297.0, 210.0),
+    ("A3", 420.0, 297.0),
+    ("A2", 594.0, 420.0),
+    ("A1", 841.0, 594.0),
+    ("A0", 1189.0, 841.0),
+)
+PAGE_MARGIN_MM = 20.0
 PRO_MICRO_GPIO_PINS = [
     5, 6, 7, 8, 9, 10, 11, 12,
     13, 14, 15, 16, 17, 18, 19, 20,
@@ -44,6 +56,114 @@ PRO_MICRO_GPIO_PINS = [
 
 SwitchType = Literal["soldered", "hotswap"]
 SWITCH_TYPES: tuple[SwitchType, ...] = ("soldered", "hotswap")
+
+
+# ---------------------------------------------------------------------------
+# Page centering
+# ---------------------------------------------------------------------------
+
+
+def _outline_bbox_mm(parse: ParseResult) -> tuple[float, float, float, float]:
+    """Return ``(xmin, ymin, xmax, ymax)`` of the effective board outline:
+    edited polygon if present (else parsed), grown by ``outline_grow_mm``.
+    Falls back to the SVG width/height when the path has too few points."""
+    base = parse.edited_outline_path_d or parse.pcb_outline.path_d
+    pts = _parse_path_points(base)
+    if parse.outline_grow_mm > 0 and len(pts) >= 3:
+        pts = _grow_polygon_points(pts, parse.outline_grow_mm)
+    if len(pts) < 2:
+        return (0.0, 0.0, parse.svg_width_mm, parse.svg_height_mm)
+    xs = [p[0] for p in pts]
+    ys = [p[1] for p in pts]
+    return (min(xs), min(ys), max(xs), max(ys))
+
+
+def _pick_paper_size(width_mm: float, height_mm: float) -> tuple[str, float, float]:
+    """Return the smallest KiCad paper that fits ``width_mm × height_mm``
+    with ``PAGE_MARGIN_MM`` of slack on every edge. Falls back to A0 if
+    the board is bigger than any standard sheet."""
+    need_w = width_mm + 2 * PAGE_MARGIN_MM
+    need_h = height_mm + 2 * PAGE_MARGIN_MM
+    for name, pw, ph in PAPER_SIZES_MM:
+        if pw >= need_w and ph >= need_h:
+            return (name, pw, ph)
+    return PAPER_SIZES_MM[-1]
+
+
+def _translate_path_d(path_d: str, dx: float, dy: float) -> str:
+    """Apply ``(dx, dy)`` to every M/L pair in an SVG-style path string.
+    Z/H/V are passed through unchanged (our parser only emits M/L/Z)."""
+    out_parts: list[str] = []
+    for cmd, x, y in _PATH_TOKEN.findall(path_d):
+        cmd_u = cmd.upper()
+        if cmd_u in ("M", "L") and x is not None and y is not None:
+            nx = float(x) + dx
+            ny = float(y) + dy
+            out_parts.append(f"{cmd} {nx:.4f} {ny:.4f}")
+        else:
+            out_parts.append(cmd)
+    return " ".join(out_parts)
+
+
+def center_parse_on_page(parse: ParseResult) -> tuple[str, ParseResult]:
+    """Return ``(paper_name, shifted_parse)`` with every coord translated so
+    the board's bbox centers on the chosen paper. Pick the smallest paper
+    that fits ``board + 20 mm margin`` on all sides; centering the board
+    keeps it well clear of KiCad's title block / page border.
+
+    Translates: switches, stabilizers, mounting holes, MCU placement,
+    pcb_outline.path_d, edited_outline_path_d. Unclassified shapes are
+    purely informational and pass through unchanged.
+    """
+    xmin, ymin, xmax, ymax = _outline_bbox_mm(parse)
+    board_w = xmax - xmin
+    board_h = ymax - ymin
+    paper_name, paper_w, paper_h = _pick_paper_size(board_w, board_h)
+    # Target: board center sits on page center.
+    dx = (paper_w / 2.0) - (xmin + board_w / 2.0)
+    dy = (paper_h / 2.0) - (ymin + board_h / 2.0)
+
+    shifted_outline = parse.pcb_outline.model_copy(
+        update={"path_d": _translate_path_d(parse.pcb_outline.path_d, dx, dy)}
+    )
+    shifted_edited = (
+        _translate_path_d(parse.edited_outline_path_d, dx, dy)
+        if parse.edited_outline_path_d
+        else None
+    )
+    shifted_switches = [
+        s.model_copy(update={"cx_mm": s.cx_mm + dx, "cy_mm": s.cy_mm + dy})
+        for s in parse.switches
+    ]
+    shifted_stabs = [
+        s.model_copy(update={"cx_mm": s.cx_mm + dx, "cy_mm": s.cy_mm + dy})
+        for s in parse.stabilizers
+    ]
+    shifted_holes = [
+        h.model_copy(update={"cx_mm": h.cx_mm + dx, "cy_mm": h.cy_mm + dy})
+        for h in parse.mounting_holes
+    ]
+    shifted_mcu = (
+        parse.mcu_placement.model_copy(
+            update={
+                "cx_mm": parse.mcu_placement.cx_mm + dx,
+                "cy_mm": parse.mcu_placement.cy_mm + dy,
+            }
+        )
+        if parse.mcu_placement is not None
+        else None
+    )
+    shifted = parse.model_copy(
+        update={
+            "pcb_outline": shifted_outline,
+            "edited_outline_path_d": shifted_edited,
+            "switches": shifted_switches,
+            "stabilizers": shifted_stabs,
+            "mounting_holes": shifted_holes,
+            "mcu_placement": shifted_mcu,
+        }
+    )
+    return paper_name, shifted
 
 
 def _kicad_angle(svg_rotation_deg: float) -> float:
@@ -66,6 +186,8 @@ def generate_pcb(
     switch_type: SwitchType = "soldered",
     diode_type: DiodeType = "tht",
     stabilizer_type: StabilizerType = "pcb_mount",
+    *,
+    center_on_page: bool = True,
 ) -> str:
     if switch_type not in SWITCH_TYPES:
         raise ValueError(
@@ -79,6 +201,15 @@ def generate_pcb(
         raise ValueError(
             f"unknown stabilizer_type: {stabilizer_type!r} (expected one of {STABILIZER_TYPES})"
         )
+
+    # Shift every coord so the board's bbox centers on the chosen paper,
+    # well away from KiCad's title block. Both the routed DSN and the
+    # final kicad_pcb consume the same shifted parse so they stay aligned.
+    # Tests opt out (center_on_page=False) to assert absolute geometry.
+    if center_on_page:
+        paper, parse = center_parse_on_page(parse)
+    else:
+        paper = "A4"
 
     # Renumber switches to row-major order so PCB refdes (`SW{id}`/`D{id}`)
     # match the schematic's grid layout: top-left = SW1, bottom-right = SWN.
@@ -98,7 +229,7 @@ def generate_pcb(
     out.append(f"\t(version {KICAD_PCB_VERSION})")
     out.append('\t(generator "keeb-layout-bot")')
     out.append("\t(general (thickness 1.6))")
-    out.append('\t(paper "A4")')
+    out.append(f'\t(paper "{paper}")')
     out.append(_layers_section())
     out.append(_setup_section())
 

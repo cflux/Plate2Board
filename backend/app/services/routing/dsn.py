@@ -41,6 +41,7 @@ from ..pcb import (
     _parse_path_points,
     _smd_diode_position,
     _stab_sides,
+    center_parse_on_page,
 )
 
 # Resolution = um * 10  → coords emitted as integer 0.1 µm units (KiCad's
@@ -601,6 +602,11 @@ def pcb_to_dsn(
     """
     if not parse.switches:
         raise ValueError("cannot export DSN from a board with zero switches")
+
+    # Same centering shift `generate_pcb` applies — both pipelines need to
+    # agree on coords or the routed SES traces will land in the wrong
+    # place relative to the kicad_pcb footprints.
+    _paper, parse = center_parse_on_page(parse)
 
     # Renumber switches into matrix-order — same as pcb.generate_pcb does
     # before emitting, so refdes / net codes line up.

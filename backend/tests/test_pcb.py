@@ -11,8 +11,17 @@ from app.models.schemas import (
     SwitchDef,
     UnclassifiedShape,
 )
-from app.services.pcb import generate_pcb
+from app.services.pcb import generate_pcb as _real_generate_pcb
 from app.services.svg_parser import parse_plate_svg
+
+
+# All assertions in this file pin specific board coordinates (switch
+# positions, stab offsets, mounting holes, etc.), so we opt out of the
+# page-centering shift `generate_pcb` does by default. A dedicated test
+# (`test_centering_*`) covers the centering behaviour.
+def generate_pcb(*args, **kwargs):
+    kwargs.setdefault("center_on_page", False)
+    return _real_generate_pcb(*args, **kwargs)
 
 
 def _result(
@@ -606,3 +615,48 @@ def test_proper_footprint_includes_silkscreen_and_courtyard() -> None:
     # F.Fab body outline (4 sides + reference text).
     fab_lines = re.findall(r'\(fp_line.+?\(layer "F\.Fab"\)', out)
     assert len(fab_lines) >= 4
+
+
+# ---------------------------------------------------------------------------
+# Page centering (default behavior — opt-in by NOT passing center_on_page)
+# ---------------------------------------------------------------------------
+
+
+def test_centering_shifts_switch_to_page_center_on_a4() -> None:
+    """A 100×50 board with a switch at its top-left corner should land
+    centered on A4 (297×210, landscape). The switch at (0, 0) of the
+    parsed board should move by half the page minus half the board."""
+    sws = [_sw(1, 0.0, 0.0)]
+    out = _real_generate_pcb(_result(switches=sws, width=100.0, height=50.0))
+    # A4 (page center 148.5, 105) minus board half (50, 25) → switch lands at
+    # (98.5, 80) in page coords.
+    m = re.search(
+        r'\(footprint "Button_Switch_Keyboard:SW_Cherry_MX_1\.00u_PCB".*?'
+        r'\(at ([-\d.]+) ([-\d.]+)',
+        out, re.DOTALL,
+    )
+    assert m is not None, "no soldered switch footprint found"
+    x, y = float(m.group(1)), float(m.group(2))
+    assert abs(x - 98.5) < 0.01, f"expected switch x≈98.5, got {x}"
+    assert abs(y - 80.0) < 0.01, f"expected switch y≈80.0, got {y}"
+
+
+def test_centering_picks_a3_when_board_exceeds_a4() -> None:
+    """A 300×200 board doesn't fit A4 (must clear 297×210 minus 2×20mm
+    margin = 257×170) but fits A3 (380×257 inside its margin). Verify
+    the paper token reflects that pick."""
+    sws = [_sw(1, 0, 0)]
+    parse = _result(switches=sws, width=300.0, height=200.0)
+    out = _real_generate_pcb(parse)
+    assert '(paper "A3")' in out
+
+
+def test_centering_keeps_edge_cuts_at_translated_polygon() -> None:
+    """Edge.Cuts gr_line endpoints should be shifted by the same offset
+    applied to footprints — board outline and switches stay relative."""
+    sws = [_sw(1, 50.0, 25.0)]
+    out = _real_generate_pcb(_result(switches=sws, width=100.0, height=50.0))
+    # Switch lands at A4 center (148.5, 105). Polygon was 0..100, 0..50 →
+    # after centering, corners are (98.5,80), (198.5,80), (198.5,130), (98.5,130).
+    assert "(start 98.5000 80.0000)" in out
+    assert "(end 198.5000 80.0000)" in out
