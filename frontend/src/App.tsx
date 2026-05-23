@@ -1,18 +1,22 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { UploadStep } from './components/UploadStep'
 import { SvgPreview } from './components/SvgPreview'
 import { MatrixGrid } from './components/MatrixGrid'
 import { NumberInput } from './components/NumberInput'
 import { OrientationHelp } from './components/OrientationHelp'
 import {
+  downloadRoutedProjectResult,
   generateNetlist,
   generatePcb,
   generatePlateSvg,
   generateProjectZip,
   generateSchematic,
   getBackendVersion,
+  getRouteJob,
   parseSvg,
+  startRoutedProject,
   type BackendVersion,
+  type RouteJobStatus,
 } from './api/client'
 import type {
   DiodeType,
@@ -23,6 +27,92 @@ import type {
   SwitchDef,
   SwitchType,
 } from './types'
+
+// Maps the live route-job status into a short label for the routed-zip
+// button. Shows whichever signal best conveys progress: stats when present
+// ("Routing… 12/50"), else percent ("Routing… 47%"), else just the phase.
+function routedButtonLabel(status: RouteJobStatus | null): string {
+  if (!status) return 'Routing…'
+  if (status.state === 'done') return 'Downloading…'
+  const phase = status.phase.replace(/-/g, ' ')
+  const elapsed = status.elapsed_s != null ? ` (${Math.round(status.elapsed_s)}s)` : ''
+  if (status.stats && status.stats.total > 0) {
+    const { routed, total } = status.stats
+    return `${capitalize(phase)}… ${routed}/${total}${elapsed}`
+  }
+  return `${capitalize(phase)}… ${Math.round(status.percent)}%${elapsed}`
+}
+
+function capitalize(s: string): string {
+  return s.charAt(0).toUpperCase() + s.slice(1)
+}
+
+// Banner that surfaces the three routing outcomes (in-progress / partial /
+// hard failure). Always dismissible. The button state separately disables
+// new export actions while a route is in flight.
+function RouteProgressBanner({
+  status,
+  onDismiss,
+}: {
+  status: RouteJobStatus
+  onDismiss: () => void
+}) {
+  const partial =
+    status.state === 'done' &&
+    status.stats &&
+    status.stats.unrouted > 0
+  const failed = status.state === 'failed'
+  const variant = failed ? 'error' : partial ? 'warning' : 'info'
+  let body: string
+  const elapsed = status.elapsed_s != null ? ` · elapsed ${Math.round(status.elapsed_s)}s` : ''
+  if (failed) {
+    body = `Auto-routing failed: ${status.error ?? 'unknown error'}`
+  } else if (partial && status.stats) {
+    const { routed, total, unrouted } = status.stats
+    body =
+      `Routed ${routed} of ${total} connections. ` +
+      `The plate may be too tight or too dense — open the project in KiCad ` +
+      `to finish the remaining ${unrouted} net${unrouted === 1 ? '' : 's'}.`
+  } else if (status.state === 'done') {
+    body = `Routed ${status.stats?.routed ?? '?'} connections — download starting.`
+  } else if (status.stats && (status.stats.total > 0 || status.stats.pass)) {
+    const passInfo = status.stats.pass ? `pass ${status.stats.pass} · ` : ''
+    const counts = status.stats.total > 0
+      ? `${status.stats.routed} of ${status.stats.total} connections`
+      : `${status.stats.routed} connections so far`
+    body =
+      `${capitalize(status.phase.replace(/-/g, ' '))} — ${passInfo}${counts}` +
+      (status.stats.vias ? ` (${status.stats.vias} vias)` : '') +
+      elapsed
+  } else {
+    body =
+      `${capitalize(status.phase.replace(/-/g, ' '))} — ${Math.round(status.percent)}%` +
+      elapsed
+  }
+  return (
+    <div className={`route-banner route-banner-${variant}`}>
+      <div className="route-banner-body">{body}</div>
+      {(status.state === 'done' || status.state === 'failed') && (
+        <button
+          className="route-banner-dismiss"
+          onClick={onDismiss}
+          aria-label="Dismiss"
+          title="Dismiss"
+        >
+          ×
+        </button>
+      )}
+      {status.state !== 'done' && status.state !== 'failed' && (
+        <div className="route-banner-bar">
+          <div
+            className="route-banner-bar-fill"
+            style={{ width: `${Math.max(2, Math.min(100, status.percent))}%` }}
+          />
+        </div>
+      )}
+    </div>
+  )
+}
 
 export function App() {
   const [file, setFile] = useState<File | null>(null)
@@ -479,8 +569,13 @@ export function App() {
   }
 
   const [busyExport, setBusyExport] = useState<
-    null | 'net' | 'sch' | 'pcb' | 'zip' | 'plate'
+    null | 'net' | 'sch' | 'pcb' | 'zip' | 'plate' | 'routed-zip'
   >(null)
+  // Live progress + stats for the auto-route flow. `null` while idle, an
+  // object with phase/percent/stats while a route job is in flight. Cleared
+  // only when the user dismisses it or starts a new route.
+  const [routeProgress, setRouteProgress] = useState<RouteJobStatus | null>(null)
+  const routePollRef = useRef<{ cancelled: boolean } | null>(null)
 
   async function downloadFile(
     kind: 'net' | 'sch' | 'pcb' | 'plate',
@@ -564,6 +659,66 @@ export function App() {
       setBusyExport(null)
     }
   }
+
+  // Auto-routed project: kick off a backend job, poll until done, then
+  // trigger a blob download. The existing unrouted button stays unchanged
+  // so the user keeps a fast path that doesn't depend on the freerouting
+  // sidecar.
+  async function downloadRoutedProjectZip() {
+    if (!result || !file) return
+    setExportError(null)
+    setBusyExport('routed-zip')
+    setRouteProgress({
+      job_id: '',
+      state: 'pending',
+      phase: 'starting',
+      percent: 0,
+    })
+    // Cancellation token — if the user navigates away or starts a new
+    // route, we set cancelled=true so the in-flight poll loop bails
+    // without touching state.
+    const token = { cancelled: false }
+    routePollRef.current = token
+    const baseName = file.name.replace(/\.svg$/i, '') || 'keyboard'
+    try {
+      const job = await startRoutedProject(
+        result, baseName, switchType, diodeType, stabilizerType,
+      )
+      while (!token.cancelled) {
+        await new Promise((r) => setTimeout(r, 500))
+        if (token.cancelled) return
+        const status = await getRouteJob(job.job_id)
+        if (token.cancelled) return
+        setRouteProgress(status)
+        if (status.state === 'done') break
+        if (status.state === 'failed') {
+          throw new Error(status.error || 'auto-routing failed')
+        }
+      }
+      if (token.cancelled) return
+      const blob = await downloadRoutedProjectResult(job.job_id)
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `${baseName}-routed-project.zip`
+      document.body.appendChild(a)
+      a.click()
+      document.body.removeChild(a)
+      URL.revokeObjectURL(url)
+    } catch (err) {
+      setExportError(err instanceof Error ? err.message : String(err))
+    } finally {
+      if (!token.cancelled) setBusyExport(null)
+      if (routePollRef.current === token) routePollRef.current = null
+    }
+  }
+
+  // Cancel any in-flight polling loop on unmount.
+  useEffect(() => {
+    return () => {
+      if (routePollRef.current) routePollRef.current.cancelled = true
+    }
+  }, [])
 
   function rotateAllSwitches(delta: number) {
     if (!result) return
@@ -893,6 +1048,16 @@ export function App() {
                 : 'Download KiCad project (.zip)'}
             </button>
             <button
+              className="primary"
+              onClick={downloadRoutedProjectZip}
+              disabled={busyExport !== null}
+              title="Auto-route the board with Freerouting before zipping. Takes 10–60s depending on board complexity. The plain Download button next to this stays available as a fast unrouted fallback."
+            >
+              {busyExport === 'routed-zip'
+                ? routedButtonLabel(routeProgress)
+                : 'Download routed project (.zip)'}
+            </button>
+            <button
               onClick={downloadSchematic}
               disabled={busyExport !== null}
               title="Just the schematic file (.kicad_sch) generated via SKiDL."
@@ -915,6 +1080,12 @@ export function App() {
             </button>
             {exportError && <span className="err">{exportError}</span>}
           </div>
+          {routeProgress && (
+            <RouteProgressBanner
+              status={routeProgress}
+              onDismiss={() => setRouteProgress(null)}
+            />
+          )}
           <SvgPreview
             file={file}
             result={result}

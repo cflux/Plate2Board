@@ -342,6 +342,65 @@ header .tag {
   background: #3a78c2;
 }
 
+.route-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 10px;
+  margin-bottom: 6px;
+  border-radius: 4px;
+  font-size: 0.85rem;
+  border: 1px solid;
+}
+
+.route-banner-info {
+  background: rgba(60, 120, 200, 0.08);
+  border-color: rgba(60, 120, 200, 0.55);
+  color: #b6ccef;
+}
+
+.route-banner-warning {
+  background: rgba(220, 170, 60, 0.10);
+  border-color: rgba(220, 170, 60, 0.55);
+  color: #efd8a0;
+}
+
+.route-banner-error {
+  background: rgba(220, 70, 70, 0.10);
+  border-color: rgba(220, 70, 70, 0.55);
+  color: #f0b6b6;
+}
+
+.route-banner-body {
+  flex: 1;
+  line-height: 1.4;
+}
+
+.route-banner-dismiss {
+  background: transparent;
+  border: none;
+  color: inherit;
+  font-size: 1.2rem;
+  cursor: pointer;
+  padding: 0 4px;
+  line-height: 1;
+}
+
+.route-banner-bar {
+  position: relative;
+  width: 160px;
+  height: 6px;
+  background: rgba(255, 255, 255, 0.08);
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.route-banner-bar-fill {
+  height: 100%;
+  background: currentColor;
+  transition: width 0.3s ease-out;
+}
+
 .toolbar-label {
   color: #98a0a8;
   font-size: 0.85rem;

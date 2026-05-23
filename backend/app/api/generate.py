@@ -1,3 +1,7 @@
+import asyncio
+import logging
+import uuid
+
 from fastapi import APIRouter, HTTPException, Response
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
@@ -12,8 +16,13 @@ from ..services.pcb import (
 )
 from ..services.plate_svg import generate_plate_svg
 from ..services.project import DEFAULT_PROJECT_NAME, generate_project_zip
+from ..services.routing import client as routing_client
+from ..services.routing import jobs as routing_jobs
+from ..services.routing.dsn import pcb_to_dsn
+from ..services.routing.ses import apply_ses_to_pcb
 from ..services.schematic import generate_schematic
 
+logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
@@ -174,3 +183,233 @@ async def post_generate_project(
             "Content-Disposition": f'attachment; filename="{safe_name}-project.zip"'
         },
     )
+
+
+# ---------------------------------------------------------------------------
+# Auto-routed project (Freerouting sidecar)
+# ---------------------------------------------------------------------------
+
+
+def _validate_project_args(
+    req: ParseResult, switch_type: str, diode_type: str, stabilizer_type: str
+) -> None:
+    if not req.switches:
+        raise HTTPException(
+            status_code=400, detail="cannot generate project from zero switches"
+        )
+    if switch_type not in SWITCH_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"switch_type must be one of {sorted(SWITCH_TYPES)}, got {switch_type!r}",
+        )
+    if diode_type not in DIODE_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"diode_type must be one of {sorted(DIODE_TYPES)}, got {diode_type!r}",
+        )
+    if stabilizer_type not in STABILIZER_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"stabilizer_type must be one of {sorted(STABILIZER_TYPES)}, got {stabilizer_type!r}",
+        )
+
+
+@router.post("/generate-routed-project")
+async def post_generate_routed_project(
+    req: ParseResult,
+    project_name: str = DEFAULT_PROJECT_NAME,
+    switch_type: str = "soldered",
+    diode_type: str = "tht",
+    stabilizer_type: str = "pcb_mount",
+) -> dict:
+    """Kick off an auto-routed project build. Returns immediately with a
+    job id; the actual routing happens in a background task. Poll
+    `/route-jobs/{job_id}` for progress and `/route-jobs/{job_id}/result`
+    once `state == "done"` to download the routed ZIP.
+    """
+    _validate_project_args(req, switch_type, diode_type, stabilizer_type)
+    job_id = str(uuid.uuid4())
+    await routing_jobs.STORE.create(job_id)
+    asyncio.create_task(
+        _run_routed_job(
+            job_id, req, project_name, switch_type, diode_type, stabilizer_type
+        )
+    )
+    return {
+        "job_id": job_id,
+        "status_url": f"/api/route-jobs/{job_id}",
+        "result_url": f"/api/route-jobs/{job_id}/result",
+    }
+
+
+@router.get("/route-jobs/{job_id}")
+async def get_route_job(job_id: str) -> dict:
+    import time as _time
+    job = await routing_jobs.STORE.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="job not found or expired")
+    body: dict = {
+        "job_id": job.job_id,
+        "state": job.state,
+        "phase": job.phase,
+        "percent": job.percent,
+        "elapsed_s": round(_time.time() - job.created_at, 1),
+    }
+    if job.error:
+        body["error"] = job.error
+    if job.stats:
+        body["stats"] = {
+            "routed": job.stats.routed_count,
+            "unrouted": job.stats.unrouted_count,
+            "total": job.stats.total_count,
+            "vias": job.stats.via_count,
+            "pass": job.stats.pass_number,
+            "log": job.stats.last_log,
+        }
+    return body
+
+
+@router.get("/route-jobs/{job_id}/result")
+async def get_route_job_result(job_id: str) -> Response:
+    job = await routing_jobs.STORE.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="job not found or expired")
+    if job.state == "failed":
+        raise HTTPException(
+            status_code=500, detail=job.error or "routing failed (no detail)"
+        )
+    if job.state != "done":
+        raise HTTPException(
+            status_code=409,
+            detail=f"job not finished (state={job.state})",
+        )
+    popped = await routing_jobs.STORE.pop_result(job_id)
+    if popped is None:
+        # Result already collected — clients should download once.
+        raise HTTPException(status_code=410, detail="result already downloaded")
+    data, filename = popped
+    return Response(
+        content=data,
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"'
+        },
+    )
+
+
+async def _run_routed_job(
+    job_id: str,
+    req: ParseResult,
+    project_name: str,
+    switch_type: str,
+    diode_type: str,
+    stabilizer_type: str,
+) -> None:
+    """Background task: full pipeline from ParseResult to routed ZIP.
+
+    Phases (each mapped to a job-store percent):
+        generating-pcb  →  5%
+        exporting-dsn   → 15%
+        routing         → 25–90% (driven by freerouting progress callbacks)
+        parsing-ses     → 92%
+        packaging       → 97%
+        done            → 100%
+    """
+    store = routing_jobs.STORE
+    try:
+        await store.update(job_id, state="running", phase="generating-pcb", percent=5.0)
+        pcb_text = generate_pcb(
+            req,
+            switch_type=switch_type,
+            diode_type=diode_type,
+            stabilizer_type=stabilizer_type,
+        )
+
+        await store.update(job_id, phase="exporting-dsn", percent=15.0)
+        dsn_text = pcb_to_dsn(
+            req,
+            switch_type=switch_type,
+            diode_type=diode_type,
+            stabilizer_type=stabilizer_type,
+        )
+
+        await store.update(job_id, phase="routing", percent=25.0)
+
+        async def on_progress(phase: str, percent: float, stats) -> None:
+            # Map client's 0..100 to our 25..90 band.
+            job_pct = 25.0 + max(0.0, min(percent, 100.0)) * (90.0 - 25.0) / 100.0
+            mapped_stats = None
+            if stats is not None:
+                mapped_stats = routing_jobs.RouteStats(
+                    routed_count=stats.routed_net_count,
+                    unrouted_count=stats.unrouted_net_count,
+                    total_count=stats.total_net_count,
+                    via_count=stats.via_count,
+                    pass_number=stats.pass_number,
+                    last_log=stats.last_log,
+                )
+            await store.update(
+                job_id, phase="routing", percent=job_pct, stats=mapped_stats
+            )
+
+        route_result = await routing_client.route(
+            dsn_text, progress_cb=on_progress
+        )
+
+        await store.update(job_id, phase="parsing-ses", percent=92.0)
+        routed_pcb, splice_stats = apply_ses_to_pcb(
+            pcb_text,
+            route_result.ses_text,
+            total_connections=route_result.stats.total_net_count,
+            unrouted_connections=route_result.stats.unrouted_net_count,
+        )
+
+        await store.update(job_id, phase="packaging", percent=97.0)
+        zip_bytes = generate_project_zip(
+            req,
+            project_name=project_name,
+            switch_type=switch_type,
+            diode_type=diode_type,
+            stabilizer_type=stabilizer_type,
+            pcb_text_override=routed_pcb,
+        )
+
+        safe_name = (
+            project_name.replace("..", "").replace("/", "").replace("\\", "")
+            or DEFAULT_PROJECT_NAME
+        )
+        # Prefer freerouting's per-net stats when present. Freerouting
+        # sometimes reports null/0 for the per-net counts on quick jobs
+        # (especially when score=1000 is reached in pass 1) — in that case
+        # fall back to the segment + via counts from the SES splice so the
+        # UI still shows meaningful numbers.
+        routed_net = route_result.stats.routed_net_count
+        unrouted_net = route_result.stats.unrouted_net_count
+        total_net = route_result.stats.total_net_count
+        via_count = route_result.stats.via_count or splice_stats.via_count
+        if routed_net == 0 and total_net == 0:
+            # Use splice counts: routed = segments emitted (each ratsnest
+            # closed maps to ≥1 segment), total = routed + unrouted_net.
+            routed_net = splice_stats.routed_count
+            total_net = routed_net + unrouted_net
+        stats = routing_jobs.RouteStats(
+            routed_count=routed_net,
+            unrouted_count=unrouted_net,
+            total_count=total_net,
+            via_count=via_count,
+        )
+        await store.update(
+            job_id,
+            state="done",
+            phase="done",
+            percent=100.0,
+            stats=stats,
+            result=zip_bytes,
+            result_filename=f"{safe_name}-project.zip",
+        )
+    except routing_client.FreeroutingError as exc:
+        logger.warning("routing job %s failed: %s", job_id, exc)
+        await store.update(job_id, state="failed", error=str(exc))
+    except Exception as exc:  # noqa: BLE001 — log everything else as a hard failure
+        logger.exception("routing job %s crashed", job_id)
+        await store.update(job_id, state="failed", error=str(exc))

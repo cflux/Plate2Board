@@ -26,16 +26,26 @@ def generate_project_zip(
     switch_type: SwitchType = "soldered",
     diode_type: DiodeType = "tht",
     stabilizer_type: StabilizerType = "pcb_mount",
+    *,
+    pcb_text_override: str | None = None,
 ) -> bytes:
+    """Bundle the project ZIP. By default the PCB is regenerated from
+    `parse`; pass `pcb_text_override` (e.g. a post-routing kicad_pcb with
+    spliced segments + vias) to skip the regenerate step and use a
+    pre-built PCB text verbatim. The schematic + .kicad_pro are always
+    regenerated."""
     project_name = _safe_name(project_name) or DEFAULT_PROJECT_NAME
 
     sch_text = generate_schematic(parse.switches)
-    pcb_text = generate_pcb(
-        parse,
-        switch_type=switch_type,
-        diode_type=diode_type,
-        stabilizer_type=stabilizer_type,
-    )
+    if pcb_text_override is not None:
+        pcb_text = pcb_text_override
+    else:
+        pcb_text = generate_pcb(
+            parse,
+            switch_type=switch_type,
+            diode_type=diode_type,
+            stabilizer_type=stabilizer_type,
+        )
     pro_text = _project_file(project_name, _extract_root_uuid(sch_text))
 
     buf = io.BytesIO()

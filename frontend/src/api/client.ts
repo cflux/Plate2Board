@@ -94,6 +94,95 @@ export function generatePlateSvg(result: ParseResult): Promise<string> {
   return postBody('/api/generate-plate-svg', result)
 }
 
+// ---- routed-project lifecycle ---------------------------------------------
+// Backend kicks off an async routing job and returns immediately with a
+// job_id. The frontend polls /api/route-jobs/{id} for progress and fetches
+// /api/route-jobs/{id}/result when state === 'done'.
+
+export interface RouteJobStart {
+  job_id: string
+  status_url: string
+  result_url: string
+}
+
+export type RouteJobState = 'pending' | 'running' | 'done' | 'failed'
+
+export interface RouteJobStatus {
+  job_id: string
+  state: RouteJobState
+  phase: string
+  percent: number
+  elapsed_s?: number
+  error?: string
+  stats?: {
+    routed: number
+    unrouted: number
+    total: number
+    vias: number
+    pass?: number
+    log?: string
+  }
+}
+
+async function jsonOrThrow<T>(res: Response, action: string): Promise<T> {
+  if (!res.ok) {
+    let detail = res.statusText
+    try {
+      const data = (await res.json()) as { detail?: string }
+      if (data.detail) detail = data.detail
+    } catch {
+      // ignore
+    }
+    throw new Error(`${action} failed (${res.status}): ${detail}`)
+  }
+  return (await res.json()) as T
+}
+
+export async function startRoutedProject(
+  result: ParseResult,
+  projectName: string,
+  switchType: SwitchType,
+  diodeType: DiodeType,
+  stabilizerType: StabilizerType = 'pcb_mount',
+): Promise<RouteJobStart> {
+  const params = new URLSearchParams({
+    project_name: projectName,
+    switch_type: switchType,
+    diode_type: diodeType,
+    stabilizer_type: stabilizerType,
+  })
+  const res = await fetch(`/api/generate-routed-project?${params}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(result),
+  })
+  return jsonOrThrow<RouteJobStart>(res, 'Routed project start')
+}
+
+export async function getRouteJob(jobId: string): Promise<RouteJobStatus> {
+  const res = await fetch(`/api/route-jobs/${encodeURIComponent(jobId)}`)
+  return jsonOrThrow<RouteJobStatus>(res, 'Route job poll')
+}
+
+export async function downloadRoutedProjectResult(
+  jobId: string,
+): Promise<Blob> {
+  const res = await fetch(
+    `/api/route-jobs/${encodeURIComponent(jobId)}/result`,
+  )
+  if (!res.ok) {
+    let detail = res.statusText
+    try {
+      const data = (await res.json()) as { detail?: string }
+      if (data.detail) detail = data.detail
+    } catch {
+      // ignore
+    }
+    throw new Error(`Routed project download failed (${res.status}): ${detail}`)
+  }
+  return res.blob()
+}
+
 export async function parseSvg(
   file: File,
   strategy: MatrixStrategy = 'row_first',
