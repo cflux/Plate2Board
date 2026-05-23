@@ -10,11 +10,16 @@ constants that `pcb.py` uses, keeping DSN and kicad_pcb perfectly aligned.
 
 Coordinate convention
 ---------------------
-Specctra is typically described as Y-up, but freerouting is convention-
-agnostic: it just routes between pads in the coordinate system you hand it.
-We emit Y-down (same as kicad_pcb) so SES coords need no Y-flip when
-splicing back. Rotation values come from `_kicad_angle` so they match what
-ships into the kicad_pcb.
+Specctra is a Y-up (math) coordinate system; KiCad is Y-down (screen).
+freerouting uses the input DSN coordinates literally — it doesn't know we
+have a Y-down source — so any rotation we hand it is applied as
+CCW-positive in Y-up space. If we feed the kicad_pcb Y coords through as-
+is, a rotated footprint's pad positions end up offset from where KiCad
+places the same footprint, and wires don't quite land on pads. Match
+KiCad's own DSN exporter: Y-flip every coord on emit, negate placement
+rotation, and Y-flip pin local coords inside each image. The SES parser
+then re-flips Y on every wire / via so the splice into kicad_pcb lands on
+the original Y-down coordinates.
 """
 
 from __future__ import annotations
@@ -425,8 +430,21 @@ def _fmt_coord(mm: float) -> str:
     return f"{mm * DSN_MM_FACTOR:.0f}"
 
 
+def _fmt_y(mm: float) -> str:
+    """Specctra is Y-up; KiCad is Y-down. Every Y coordinate emitted into
+    the DSN flips sign so freerouting sees the board in its native frame.
+    The SES parser un-flips Y to map wires back into kicad_pcb coords."""
+    return f"{-mm * DSN_MM_FACTOR:.0f}"
+
+
 def _fmt_mm(mm: float) -> str:
     return f"{mm:.4f}"
+
+
+# Number of segments used to approximate each NPTH keepout circle. 16 is
+# enough that the polygon's inscribed-vs-circumscribed difference stays
+# below freerouting's clearance tolerance for a 1.75–4 mm hole.
+KEEPOUT_POLY_SEGMENTS = 16
 
 
 def _emit_parser() -> list[str]:
@@ -456,20 +474,15 @@ def _emit_structure(
     if closed[0] != closed[-1]:
         closed.append(closed[0])
     coord_pairs = " ".join(
-        f"{_fmt_coord(x)} {_fmt_coord(y)}" for x, y in closed
+        f"{_fmt_coord(x)} {_fmt_y(y)}" for x, y in closed
     )
     out.append(f'    (boundary (path pcb 0 {coord_pairs}))')
-    # NPTH keepouts on both signal layers (router avoids these regions).
+    # NPTH keepouts as polygons (one polygon per NPTH). Earlier we tried
+    # `(circle signal D X Y)` but freerouting 2.2.4 rejects that shape as
+    # "degenerate" and routes through the holes. Polygons match what
+    # KiCad's own Specctra exporter emits.
     for ko in keepouts:
-        out.append(
-            f'    (keepout "" '
-            f'(circle signal {_fmt_coord(ko.diameter_mm)} '
-            f'{_fmt_coord(ko.cx_mm)} {_fmt_coord(ko.cy_mm)}))'
-        )
-    # Default routing rule. Widths + clearances live in the DSN's
-    # resolution units (same as coords), so we use `_fmt_coord` here —
-    # using millimetre values directly makes the router think traces are
-    # microns wide and it can't fit any route.
+        out.append(_emit_keepout_polygon(ko))
     out.append(
         f'    (via "Via[0-1]_{VIA_PAD_DIAMETER_MM:.1f}:{VIA_DRILL_DIAMETER_MM:.1f}_um")'
     )
@@ -481,6 +494,22 @@ def _emit_structure(
     return out
 
 
+def _emit_keepout_polygon(ko: KeepoutCircle) -> str:
+    """Approximate `ko` as an N-gon polygon keepout on both signal layers.
+    Slight oversize (~0.05 mm) so the inscribed polygon still fully
+    covers the underlying drill hole."""
+    r = ko.diameter_mm / 2.0 + 0.05
+    pts: list[tuple[float, float]] = []
+    for i in range(KEEPOUT_POLY_SEGMENTS):
+        a = 2 * math.pi * i / KEEPOUT_POLY_SEGMENTS
+        pts.append((ko.cx_mm + r * math.cos(a), ko.cy_mm + r * math.sin(a)))
+    pts.append(pts[0])
+    coord_pairs = " ".join(
+        f"{_fmt_coord(x)} {_fmt_y(y)}" for x, y in pts
+    )
+    return f'    (keepout "" (polygon signal 0 {coord_pairs}))'
+
+
 def _emit_placement(components: list[Component]) -> list[str]:
     out = ["  (placement"]
     by_image: dict[str, list[Component]] = {}
@@ -489,10 +518,11 @@ def _emit_placement(components: list[Component]) -> list[str]:
     for image_name, comps in by_image.items():
         out.append(f'    (component "{image_name}"')
         for c in comps:
+            # Y-flip placement Y, negate rotation (Y-flip inverts CCW/CW).
             out.append(
                 f'      (place "{c.ref}" '
-                f"{_fmt_coord(c.place_x)} {_fmt_coord(c.place_y)} "
-                f"{c.side} {c.rotation_deg:.3f})"
+                f"{_fmt_coord(c.place_x)} {_fmt_y(c.place_y)} "
+                f"{c.side} {-c.rotation_deg:.3f})"
             )
         out.append("    )")
     out.append("  )")
@@ -505,9 +535,11 @@ def _emit_library(used_images: set[str]) -> list[str]:
         image = IMAGE_BUILDERS[image_name]()
         out.append(f'    (image "{image_name}"')
         for pin in image.pins:
+            # Pin local coords are also Y-flipped so they compose
+            # correctly with the Y-flipped placement (see module docstring).
             out.append(
                 f'      (pin "{pin.padstack.name}" "{pin.number}" '
-                f"{_fmt_coord(pin.local_x)} {_fmt_coord(pin.local_y)})"
+                f"{_fmt_coord(pin.local_x)} {_fmt_y(pin.local_y)})"
             )
         out.append("    )")
     # Padstacks (one per unique padstack referenced by any used image).

@@ -256,13 +256,16 @@ def parse_ses(
             except (TypeError, ValueError):
                 continue
             for i in range(0, len(coords) - 2, 2):
+                # Negate Y to undo the Y-flip we applied on DSN emit (see
+                # `dsn.py` module docstring) so coords land in KiCad's
+                # Y-down convention again.
                 segments.append(Segment(
                     layer=layer,
                     width_mm=width,
                     x1_mm=coords[i],
-                    y1_mm=coords[i + 1],
+                    y1_mm=-coords[i + 1],
                     x2_mm=coords[i + 2],
-                    y2_mm=coords[i + 3],
+                    y2_mm=-coords[i + 3],
                     net_code=net_code,
                     net_name=net_name,
                 ))
@@ -282,7 +285,7 @@ def parse_ses(
             pad_d, drill_d = _via_dims_from_padstack(ps_name)
             vias.append(Via(
                 cx_mm=cx,
-                cy_mm=cy,
+                cy_mm=-cy,  # un-flip Y, same as segment endpoints
                 pad_diameter_mm=pad_d,
                 drill_diameter_mm=drill_d,
                 net_code=net_code,

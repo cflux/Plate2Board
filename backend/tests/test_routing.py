@@ -134,13 +134,18 @@ def test_ses_parses_wires_and_vias() -> None:
     )
     # Path was 3 points → 2 segments.
     assert len(segments) == 2
-    # mm × 10 resolution → 100 → 10.0 mm
+    # mm × 10 resolution → 100 → 10.0 mm. Y is negated on parse because
+    # the DSN exporter Y-flips to convert KiCad Y-down → Specctra Y-up,
+    # and the SES parser un-flips Y to restore KiCad coords.
     assert segments[0].x1_mm == pytest.approx(10.0)
+    assert segments[0].y1_mm == pytest.approx(-20.0)
     assert segments[0].width_mm == pytest.approx(0.3)
     assert segments[0].net_code == 1
-    # Via reads pad/drill from canonical padstack name.
+    # Via: x stays, y un-flipped.
     assert len(vias) == 1
     assert vias[0].net_code == 2
+    assert vias[0].cx_mm == pytest.approx(11.0)
+    assert vias[0].cy_mm == pytest.approx(4.5)  # SES -45 → un-flipped 4.5
     assert vias[0].pad_diameter_mm == pytest.approx(0.6)
     assert vias[0].drill_diameter_mm == pytest.approx(0.3)
 
@@ -165,8 +170,8 @@ def test_splice_inserts_segments_before_closing_paren() -> None:
     )
     # Original (net …) rows are still there.
     assert '(net 1 "COL0")' in spliced
-    # New segment with the right net code.
-    assert "(segment (start 10.0000 20.0000)" in spliced
+    # New segment with the right net code. Y is un-flipped on splice.
+    assert "(segment (start 10.0000 -20.0000)" in spliced
     assert "(net 1)" in spliced
     # Stats reflect what was spliced + what was passed in.
     assert stats.routed_count == 1
