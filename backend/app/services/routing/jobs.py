@@ -29,6 +29,10 @@ class RouteStats:
     unrouted_count: int = 0
     total_count: int = 0
     via_count: int = 0
+    # Pads whose net has copper but no wire actually touching them after
+    # the splice (see ses.find_unattached_pads) — shown to the user as
+    # connections they must finish in KiCad, on top of `unrouted_count`.
+    unattached_pads: int = 0
     # Optional live signal from the freerouting log scraper — lets the UI
     # show "Pass 3 — score 991.2" instead of just a static percent.
     pass_number: int = 0

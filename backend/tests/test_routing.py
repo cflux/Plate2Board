@@ -697,3 +697,122 @@ def test_client_route_times_out_cleanly() -> None:
                 poll_interval_s=0.05,
                 timeout_s=0.2,
             ))
+
+
+# --- via-cost ladder runner (mocked client) ----------------------------------
+
+
+def _runner_parse():
+    from app.models.schemas import ParseResult, PcbOutline, SwitchDef
+
+    return ParseResult(
+        svg_width_mm=60.0,
+        svg_height_mm=40.0,
+        pcb_outline=PcbOutline(
+            width_mm=60.0, height_mm=40.0,
+            path_d="M 0 0 L 60 0 L 60 40 L 0 40 Z",
+        ),
+        switches=[SwitchDef(id=1, cx_mm=30.0, cy_mm=20.0, row=0, col=0)],
+        stabilizers=[], mounting_holes=[], unclassified=[],
+    )
+
+
+def test_runner_stops_after_first_fully_routed_attempt(monkeypatch) -> None:
+    from app.services.routing import client as rclient
+    from app.services.routing import runner
+
+    seen_via_costs: list[int] = []
+
+    async def fake_route(dsn_text, *, progress_cb=None, timeout_s=None):
+        import re as _re
+        m = _re.search(r"\(via_costs (\d+)\)", dsn_text)
+        seen_via_costs.append(int(m.group(1)))
+        return rclient.RouteResult(
+            ses_text="(session)",
+            stats=rclient.RouterStats(routed_net_count=3, unrouted_net_count=0),
+        )
+
+    monkeypatch.setattr(rclient, "route", fake_route)
+    result = asyncio.run(runner.route_board(_runner_parse()))
+    assert result.stats.unrouted_net_count == 0
+    assert seen_via_costs == [runner.VIA_COST_LADDER[0]]
+
+
+def test_runner_retries_with_next_via_cost_and_keeps_best(monkeypatch) -> None:
+    from app.services.routing import client as rclient
+    from app.services.routing import runner
+
+    seen_via_costs: list[int] = []
+
+    async def fake_route(dsn_text, *, progress_cb=None, timeout_s=None):
+        import re as _re
+        m = _re.search(r"\(via_costs (\d+)\)", dsn_text)
+        vc = int(m.group(1))
+        seen_via_costs.append(vc)
+        # First rung plateaus with 2 unrouted; second rung completes.
+        unrouted = 2 if vc == runner.VIA_COST_LADDER[0] else 0
+        return rclient.RouteResult(
+            ses_text=f"(session via {vc})",
+            stats=rclient.RouterStats(
+                routed_net_count=10 - unrouted, unrouted_net_count=unrouted
+            ),
+        )
+
+    monkeypatch.setattr(rclient, "route", fake_route)
+    result = asyncio.run(runner.route_board(_runner_parse()))
+    assert seen_via_costs == list(runner.VIA_COST_LADDER)
+    assert result.stats.unrouted_net_count == 0
+    assert "via 20" in result.ses_text
+
+
+def test_runner_returns_best_when_no_attempt_completes(monkeypatch) -> None:
+    from app.services.routing import client as rclient
+    from app.services.routing import runner
+
+    async def fake_route(dsn_text, *, progress_cb=None, timeout_s=None):
+        import re as _re
+        vc = int(_re.search(r"\(via_costs (\d+)\)", dsn_text).group(1))
+        unrouted = 1 if vc == runner.VIA_COST_LADDER[-1] else 4
+        return rclient.RouteResult(
+            ses_text=f"(session via {vc})",
+            stats=rclient.RouterStats(
+                routed_net_count=10 - unrouted, unrouted_net_count=unrouted
+            ),
+        )
+
+    monkeypatch.setattr(rclient, "route", fake_route)
+    result = asyncio.run(runner.route_board(_runner_parse()))
+    assert result.stats.unrouted_net_count == 1
+
+
+def test_runner_survives_hard_failure_on_one_rung(monkeypatch) -> None:
+    from app.services.routing import client as rclient
+    from app.services.routing import runner
+
+    calls = {"n": 0}
+
+    async def fake_route(dsn_text, *, progress_cb=None, timeout_s=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise rclient.FreeroutingError("sidecar hiccup")
+        return rclient.RouteResult(
+            ses_text="(session)",
+            stats=rclient.RouterStats(routed_net_count=3, unrouted_net_count=0),
+        )
+
+    monkeypatch.setattr(rclient, "route", fake_route)
+    result = asyncio.run(runner.route_board(_runner_parse()))
+    assert result.stats.unrouted_net_count == 0
+    assert calls["n"] == 2
+
+
+def test_runner_raises_when_every_rung_hard_fails(monkeypatch) -> None:
+    from app.services.routing import client as rclient
+    from app.services.routing import runner
+
+    async def fake_route(dsn_text, *, progress_cb=None, timeout_s=None):
+        raise rclient.FreeroutingError("sidecar down")
+
+    monkeypatch.setattr(rclient, "route", fake_route)
+    with pytest.raises(rclient.FreeroutingError, match="sidecar down"):
+        asyncio.run(runner.route_board(_runner_parse()))

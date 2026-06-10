@@ -660,3 +660,156 @@ def test_centering_keeps_edge_cuts_at_translated_polygon() -> None:
     # after centering, corners are (98.5,80), (198.5,80), (198.5,130), (98.5,130).
     assert "(start 98.5000 80.0000)" in out
     assert "(end 198.5000 80.0000)" in out
+
+
+# ---------------------------------------------------------------------------
+# Diode placement conflict avoidance
+# ---------------------------------------------------------------------------
+
+import math  # noqa: E402
+
+from app.services.pcb import (  # noqa: E402
+    _diode_pads_world,
+    _npth_obstacles,
+    resolve_diode_placements,
+)
+
+
+def _placements(parse, **kwargs):
+    defaults = dict(
+        switch_type="soldered", diode_type="tht", stabilizer_type="pcb_mount"
+    )
+    defaults.update(kwargs)
+    return resolve_diode_placements(
+        list(parse.switches),
+        list(parse.stabilizers),
+        list(parse.mounting_holes),
+        parse.mcu_placement,
+        **defaults,
+    )
+
+
+def _assert_pads_clear_npths(parse, placements, *, switch_type, diode_type,
+                             stabilizer_type="pcb_mount") -> None:
+    from app.services.pcb import _DIODE_PAD_RADIUS
+    import math as _math
+
+    npths = _npth_obstacles(
+        list(parse.switches), list(parse.stabilizers),
+        list(parse.mounting_holes), switch_type, stabilizer_type,
+    )
+    pad_r = _DIODE_PAD_RADIUS[diode_type]
+    for sw in parse.switches:
+        p = placements[sw.id]
+        for px, py, _key in _diode_pads_world(
+            p.cx_mm, p.cy_mm, p.svg_rotation_deg, sw, diode_type
+        ):
+            for ox, oy, orad in npths:
+                gap = _math.hypot(ox - px, oy - py) - orad - pad_r
+                assert gap >= 0.29, (
+                    f"D{sw.id} pad at ({px:.2f},{py:.2f}) only {gap:.2f} mm "
+                    f"from NPTH at ({ox:.2f},{oy:.2f})"
+                )
+
+
+def test_diode_placement_defaults_unchanged_without_conflicts() -> None:
+    """A lone switch has nothing to conflict with — the resolver must keep
+    the historical default anchor exactly (hotswap SMD: +8.54, -5.08 local,
+    rotated 90° from the switch)."""
+    sw = _sw(1, 50.0, 50.0)
+    placements = _placements(
+        _result(switches=[sw]), switch_type="hotswap", diode_type="smd"
+    )
+    p = placements[1]
+    assert p.cx_mm == pytest.approx(58.54)
+    assert p.cy_mm == pytest.approx(44.92)
+    assert p.svg_rotation_deg == 90.0
+
+
+def test_smd_diode_moves_off_neighbor_stab_housing_hole() -> None:
+    """Production repro: with 19.05 mm pitch and a pcb-mount stab on the
+    right-hand key, the left key's hotswap SMD diode pad lands on the stab's
+    4 mm housing-post hole. The resolver must relocate that diode; every
+    diode pad must clear every NPTH afterwards."""
+    sw1 = _sw(1, 30.0, 30.0, row=0, col=0)
+    sw2 = _sw(2, 49.05, 30.0, row=0, col=1)
+    parse = _result(
+        switches=[sw1, sw2],
+        stabilizers=_stab_pair_for_switch(2, 49.05, 30.0, 11.94),
+    )
+    placements = _placements(parse, switch_type="hotswap", diode_type="smd")
+    # The default anchor for SW1's diode would be (38.54, 24.92) — pad 1 at
+    # (38.54, 23.27) sits 2.08 mm from the stab housing hole at
+    # (37.11, 21.76), inside drill + pad + clearance. Must have moved.
+    moved = math.hypot(placements[1].cx_mm - 38.54, placements[1].cy_mm - 24.92)
+    assert moved > 0.5, "SW1's diode should have been relocated"
+    # SW2's own diode hangs to its right, away from the stab — unchanged.
+    assert placements[2].cx_mm == pytest.approx(57.59)
+    assert placements[2].cy_mm == pytest.approx(24.92)
+    _assert_pads_clear_npths(
+        parse, placements, switch_type="hotswap", diode_type="smd"
+    )
+
+
+def test_tht_diode_moves_off_mounting_hole() -> None:
+    """A mounting hole drilled where the THT diode's ROW pad would land
+    forces the resolver to a different anchor."""
+    sw = _sw(1, 30.0, 30.0)
+    parse = _result(
+        switches=[sw],
+        mounting_holes=[MountingHoleDef(id=1, cx_mm=27.0, cy_mm=35.5, diameter_mm=4.0)],
+    )
+    placements = _placements(parse, switch_type="soldered", diode_type="tht")
+    moved = math.hypot(placements[1].cx_mm - 30.0, placements[1].cy_mm - 35.5)
+    assert moved > 0.5, "diode should have been relocated off the hole"
+    _assert_pads_clear_npths(
+        parse, placements, switch_type="soldered", diode_type="tht"
+    )
+
+
+def test_generated_pcb_uses_resolved_diode_position() -> None:
+    """The kicad_pcb must emit the conflict-resolved diode anchor, not the
+    static default."""
+    sw1 = _sw(1, 30.0, 30.0, row=0, col=0)
+    sw2 = _sw(2, 49.05, 30.0, row=0, col=1)
+    parse = _result(
+        switches=[sw1, sw2],
+        stabilizers=_stab_pair_for_switch(2, 49.05, 30.0, 11.94),
+    )
+    placements = _placements(parse, switch_type="hotswap", diode_type="smd")
+    out = generate_pcb(parse, switch_type="hotswap", diode_type="smd")
+    p1 = placements[1]
+    assert f"(at {p1.cx_mm:.4f} {p1.cy_mm:.4f}" in out
+    # And the default anchor of SW1's diode must NOT appear.
+    assert "(at 38.5400 24.9200" not in out
+
+
+def test_dsn_diodes_match_pcb_diodes_after_resolution() -> None:
+    """pcb_to_dsn must place diodes exactly where generate_pcb does, even
+    when the resolver moved them (same prepared parse → same resolution)."""
+    from app.services.routing.dsn import pad_world_positions
+
+    sw1 = _sw(1, 30.0, 30.0, row=0, col=0)
+    sw2 = _sw(2, 49.05, 30.0, row=0, col=1)
+    parse = _result(
+        switches=[sw1, sw2],
+        stabilizers=_stab_pair_for_switch(2, 49.05, 30.0, 11.94),
+    )
+    pcb_text = _real_generate_pcb(parse, switch_type="hotswap", diode_type="smd")
+    pads = pad_world_positions(parse, switch_type="hotswap", diode_type="smd")
+    # Every ROW-net diode pad position reported by the DSN layer must
+    # appear as a pad `(at …)`-derived world position in the pcb text.
+    diode_at = re.findall(
+        r'\(footprint "keeb:D_SOD-123"\s*\(layer "B\.Cu"\)\s*\(uuid "[^"]+"\)\s*'
+        r"\(at ([-\d.]+) ([-\d.]+)",
+        pcb_text,
+    )
+    assert len(diode_at) == 2
+    anchors = {(round(float(x), 3), round(float(y), 3)) for x, y in diode_at}
+    for px, py, _r in pads["ROW0"]:
+        # Each diode ROW pad must be 1.65 mm from one of the pcb anchors.
+        import math as _math
+        assert any(
+            abs(_math.hypot(px - ax, py - ay) - 1.65) < 1e-6
+            for ax, ay in anchors
+        ), f"DSN diode pad ({px}, {py}) doesn't match any pcb anchor"

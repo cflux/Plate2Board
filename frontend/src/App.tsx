@@ -57,10 +57,13 @@ function RouteProgressBanner({
   status: RouteJobStatus
   onDismiss: () => void
 }) {
-  const partial =
-    status.state === 'done' &&
-    status.stats &&
-    status.stats.unrouted > 0
+  // Connections the user must finish by hand: nets the router gave up on
+  // plus pads whose copper never actually attached after the splice.
+  const unfinished =
+    status.state === 'done' && status.stats
+      ? status.stats.unrouted + (status.stats.unattached ?? 0)
+      : 0
+  const partial = unfinished > 0
   const failed = status.state === 'failed'
   const variant = failed ? 'error' : partial ? 'warning' : 'info'
   let body: string
@@ -68,11 +71,11 @@ function RouteProgressBanner({
   if (failed) {
     body = `Auto-routing failed: ${status.error ?? 'unknown error'}`
   } else if (partial && status.stats) {
-    const { routed, total, unrouted } = status.stats
+    const { routed, total } = status.stats
     body =
-      `Routed ${routed} of ${total} connections. ` +
-      `The plate may be too tight or too dense — open the project in KiCad ` +
-      `to finish the remaining ${unrouted} net${unrouted === 1 ? '' : 's'}.`
+      `Routed ${routed} of ${total} connections, but ${unfinished} ` +
+      `connection${unfinished === 1 ? '' : 's'} need${unfinished === 1 ? 's' : ''} finishing ` +
+      `by hand — open the project in KiCad and route the remaining ratsnest lines.`
   } else if (status.state === 'done') {
     body = `Routed ${status.stats?.routed ?? '?'} connections — download starting.`
   } else if (status.stats && (status.stats.total > 0 || status.stats.pass)) {

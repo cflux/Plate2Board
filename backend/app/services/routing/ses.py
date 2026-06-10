@@ -14,6 +14,7 @@ can keep the splice surgical without reformatting the rest of the file.
 from __future__ import annotations
 
 import logging
+import math
 import re
 import uuid
 from dataclasses import dataclass
@@ -365,14 +366,14 @@ def splice_routes(
 PAD_ATTACH_SLOP_MM = 0.2
 
 
-def count_unattached_pads(
+def find_unattached_pads(
     segments: list[Segment],
     vias: list[Via],
     pad_positions: dict[str, list[tuple[float, float, float]]],
     net_table: dict[str, int],
-) -> int:
-    """Number of pads whose net has routed copper but where no wire endpoint
-    or via lands on the pad itself.
+) -> list[tuple[str, float, float, float]]:
+    """Pads whose net has routed copper but where no wire endpoint or via
+    lands on the pad itself, as ``(net_name, x_mm, y_mm, nearest_mm)``.
 
     This is the tripwire for convention bugs between dsn.py and pcb.py: the
     DSN is self-consistent by construction, so freerouting happily reports
@@ -392,19 +393,30 @@ def count_unattached_pads(
     for v in vias:
         points_by_code.setdefault(v.net_code, []).append((v.cx_mm, v.cy_mm))
 
-    unattached = 0
+    unattached: list[tuple[str, float, float, float]] = []
     for net_name, pads in pad_positions.items():
         code = net_table.get(net_name)
         points = points_by_code.get(code) if code is not None else None
         if not points:
             continue
         for px, py, radius in pads:
-            tol_sq = (radius + PAD_ATTACH_SLOP_MM) ** 2
-            if not any(
-                (x - px) ** 2 + (y - py) ** 2 <= tol_sq for x, y in points
-            ):
-                unattached += 1
+            nearest = min(
+                math.hypot(x - px, y - py) for x, y in points
+            )
+            if nearest > radius + PAD_ATTACH_SLOP_MM:
+                unattached.append((net_name, px, py, nearest))
     return unattached
+
+
+def count_unattached_pads(
+    segments: list[Segment],
+    vias: list[Via],
+    pad_positions: dict[str, list[tuple[float, float, float]]],
+    net_table: dict[str, int],
+) -> int:
+    """Count of `find_unattached_pads` — kept for callers that only need
+    the headline number."""
+    return len(find_unattached_pads(segments, vias, pad_positions, net_table))
 
 
 # --- public top-level helper ------------------------------------------------
@@ -457,15 +469,17 @@ def apply_ses_to_pcb(
     routed_pcb = splice_routes(pcb_text, segments, vias)
     unattached = 0
     if pad_positions is not None:
-        unattached = count_unattached_pads(
-            segments, vias, pad_positions, net_table
-        )
-        if unattached:
+        missing = find_unattached_pads(segments, vias, pad_positions, net_table)
+        unattached = len(missing)
+        if missing:
+            detail = "; ".join(
+                f"{net} pad at ({x:.2f}, {y:.2f}) — nearest wire {d:.2f} mm"
+                for net, x, y, d in missing[:10]
+            )
             logger.warning(
                 "post-route check: %d pad(s) have routed copper on their "
-                "net but no wire touching them — traces may not land on "
-                "pads (coordinate-convention drift?)",
-                unattached,
+                "net but no wire touching them: %s",
+                unattached, detail,
             )
     stats = RouteStats(
         routed_count=len(segments),

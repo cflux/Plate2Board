@@ -127,6 +127,9 @@ export interface RouteJobStatus {
     unrouted: number
     total: number
     vias: number
+    // Pads the router claims it reached but whose wires don't actually
+    // touch the pad after the splice — finish these in KiCad.
+    unattached?: number
     pass?: number
     log?: string
   }

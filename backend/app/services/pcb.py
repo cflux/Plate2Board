@@ -16,19 +16,24 @@ Wiring matches the schematic: COL → SW.1 → SW.2 ↔ D.A → D.K → ROW (COL
 
 from __future__ import annotations
 
+import logging
 import math
 import re
 import uuid
 from collections.abc import Iterable
+from dataclasses import dataclass
 from typing import Literal
 
 from ..models.schemas import (
+    McuPlacement,
     MountingHoleDef,
     ParseResult,
     StabilizerDef,
     SwitchDef,
 )
 from .matrix import renumber_switches
+
+logger = logging.getLogger(__name__)
 
 KICAD_PCB_VERSION = "20240108"
 DIODE_OFFSET_MM = 5.5
@@ -237,9 +242,22 @@ def generate_pcb(
     for name, code in nets.items():
         out.append(f'\t(net {code} "{name}")')
 
+    diode_placements = resolve_diode_placements(
+        switches,
+        list(parse.stabilizers),
+        list(parse.mounting_holes),
+        parse.mcu_placement,
+        switch_type=switch_type,
+        diode_type=diode_type,
+        stabilizer_type=stabilizer_type,
+    )
     for sw in sorted(switches, key=lambda s: s.id):
         out.append(_switch_footprint(sw, nets, switch_type))
-        out.append(_diode_footprint(sw, nets, diode_type, switch_type))
+        out.append(
+            _diode_footprint(
+                sw, nets, diode_type, switch_type, diode_placements[sw.id]
+            )
+        )
 
     if switches:
         # Pro Micro footprint is 2 × 12 thru-hole, 17.78 mm wide. Anchor at
@@ -544,14 +562,6 @@ def _crtyd_socket(side: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _diode_position(sw: SwitchDef) -> tuple[float, float]:
-    """THT diode placed `DIODE_OFFSET_MM` along the switch's local +Y axis."""
-    rot = math.radians(sw.rotation_deg)
-    dx = -DIODE_OFFSET_MM * math.sin(rot)
-    dy = DIODE_OFFSET_MM * math.cos(rot)
-    return (sw.cx_mm + dx, sw.cy_mm + dy)
-
-
 # SMD diode anchor in switch local coords, near the pad it connects to
 # (switch pin 2 / hotswap socket pad 2). Hotswap shifts +6 mm in X to
 # clear the larger Kailh socket pad on B.Cu.
@@ -570,16 +580,254 @@ SMD_DIODE_LOCAL_OFFSET = {
 }
 
 
-def _smd_diode_position(sw: SwitchDef, switch_type: SwitchType) -> tuple[float, float]:
-    """SMD diode global anchor: switch local pad-2 position rotated by the
-    switch's own rotation and translated to the switch's center."""
-    lx, ly = SMD_DIODE_LOCAL_OFFSET[switch_type]
-    rot = math.radians(sw.rotation_deg)
-    cos_r, sin_r = math.cos(rot), math.sin(rot)
-    return (
-        sw.cx_mm + lx * cos_r - ly * sin_r,
-        sw.cy_mm + lx * sin_r + ly * cos_r,
+# ---------------------------------------------------------------------------
+# Diode placement conflict avoidance
+# ---------------------------------------------------------------------------
+
+# Switch NPTHs in footprint-local mm (x, y, drill radius): 4 mm center stem
+# + two 1.75 mm peg holes. Same data `_switch_npth` emits; `dsn.py` imports
+# these for its router keepouts so all three stay in lockstep.
+SWITCH_NPTH_LOCAL = (
+    (0.0, 0.0, 2.0),
+    (-5.08, 0.0, 0.875),
+    (5.08, 0.0, 0.875),
+)
+# Hotswap adds two 3 mm switch-pin clearance holes at the THT pin positions.
+HOTSWAP_PIN_NPTH_LOCAL = (
+    (-3.81, -2.54, 1.5),
+    (2.54, -5.08, 1.5),
+)
+
+# Copper pads of each switch footprint in local mm (x, y, bounding radius,
+# "col"/"link" net role) — obstacles a relocated diode must clear.
+_SWITCH_PAD_LOCAL = {
+    "soldered": (
+        (-3.81, -2.54, 1.25, "col"),
+        (2.54, -5.08, 1.25, "link"),
+    ),
+    # Kailh socket pads are 2.55 × 2.5 rects → bounding radius is the
+    # half-diagonal.
+    "hotswap": (
+        (-7.085, -2.54, 1.79, "col"),
+        (5.842, -5.08, 1.79, "link"),
+    ),
+}
+
+# Diode pads sit at ±this along the diode's long axis.
+_DIODE_PAD_LOCAL_X = {"tht": 3.81, "smd": 1.65}
+# Pad bounding radius: THT 1.6 mm circle → 0.8; SMD 1.0 × 0.6 rect →
+# half-diagonal 0.583.
+_DIODE_PAD_RADIUS = {"tht": 0.8, "smd": 0.583}
+
+# Pad-to-NPTH-drill clearance a candidate must keep. 0.3 mm covers the DSN
+# keepout oversize (0.05) + routing clearance (0.2) with margin, so the
+# router can always reach a resolved pad.
+_DIODE_HOLE_CLEARANCE_MM = 0.3
+# Pad-to-foreign-pad copper clearance. Matches the 0.2 mm netclass rule —
+# the designed-in soldered/SMD layout keeps exactly 0.25 mm to the switch's
+# pin-2 copper, which must keep passing.
+_DIODE_PAD_CLEARANCE_MM = 0.2
+
+
+@dataclass(frozen=True)
+class DiodePlacement:
+    """World-coordinate diode anchor. `svg_rotation_deg` is in SVG (CW)
+    convention — emitters pass it through `_kicad_angle` like every other
+    footprint angle."""
+    cx_mm: float
+    cy_mm: float
+    svg_rotation_deg: float
+
+
+def _diode_candidate_offsets(
+    switch_type: SwitchType, diode_type: DiodeType
+) -> list[tuple[float, float, float]]:
+    """Candidate diode anchors as (local_x, local_y, extra_rotation_deg) in
+    switch-local coords, default placement strictly first so conflict-free
+    boards are byte-identical to the pre-resolver output. Alternates mirror
+    the anchor to the other side of the switch and slide along the diode's
+    long axis in 1 mm steps."""
+    if diode_type == "smd":
+        ax, ay = SMD_DIODE_LOCAL_OFFSET[switch_type]
+        bases = [
+            (ax, ay, 90.0),       # default (beside pad 2)
+            (ax, -ay, 90.0),      # mirrored below the switch
+            (0.0, 8.0, 0.0),      # under the stem, pads along local X
+            (0.0, -8.0, 0.0),
+        ]
+    else:
+        off = DIODE_OFFSET_MM
+        bases = [
+            (0.0, off, 0.0),      # default (below the switch)
+            (0.0, -off, 0.0),     # above
+            (off + 2.0, 0.0, 90.0),   # right side, body vertical
+            (-(off + 2.0), 0.0, 90.0),  # left side
+        ]
+    out: list[tuple[float, float, float]] = []
+    for bx, by, extra in bases:
+        e = math.radians(extra)
+        axis = (math.cos(e), math.sin(e))
+        for shift in (0.0, 1.0, -1.0, 2.0, -2.0, 3.0, -3.0):
+            out.append((bx + axis[0] * shift, by + axis[1] * shift, extra))
+    return out
+
+
+def _npth_obstacles(
+    switches: list[SwitchDef],
+    stabilizers: list[StabilizerDef],
+    mounting_holes: list[MountingHoleDef],
+    switch_type: SwitchType,
+    stabilizer_type: StabilizerType,
+) -> list[tuple[float, float, float]]:
+    """Every NPTH on the board as world-coordinate (x, y, drill radius)."""
+    locals_ = SWITCH_NPTH_LOCAL
+    if switch_type == "hotswap":
+        locals_ = locals_ + HOTSWAP_PIN_NPTH_LOCAL
+    out: list[tuple[float, float, float]] = []
+    for sw in switches:
+        for lx, ly, r in locals_:
+            x, y = _rotate_local_to_world(lx, ly, sw)
+            out.append((x, y, r))
+    if stabilizer_type == "pcb_mount":
+        for sw, stabs in _pair_stabs_to_switches(switches, stabilizers):
+            for side_x in _stab_sides(sw, stabs):
+                for ly, d in (
+                    (CHERRY_STAB_WIRE_OFFSET_Y_MM, CHERRY_STAB_WIRE_HOLE_MM),
+                    (CHERRY_STAB_HOUSING_OFFSET_Y_MM, CHERRY_STAB_HOUSING_HOLE_MM),
+                ):
+                    x, y = _rotate_local_to_world(side_x, ly, sw)
+                    out.append((x, y, d / 2.0))
+    for h in mounting_holes:
+        out.append((h.cx_mm, h.cy_mm, h.diameter_mm / 2.0))
+    return out
+
+
+def _fixed_pad_obstacles(
+    switches: list[SwitchDef],
+    mcu_placement: McuPlacement | None,
+    switch_type: SwitchType,
+) -> list[tuple[float, float, float, str]]:
+    """All non-diode copper pads as world (x, y, bounding radius, net key).
+    Net keys let same-net overlaps through (e.g. the designed soldered/SMD
+    link-pad-on-pin-2 short)."""
+    out: list[tuple[float, float, float, str]] = []
+    for sw in switches:
+        for lx, ly, r, role in _SWITCH_PAD_LOCAL[switch_type]:
+            x, y = _rotate_local_to_world(lx, ly, sw)
+            key = f"COL{sw.col}" if role == "col" else f"LINK{sw.id}"
+            out.append((x, y, r, key))
+    if mcu_placement is not None:
+        rows = sorted({s.row for s in switches})
+        cols = sorted({s.col for s in switches})
+        rot = math.radians(mcu_placement.rotation_deg)
+        cos_r, sin_r = math.cos(rot), math.sin(rot)
+        n_rows = len(rows)
+        pin_net: dict[int, str] = {}
+        for i, pin in enumerate(PRO_MICRO_GPIO_PINS):
+            if i < n_rows:
+                pin_net[pin] = f"ROW{rows[i]}"
+            elif i - n_rows < len(cols):
+                pin_net[pin] = f"COL{cols[i - n_rows]}"
+        for pin in range(1, 25):
+            if pin <= 12:
+                lx, ly = 0.0, (pin - 1) * 2.54
+            else:
+                lx, ly = 17.78, (24 - pin) * 2.54
+            x = mcu_placement.cx_mm + lx * cos_r - ly * sin_r
+            y = mcu_placement.cy_mm + lx * sin_r + ly * cos_r
+            out.append((x, y, 0.85, pin_net.get(pin, f"{MCU_REF}-{pin}")))
+    return out
+
+
+def _diode_pads_world(
+    cx: float, cy: float, svg_rot_deg: float, sw: SwitchDef, diode_type: DiodeType
+) -> list[tuple[float, float, str]]:
+    """The two diode pads in world coords with their net keys (pad 1 = ROW,
+    pad 2 = the per-switch link net)."""
+    pad_x = _DIODE_PAD_LOCAL_X[diode_type]
+    r = math.radians(svg_rot_deg)
+    cos_r, sin_r = math.cos(r), math.sin(r)
+    return [
+        (cx - pad_x * cos_r, cy - pad_x * sin_r, f"ROW{sw.row}"),
+        (cx + pad_x * cos_r, cy + pad_x * sin_r, f"LINK{sw.id}"),
+    ]
+
+
+def resolve_diode_placements(
+    switches: list[SwitchDef],
+    stabilizers: list[StabilizerDef],
+    mounting_holes: list[MountingHoleDef],
+    mcu_placement: McuPlacement | None,
+    *,
+    switch_type: SwitchType,
+    diode_type: DiodeType,
+    stabilizer_type: StabilizerType,
+) -> dict[int, DiodePlacement]:
+    """Pick a conflict-free placement for every switch's diode.
+
+    The static anchors can land a diode pad on another footprint's NPTH —
+    reproduced in production with a hotswap SMD diode pad overlapping the
+    neighboring key's stabilizer housing hole (4 mm drill), which both
+    breaks the physical board and makes the pad unroutable (freerouting
+    walls every NPTH off with a keepout). For each diode we test the
+    default anchor first (so conflict-free boards are unchanged), then
+    mirrored/slid alternates, and keep the first candidate whose pads
+    clear every NPTH and every foreign-net pad. If nothing fits we keep
+    the default and log a warning rather than fail the export.
+
+    Shared by `generate_pcb` and `dsn.pcb_to_dsn` (same prepared parse in
+    both) so the kicad_pcb and the router's view always agree.
+    """
+    npths = _npth_obstacles(
+        switches, stabilizers, mounting_holes, switch_type, stabilizer_type
     )
+    fixed_pads = _fixed_pad_obstacles(switches, mcu_placement, switch_type)
+    pad_r = _DIODE_PAD_RADIUS[diode_type]
+    candidates = _diode_candidate_offsets(switch_type, diode_type)
+
+    def conflict(pads: list[tuple[float, float, str]],
+                 extra_pads: list[tuple[float, float, float, str]]) -> bool:
+        for px, py, key in pads:
+            for ox, oy, orad in npths:
+                if math.hypot(ox - px, oy - py) < orad + pad_r + _DIODE_HOLE_CLEARANCE_MM:
+                    return True
+            for ox, oy, orad, okey in fixed_pads:
+                if okey != key and math.hypot(ox - px, oy - py) < orad + pad_r + _DIODE_PAD_CLEARANCE_MM:
+                    return True
+            for ox, oy, orad, okey in extra_pads:
+                if okey != key and math.hypot(ox - px, oy - py) < orad + pad_r + _DIODE_PAD_CLEARANCE_MM:
+                    return True
+        return False
+
+    placements: dict[int, DiodePlacement] = {}
+    placed_pads: list[tuple[float, float, float, str]] = []
+    for sw in sorted(switches, key=lambda s: s.id):
+        chosen: DiodePlacement | None = None
+        for ox, oy, extra in candidates:
+            cx, cy = _rotate_local_to_world(ox, oy, sw)
+            svg_rot = (sw.rotation_deg + extra) % 360 if extra else sw.rotation_deg
+            pads = _diode_pads_world(cx, cy, svg_rot, sw, diode_type)
+            if not conflict(pads, placed_pads):
+                chosen = DiodePlacement(cx, cy, svg_rot)
+                break
+        if chosen is None:
+            # Nothing fits — keep the default so output stays usable, but
+            # make the problem visible in the logs.
+            ox, oy, extra = candidates[0]
+            cx, cy = _rotate_local_to_world(ox, oy, sw)
+            svg_rot = (sw.rotation_deg + extra) % 360 if extra else sw.rotation_deg
+            chosen = DiodePlacement(cx, cy, svg_rot)
+            logger.warning(
+                "no conflict-free placement for D%d (switch at %.1f, %.1f) — "
+                "keeping the default anchor; expect a DRC/routing conflict",
+                sw.id, sw.cx_mm, sw.cy_mm,
+            )
+        placements[sw.id] = chosen
+        for px, py, key in _diode_pads_world(
+            chosen.cx_mm, chosen.cy_mm, chosen.svg_rotation_deg, sw, diode_type
+        ):
+            placed_pads.append((px, py, pad_r, key))
+    return placements
 
 
 def _diode_footprint(
@@ -587,21 +835,24 @@ def _diode_footprint(
     nets: dict[str, int],
     diode_type: DiodeType,
     switch_type: SwitchType,
+    placement: DiodePlacement,
 ) -> str:
     if diode_type == "tht":
-        return _diode_footprint_tht(sw, nets)
-    return _diode_footprint_smd(sw, nets, switch_type)
+        return _diode_footprint_tht(sw, nets, placement)
+    return _diode_footprint_smd(sw, nets, switch_type, placement)
 
 
-def _diode_footprint_tht(sw: SwitchDef, nets: dict[str, int]) -> str:
+def _diode_footprint_tht(
+    sw: SwitchDef, nets: dict[str, int], placement: DiodePlacement
+) -> str:
     fp_uuid = _u()
     ref = f"D{sw.id}"
     row_net = nets[f"ROW{sw.row}"]
     row_name = f"ROW{sw.row}"
     link_net = nets[f"NET-SW{sw.id}-D{sw.id}"]
     link_name = f"NET-SW{sw.id}-D{sw.id}"
-    cx, cy = _diode_position(sw)
-    rot = _kicad_angle(sw.rotation_deg)
+    cx, cy = placement.cx_mm, placement.cy_mm
+    rot = _kicad_angle(placement.svg_rotation_deg)
     return (
         f'\t(footprint "keeb:D_DO-35_SOD27_P7.62mm_Horizontal"\n'
         f'\t\t(layer "F.Cu")\n'
@@ -636,20 +887,24 @@ def _diode_footprint_tht(sw: SwitchDef, nets: dict[str, int]) -> str:
 
 
 def _diode_footprint_smd(
-    sw: SwitchDef, nets: dict[str, int], switch_type: SwitchType
+    sw: SwitchDef,
+    nets: dict[str, int],
+    switch_type: SwitchType,
+    placement: DiodePlacement,
 ) -> str:
-    """SOD-123 SMD diode mounted on B.Cu, anchor centered on the switch
-    pad it connects to (switch pin 2 for soldered; Kailh socket pad 2 for
-    hotswap, with +6 mm X clearance from the larger SMD socket pad).
-    Rotated 90° from the switch so its pads stack along the column axis."""
+    """SOD-123 SMD diode mounted on B.Cu, anchored by the conflict
+    resolver — default is centered on the switch pad it connects to
+    (switch pin 2 for soldered; Kailh socket pad 2 for hotswap, with
+    +6 mm X clearance from the larger SMD socket pad), rotated 90° from
+    the switch so its pads stack along the column axis."""
     fp_uuid = _u()
     ref = f"D{sw.id}"
     row_net = nets[f"ROW{sw.row}"]
     row_name = f"ROW{sw.row}"
     link_net = nets[f"NET-SW{sw.id}-D{sw.id}"]
     link_name = f"NET-SW{sw.id}-D{sw.id}"
-    cx, cy = _smd_diode_position(sw, switch_type)
-    rot = _kicad_angle((sw.rotation_deg + 90) % 360)
+    cx, cy = placement.cx_mm, placement.cy_mm
+    rot = _kicad_angle(placement.svg_rotation_deg)
     return (
         f'\t(footprint "keeb:D_SOD-123"\n'
         f'\t\t(layer "B.Cu")\n'

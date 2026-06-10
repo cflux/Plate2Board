@@ -43,21 +43,22 @@ from ..pcb import (
     CHERRY_STAB_HOUSING_OFFSET_Y_MM,
     CHERRY_STAB_WIRE_HOLE_MM,
     CHERRY_STAB_WIRE_OFFSET_Y_MM,
+    DiodePlacement,
     DiodeType,
+    HOTSWAP_PIN_NPTH_LOCAL,
     MCU_REF,
     PRO_MICRO_GPIO_PINS,
-    SMD_DIODE_LOCAL_OFFSET,
+    SWITCH_NPTH_LOCAL,
     StabilizerType,
     SwitchType,
-    _diode_position,
     _enumerate_nets,
     _kicad_angle,
     _pair_stabs_to_switches,
     _parse_path_points,
     _rotate_local_to_world,
-    _smd_diode_position,
     _stab_sides,
     center_parse_on_page,
+    resolve_diode_placements,
 )
 
 # Resolution = um * 10  → coords emitted as integer 0.1 µm units (KiCad's
@@ -108,6 +109,13 @@ AGAINST_PREFERRED_DIRECTION_TRACE_COST = 2.5
 
 # Freerouting cost knobs (mirrored from its own defaults; carried in the
 # DSN so the values are visible in one place and survive API changes).
+# Via cost matters a lot and the best value is board-dependent —
+# freerouting 2.2.4 stops at the first pass with no progress, and which
+# nets strand at that plateau flips with this knob (measured: a 62-switch
+# hotswap/smd board routes fully at 20 but strands 2 nets at 50, while the
+# small e2e fixture routes fully at 50 but strands 1 net at 20). The
+# router runner therefore tries a ladder of via costs (see runner.py);
+# this constant is only the first rung / default.
 VIA_COSTS = 50
 PLANE_VIA_COSTS = 5
 START_RIPUP_COSTS = 100
@@ -305,24 +313,19 @@ def _diode_components(
     parse: ParseResult,
     nets: dict[str, int],
     diode_type: DiodeType,
-    switch_type: SwitchType,
+    placements: dict[int, DiodePlacement],
 ) -> list[Component]:
     image = _diode_image_name(diode_type)
     out: list[Component] = []
     for sw in parse.switches:
-        if diode_type == "tht":
-            cx, cy = _diode_position(sw)
-            rot = _kicad_angle(sw.rotation_deg)
-        else:
-            cx, cy = _smd_diode_position(sw, switch_type)
-            rot = _kicad_angle((sw.rotation_deg + 90) % 360)
+        placement = placements[sw.id]
         out.append(
             Component(
                 image_name=image,
                 ref=f"D{sw.id}",
-                place_x=cx,
-                place_y=cy,
-                rotation_deg=rot,
+                place_x=placement.cx_mm,
+                place_y=placement.cy_mm,
+                rotation_deg=_kicad_angle(placement.svg_rotation_deg),
                 # SMD diode copper is on B.Cu via its padstack's layer list;
                 # the place stays side=front because pcb.py emits the B.Cu
                 # footprint WYSIWYG (no mirrored frame), while a DSN back-
@@ -370,35 +373,23 @@ def _mcu_components(parse: ParseResult, nets: dict[str, int]) -> list[Component]
 # ---------------------------------------------------------------------------
 
 
-# Switch NPTHs in footprint-local mm: center stem (4 mm) + two peg holes
-# (1.75 mm at ±5.08). Mirrors pcb._switch_npth.
-SWITCH_NPTH_LOCAL = (
-    (0.0, 0.0, 4.0),
-    (-5.08, 0.0, 1.75),
-    (5.08, 0.0, 1.75),
-)
-# Hotswap adds two 3 mm switch-pin clearance holes at the THT pin
-# positions (mirrors pcb._switch_hotswap).
-HOTSWAP_PIN_NPTH_LOCAL = (
-    (-3.81, -2.54, 3.0),
-    (2.54, -5.08, 3.0),
-)
-
-
 def _switch_npth_keepouts(
     parse: ParseResult, switch_type: SwitchType
 ) -> list[KeepoutCircle]:
     """All NPTHs of every switch footprint, rotated to world coords with
     `_rotate_local_to_world` — the same convention pcb.py uses, so each
-    keepout sits exactly over the hole KiCad drills."""
+    keepout sits exactly over the hole KiCad drills. The local tables
+    (`SWITCH_NPTH_LOCAL` / `HOTSWAP_PIN_NPTH_LOCAL`, radius form) are
+    imported from pcb.py so the drills, these keepouts, and the diode
+    placement resolver all share one definition."""
     locals_ = SWITCH_NPTH_LOCAL
     if switch_type == "hotswap":
         locals_ = locals_ + HOTSWAP_PIN_NPTH_LOCAL
     out: list[KeepoutCircle] = []
     for sw in parse.switches:
-        for lx, ly, d in locals_:
+        for lx, ly, r in locals_:
             wx, wy = _rotate_local_to_world(lx, ly, sw)
-            out.append(KeepoutCircle(d, wx, wy))
+            out.append(KeepoutCircle(2.0 * r, wx, wy))
     return out
 
 
@@ -511,6 +502,7 @@ def _emit_parser() -> list[str]:
 def _emit_structure(
     boundary: list[tuple[float, float]],
     keepouts: list[KeepoutCircle],
+    via_costs: int,
 ) -> list[str]:
     out = ["  (structure"]
     out.append(f'    (layer "{LAYER_F_CU}" (type signal) (property (index 0)))')
@@ -521,7 +513,7 @@ def _emit_structure(
     # reading any keepout builds that table. Emitted later, the scope
     # isn't skipped — the scanner is left inside it and every following
     # token mis-parses, silently producing a board with zero nets.
-    out.extend(_emit_autoroute_settings())
+    out.extend(_emit_autoroute_settings(via_costs))
     # Freerouting accepts exactly one bounding_shape per boundary. Use a
     # closed polyline so non-rectangular plate outlines (edited or grown)
     # are honoured by the router. The polygon must close back on itself
@@ -551,7 +543,7 @@ def _emit_structure(
     return out
 
 
-def _emit_autoroute_settings() -> list[str]:
+def _emit_autoroute_settings(via_costs: int) -> list[str]:
     """Per-layer routing discipline for freerouting (see the
     LAYER_PREFERRED_DIRECTION comment). Placement inside the structure
     scope is load-bearing — see the comment at the call site. Layer names
@@ -566,7 +558,7 @@ def _emit_autoroute_settings() -> list[str]:
     # Completion beats polish — keep it off.
     out.append("      (postroute off)")
     out.append("      (vias on)")
-    out.append(f"      (via_costs {VIA_COSTS})")
+    out.append(f"      (via_costs {via_costs})")
     out.append(f"      (plane_via_costs {PLANE_VIA_COSTS})")
     out.append(f"      (start_ripup_costs {START_RIPUP_COSTS})")
     for layer in LAYERS_SIGNAL:
@@ -731,11 +723,23 @@ def _build_components(
     parse: ParseResult,
     switch_type: SwitchType,
     diode_type: DiodeType,
+    stabilizer_type: StabilizerType,
 ) -> list[Component]:
     nets = _enumerate_nets(parse.switches)
+    # Same resolver call generate_pcb makes on the same prepared parse, so
+    # the DSN diodes sit exactly where the kicad_pcb puts them.
+    placements = resolve_diode_placements(
+        list(parse.switches),
+        list(parse.stabilizers),
+        list(parse.mounting_holes),
+        parse.mcu_placement,
+        switch_type=switch_type,
+        diode_type=diode_type,
+        stabilizer_type=stabilizer_type,
+    )
     components: list[Component] = []
     components.extend(_switch_components(parse, nets, switch_type))
-    components.extend(_diode_components(parse, nets, diode_type, switch_type))
+    components.extend(_diode_components(parse, nets, diode_type, placements))
     components.extend(_mcu_components(parse, nets))
     return components
 
@@ -745,6 +749,7 @@ def pad_world_positions(
     *,
     switch_type: SwitchType = "soldered",
     diode_type: DiodeType = "tht",
+    stabilizer_type: StabilizerType = "pcb_mount",
 ) -> dict[str, list[tuple[float, float, float]]]:
     """Net name → ``[(x_mm, y_mm, radius_mm)]`` of every connected pad, in
     KiCad Y-down coordinates after the same centering/renumbering
@@ -759,7 +764,7 @@ def pad_world_positions(
     cross-check at splice time.
     """
     parse = _prepare_parse(parse)
-    components = _build_components(parse, switch_type, diode_type)
+    components = _build_components(parse, switch_type, diode_type, stabilizer_type)
     images = {
         name: IMAGE_BUILDERS[name]()
         for name in {c.image_name for c in components}
@@ -787,6 +792,7 @@ def pcb_to_dsn(
     diode_type: DiodeType = "tht",
     stabilizer_type: StabilizerType = "pcb_mount",
     design_name: str = "keyboard",
+    via_costs: int = VIA_COSTS,
 ) -> str:
     """Build a Specctra DSN file describing the board to freerouting.
 
@@ -798,7 +804,7 @@ def pcb_to_dsn(
         raise ValueError("cannot export DSN from a board with zero switches")
 
     parse = _prepare_parse(parse)
-    components = _build_components(parse, switch_type, diode_type)
+    components = _build_components(parse, switch_type, diode_type, stabilizer_type)
 
     used_images = {c.image_name for c in components}
     pins_per_net = _collect_pins_per_net(components)
@@ -817,7 +823,7 @@ def pcb_to_dsn(
     lines.extend(_emit_parser())
     lines.append(f"  (resolution {DSN_RESOLUTION_UNIT} {DSN_RESOLUTION})")
     lines.append(f"  (unit {DSN_RESOLUTION_UNIT})")
-    lines.extend(_emit_structure(boundary, keepouts))
+    lines.extend(_emit_structure(boundary, keepouts, via_costs))
     lines.extend(_emit_placement(components))
     lines.extend(_emit_library(used_images))
     lines.extend(_emit_network(pins_per_net))

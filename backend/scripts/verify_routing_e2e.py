@@ -48,11 +48,8 @@ from app.models.schemas import (  # noqa: E402
     SwitchDef,
 )
 from app.services.pcb import generate_pcb  # noqa: E402
-from app.services.routing import client as routing_client  # noqa: E402
-from app.services.routing.dsn import (  # noqa: E402
-    pad_world_positions,
-    pcb_to_dsn,
-)
+from app.services.routing import runner as routing_runner  # noqa: E402
+from app.services.routing.dsn import pad_world_positions  # noqa: E402
 from app.services.routing.ses import (  # noqa: E402
     _atom,
     _find_child,
@@ -178,15 +175,15 @@ def verify(switch_type: str, diode_type: str) -> bool:
         parse, switch_type=switch_type, diode_type=diode_type,
         stabilizer_type="pcb_mount",
     )
-    dsn_text = pcb_to_dsn(
-        parse, switch_type=switch_type, diode_type=diode_type,
-        stabilizer_type="pcb_mount",
-    )
     print(f"{label} routing via freerouting…", flush=True)
-    # Short cap: this fixture routes in seconds, so a hang here means a
-    # regression (e.g. freerouting mis-parsed the DSN) — fail fast rather
-    # than waiting out the production timeout.
-    result = asyncio.run(routing_client.route(dsn_text, timeout_s=240.0))
+    # Routes through the same via-cost-ladder runner production uses.
+    # Short per-attempt cap: this fixture routes in seconds, so a hang here
+    # means a regression (e.g. freerouting mis-parsed the DSN) — fail fast
+    # rather than waiting out the production timeout.
+    result = asyncio.run(routing_runner.route_board(
+        parse, switch_type=switch_type, diode_type=diode_type,
+        stabilizer_type="pcb_mount", timeout_s=240.0,
+    ))
     routed_pcb, stats = apply_ses_to_pcb(
         pcb_text,
         result.ses_text,

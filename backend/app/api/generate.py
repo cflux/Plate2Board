@@ -18,7 +18,8 @@ from ..services.plate_svg import generate_plate_svg
 from ..services.project import DEFAULT_PROJECT_NAME, generate_project_zip
 from ..services.routing import client as routing_client
 from ..services.routing import jobs as routing_jobs
-from ..services.routing.dsn import pad_world_positions, pcb_to_dsn
+from ..services.routing import runner as routing_runner
+from ..services.routing.dsn import pad_world_positions
 from ..services.routing.ses import apply_ses_to_pcb
 from ..services.schematic import generate_schematic
 
@@ -279,6 +280,7 @@ async def get_route_job(job_id: str) -> dict:
             "unrouted": job.stats.unrouted_count,
             "total": job.stats.total_count,
             "vias": job.stats.via_count,
+            "unattached": job.stats.unattached_pads,
             "pass": job.stats.pass_number,
             "log": job.stats.last_log,
         }
@@ -325,8 +327,8 @@ async def _run_routed_job(
 
     Phases (each mapped to a job-store percent):
         generating-pcb  →  5%
-        exporting-dsn   → 15%
-        routing         → 25–90% (driven by freerouting progress callbacks)
+        routing         → 20–90% (DSN export + freerouting attempts across
+                          the via-cost ladder, driven by progress callbacks)
         parsing-ses     → 92%
         packaging       → 97%
         done            → 100%
@@ -341,15 +343,7 @@ async def _run_routed_job(
             stabilizer_type=stabilizer_type,
         )
 
-        await store.update(job_id, phase="exporting-dsn", percent=15.0)
-        dsn_text = pcb_to_dsn(
-            req,
-            switch_type=switch_type,
-            diode_type=diode_type,
-            stabilizer_type=stabilizer_type,
-        )
-
-        await store.update(job_id, phase="routing", percent=25.0)
+        await store.update(job_id, phase="routing", percent=20.0)
 
         async def on_progress(phase: str, percent: float, stats) -> None:
             # Map client's 0..100 to our 25..90 band.
@@ -368,8 +362,14 @@ async def _run_routed_job(
                 job_id, phase="routing", percent=job_pct, stats=mapped_stats
             )
 
-        route_result = await routing_client.route(
-            dsn_text, progress_cb=on_progress
+        # Routes across the via-cost ladder: a plateaued first attempt is
+        # retried with cheaper vias, and the best attempt wins.
+        route_result = await routing_runner.route_board(
+            req,
+            switch_type=switch_type,
+            diode_type=diode_type,
+            stabilizer_type=stabilizer_type,
+            progress_cb=on_progress,
         )
 
         await store.update(job_id, phase="parsing-ses", percent=92.0)
@@ -382,7 +382,10 @@ async def _run_routed_job(
             # kicad_pcb's pads (catches DSN coordinate-convention drift,
             # which freerouting itself can't see).
             pad_positions=pad_world_positions(
-                req, switch_type=switch_type, diode_type=diode_type
+                req,
+                switch_type=switch_type,
+                diode_type=diode_type,
+                stabilizer_type=stabilizer_type,
             ),
         )
         if splice_stats.unattached_pad_count:
@@ -414,6 +417,7 @@ async def _run_routed_job(
             unrouted_count=route_result.stats.unrouted_net_count,
             total_count=route_result.stats.total_net_count,
             via_count=route_result.stats.via_count or splice_stats.via_count,
+            unattached_pads=splice_stats.unattached_pad_count,
         )
         await store.update(
             job_id,
