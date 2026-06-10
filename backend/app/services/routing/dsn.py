@@ -86,6 +86,32 @@ LAYER_F_CU = "F.Cu"
 LAYER_B_CU = "B.Cu"
 LAYERS_SIGNAL = (LAYER_F_CU, LAYER_B_CU)
 
+# Keyboard matrix layer discipline: rows run (mostly) horizontally and
+# columns vertically, so bias F.Cu toward horizontal traces and B.Cu
+# toward vertical ones. Freerouting's defaults apply NO direction
+# preference (preferred and against costs are both 1.0), and its built-in
+# per-layer alternation is the opposite of this anyway (layer 0 vertical),
+# so without these rules row/column traces fight for the same layer.
+# Per-layer preferred directions are transient in freerouting's settings
+# model — they can only be set from the DSN `(autoroute_settings
+# (layer_rule …))` scope, not the REST settings JSON.
+LAYER_PREFERRED_DIRECTION = {
+    LAYER_F_CU: "horizontal",
+    LAYER_B_CU: "vertical",
+}
+# Cost multiplier for routing against a layer's preferred direction.
+# 2.5 matches freerouting's classic GUI default — strong enough to put
+# rows on top / columns on bottom, soft enough that short connections
+# (switch→diode links) can still cut across when that's the only way.
+PREFERRED_DIRECTION_TRACE_COST = 1.0
+AGAINST_PREFERRED_DIRECTION_TRACE_COST = 2.5
+
+# Freerouting cost knobs (mirrored from its own defaults; carried in the
+# DSN so the values are visible in one place and survive API changes).
+VIA_COSTS = 50
+PLANE_VIA_COSTS = 5
+START_RIPUP_COSTS = 100
+
 
 # ---------------------------------------------------------------------------
 # Internal data structures
@@ -489,6 +515,13 @@ def _emit_structure(
     out = ["  (structure"]
     out.append(f'    (layer "{LAYER_F_CU}" (type signal) (property (index 0)))')
     out.append(f'    (layer "{LAYER_B_CU}" (type signal) (property (index 1)))')
+    # MUST come right after the layer definitions: freerouting only
+    # consumes this scope while its layer table is still unbuilt
+    # (Structure.java guards it with `layer_structure == null`), and
+    # reading any keepout builds that table. Emitted later, the scope
+    # isn't skipped — the scanner is left inside it and every following
+    # token mis-parses, silently producing a board with zero nets.
+    out.extend(_emit_autoroute_settings())
     # Freerouting accepts exactly one bounding_shape per boundary. Use a
     # closed polyline so non-rectangular plate outlines (edited or grown)
     # are honoured by the router. The polygon must close back on itself
@@ -515,6 +548,43 @@ def _emit_structure(
     out.append(f"      (clearance {_fmt_coord(DEFAULT_CLEARANCE_MM)})")
     out.append("    )")
     out.append("  )")
+    return out
+
+
+def _emit_autoroute_settings() -> list[str]:
+    """Per-layer routing discipline for freerouting (see the
+    LAYER_PREFERRED_DIRECTION comment). Placement inside the structure
+    scope is load-bearing — see the comment at the call site. Layer names
+    are emitted bare: freerouting's parser reads the layer_rule name in
+    NAME mode, matching the format its own DSN writer produces."""
+    out = ["    (autoroute_settings"]
+    out.append("      (fanout off)")
+    out.append("      (autoroute on)")
+    # postroute=on enables freerouting 2.2.4's optimizer, which we've
+    # seen drop a fully-routed net from the exported SES (net present
+    # after the router's final pass, absent after optimizer passes).
+    # Completion beats polish — keep it off.
+    out.append("      (postroute off)")
+    out.append("      (vias on)")
+    out.append(f"      (via_costs {VIA_COSTS})")
+    out.append(f"      (plane_via_costs {PLANE_VIA_COSTS})")
+    out.append(f"      (start_ripup_costs {START_RIPUP_COSTS})")
+    for layer in LAYERS_SIGNAL:
+        out.append(f"      (layer_rule {layer}")
+        out.append("        (active on)")
+        out.append(
+            f"        (preferred_direction {LAYER_PREFERRED_DIRECTION[layer]})"
+        )
+        out.append(
+            f"        (preferred_direction_trace_costs "
+            f"{PREFERRED_DIRECTION_TRACE_COST:.1f})"
+        )
+        out.append(
+            f"        (against_preferred_direction_trace_costs "
+            f"{AGAINST_PREFERRED_DIRECTION_TRACE_COST:.1f})"
+        )
+        out.append("      )")
+    out.append("    )")
     return out
 
 

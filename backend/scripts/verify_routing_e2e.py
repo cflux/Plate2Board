@@ -15,7 +15,10 @@ independently written math:
    imported from dsn.py so a convention bug there cannot vouch for
    itself;
 4. no trace may cross any NPTH (switch stems/pegs, hotswap pin holes,
-   stab holes, mounting holes).
+   stab holes, mounting holes);
+5. layer discipline: F.Cu copper must be more horizontal than B.Cu
+   (rows on top, columns on bottom — driven by the DSN
+   autoroute_settings layer rules).
 
 Run inside the compose network (the sidecar publishes no host port):
 
@@ -24,7 +27,7 @@ Run inside the compose network (the sidecar publishes no host port):
         -v "$PWD/backend:/src" -w /src keeblayoutbot-backend:latest \\
         python scripts/verify_routing_e2e.py
 
-Exits 0 if every check passes for both build configs, 1 otherwise.
+Exits 0 if every check passes for all four build configs, 1 otherwise.
 """
 
 from __future__ import annotations
@@ -138,14 +141,16 @@ def collect_board_geometry(pcb_text: str):
             pads.append((ref, _atom(pad[1]), int(_atom(net[1])), wx, wy, radius))
 
     segments = [
-        tuple(float(g) for g in m.groups()[:4]) + (int(m.group(6)), float(m.group(5)))
+        tuple(float(g) for g in m.groups()[:4])
+        + (int(m.group(7)), float(m.group(5)), m.group(6))
         for m in re.finditer(
             r"\(segment \(start ([-\d.]+) ([-\d.]+)\) "
-            r"\(end ([-\d.]+) ([-\d.]+)\) \(width ([-\d.]+)\)"
-            r'.*?\(net (\d+)\)',
+            r"\(end ([-\d.]+) ([-\d.]+)\) \(width ([-\d.]+)\) "
+            r'\(layer "([^"]+)"\)'
+            r".*?\(net (\d+)\)",
             pcb_text,
         )
-    ]  # (x1, y1, x2, y2, net_code, width)
+    ]  # (x1, y1, x2, y2, net_code, width, layer)
     vias = [
         (float(m.group(1)), float(m.group(2)), int(m.group(3)))
         for m in re.finditer(
@@ -178,7 +183,10 @@ def verify(switch_type: str, diode_type: str) -> bool:
         stabilizer_type="pcb_mount",
     )
     print(f"{label} routing via freerouting…", flush=True)
-    result = asyncio.run(routing_client.route(dsn_text))
+    # Short cap: this fixture routes in seconds, so a hang here means a
+    # regression (e.g. freerouting mis-parsed the DSN) — fail fast rather
+    # than waiting out the production timeout.
+    result = asyncio.run(routing_client.route(dsn_text, timeout_s=240.0))
     routed_pcb, stats = apply_ses_to_pcb(
         pcb_text,
         result.ses_text,
@@ -231,7 +239,7 @@ def verify(switch_type: str, diode_type: str) -> bool:
 
     crossings = 0
     for hx, hy, hr in npths:
-        for x1, y1, x2, y2, _code, width in segments:
+        for x1, y1, x2, y2, _code, width, _layer in segments:
             if point_segment_distance(hx, hy, x1, y1, x2, y2) < hr + width / 2.0:
                 crossings += 1
     if crossings:
@@ -239,12 +247,51 @@ def verify(switch_type: str, diode_type: str) -> bool:
         ok = False
     else:
         print(f"{label} no traces cross any of the {len(npths)} NPTHs")
+
+    # Layer discipline: with the DSN autoroute_settings layer rules, F.Cu
+    # should carry mostly horizontal copper (rows) and B.Cu mostly
+    # vertical (columns). Compare the horizontal share of copper length
+    # per layer — the relative ordering is the robust signal.
+    horiz = {"F.Cu": 0.0, "B.Cu": 0.0}
+    total = {"F.Cu": 0.0, "B.Cu": 0.0}
+    for x1, y1, x2, y2, _code, _width, layer in segments:
+        if layer not in total:
+            continue
+        dx, dy = abs(x2 - x1), abs(y2 - y1)
+        length = math.hypot(dx, dy)
+        total[layer] += length
+        if dx >= dy:
+            horiz[layer] += length
+    share = {
+        layer: (horiz[layer] / total[layer] if total[layer] else 0.0)
+        for layer in total
+    }
+    print(
+        f"{label} horizontal copper share: "
+        f"F.Cu {share['F.Cu']:.0%} ({total['F.Cu']:.0f} mm), "
+        f"B.Cu {share['B.Cu']:.0%} ({total['B.Cu']:.0f} mm)"
+    )
+    # Only meaningful when both layers carry real copper: in the
+    # hotswap/smd config every pad is on B.Cu, so F.Cu sees a few mm of
+    # crossover jumps and its share is statistical noise.
+    if (
+        min(total.values()) >= 75.0
+        and share["F.Cu"] <= share["B.Cu"]
+    ):
+        print(f"{label} FAIL: no row/column layer discipline "
+              f"(F.Cu should be more horizontal than B.Cu)")
+        ok = False
     return ok
 
 
 def main() -> int:
     all_ok = True
-    for switch_type, diode_type in (("soldered", "tht"), ("hotswap", "smd")):
+    for switch_type, diode_type in (
+        ("soldered", "tht"),
+        ("soldered", "smd"),
+        ("hotswap", "tht"),
+        ("hotswap", "smd"),
+    ):
         try:
             all_ok &= verify(switch_type, diode_type)
         except Exception as exc:  # noqa: BLE001 — report and fail

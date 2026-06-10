@@ -109,6 +109,37 @@ def test_dsn_zero_switches_raises() -> None:
         pcb_to_dsn(parse)
 
 
+def test_dsn_emits_layer_direction_discipline() -> None:
+    """Rows route on F.Cu (horizontal preference), columns on B.Cu
+    (vertical). Scope ordering is load-bearing: autoroute_settings must
+    come after the layer definitions (freerouting builds its layer table
+    from them) but BEFORE any keepout — reading a keepout also builds the
+    layer table, and freerouting only consumes autoroute_settings while
+    that table is still unbuilt; emitted later, the scanner is left inside
+    the scope and the rest of the DSN silently mis-parses to zero nets."""
+    dsn = pcb_to_dsn(_result_two_keys())
+    settings_at = dsn.index("(autoroute_settings")
+    assert settings_at > dsn.index('(layer "B.Cu"')
+    assert settings_at < dsn.index("(boundary")
+    assert settings_at < dsn.index("(keepout")
+    assert re.search(
+        r"\(layer_rule F\.Cu\s+\(active on\)\s+"
+        r"\(preferred_direction horizontal\)", dsn,
+    ), "F.Cu must prefer horizontal (rows on top)"
+    assert re.search(
+        r"\(layer_rule B\.Cu\s+\(active on\)\s+"
+        r"\(preferred_direction vertical\)", dsn,
+    ), "B.Cu must prefer vertical (columns on bottom)"
+    # Against-preferred cost must exceed preferred or the rules are inert.
+    costs = re.findall(
+        r"\(preferred_direction_trace_costs ([\d.]+)\)\s+"
+        r"\(against_preferred_direction_trace_costs ([\d.]+)\)", dsn,
+    )
+    assert len(costs) == 2
+    for preferred, against in costs:
+        assert float(against) > float(preferred)
+
+
 # --- DSN ↔ kicad_pcb geometric agreement ------------------------------------
 #
 # These tests interpret the emitted DSN exactly the way freerouting does
@@ -357,6 +388,96 @@ def test_pad_world_positions_match_kicad_pcb() -> None:
         assert any(
             math.hypot(px - kx, py - ky) < 1e-3 for px, py, _r in entries
         ), f"{ref}-{number} ({net_name}) missing from pad_world_positions"
+
+
+def _pad_copper_geometries(pcb_text: str):
+    """``[(ref, number, net_name, layer_set, shapely_geom)]`` for every
+    netted copper pad, in world coordinates. NPTHs (no net) are skipped."""
+    from shapely.affinity import rotate as shp_rotate
+    from shapely.affinity import translate as shp_translate
+    from shapely.geometry import Point, box
+
+    out = []
+    root = _parse_sexp(pcb_text)
+    for fp in _find_children(root, "footprint"):
+        at = _find_child(fp, "at")
+        fx, fy = float(_atom(at[1])), float(_atom(at[2]))
+        theta = float(_atom(at[3])) if len(at) > 3 else 0.0
+        cos_r = math.cos(math.radians(theta))
+        sin_r = math.sin(math.radians(theta))
+        ref = ""
+        for prop in _find_children(fp, "property"):
+            if _atom(prop[1]) == "Reference":
+                ref = _atom(prop[2])
+        for pad in _find_children(fp, "pad"):
+            net = _find_child(pad, "net")
+            if net is None:
+                continue
+            pad_at = _find_child(pad, "at")
+            lx, ly = float(_atom(pad_at[1])), float(_atom(pad_at[2]))
+            wx = fx + lx * cos_r + ly * sin_r
+            wy = fy - lx * sin_r + ly * cos_r
+            size = _find_child(pad, "size")
+            w, h = float(_atom(size[1])), float(_atom(size[2]))
+            if _atom(pad[3]) in ("circle", "oval"):
+                geom = Point(wx, wy).buffer(max(w, h) / 2.0, quad_segs=16)
+            else:  # rect — KiCad world = R_k(θ)·local, i.e. standard −θ.
+                geom = box(-w / 2.0, -h / 2.0, w / 2.0, h / 2.0)
+                geom = shp_rotate(geom, -theta, origin=(0, 0))
+                geom = shp_translate(geom, wx, wy)
+            layers: set[str] = set()
+            for tok in _find_child(pad, "layers")[1:]:
+                t = _atom(tok)
+                if t == "*.Cu":
+                    layers |= {"F.Cu", "B.Cu"}
+                elif t.endswith(".Cu"):
+                    layers.add(t)
+            out.append((ref, _atom(pad[1]), _atom(net[2]), layers, geom))
+    return out
+
+
+@pytest.mark.parametrize(
+    "switch_type,diode_type",
+    [
+        ("soldered", "tht"),
+        ("soldered", "smd"),
+        ("hotswap", "tht"),
+        ("hotswap", "smd"),
+    ],
+)
+def test_no_cross_net_pad_clearance_violations(
+    switch_type: str, diode_type: str
+) -> None:
+    """No two pads on different nets may sit closer than the 0.2 mm
+    clearance rule on a shared copper layer — a violation here is a
+    manufactured short (or an unroutable net for freerouting) baked into
+    the footprint geometry itself. Caught a real one: the soldered+SMD
+    diode anchor used to overlap the ROW pad with switch pin 2's
+    through-hole copper by 0.10 mm."""
+    parse = _result_rotated()
+    pcb_text = generate_pcb(
+        parse, switch_type=switch_type, diode_type=diode_type,
+        stabilizer_type="pcb_mount",
+    )
+    pads = _pad_copper_geometries(pcb_text)
+    assert pads
+    min_clearance = 0.2 - 1e-6
+    violations = []
+    for i in range(len(pads)):
+        ref1, n1, net1, layers1, g1 = pads[i]
+        for j in range(i + 1, len(pads)):
+            ref2, n2, net2, layers2, g2 = pads[j]
+            if net1 == net2 or not (layers1 & layers2):
+                continue
+            dist = g1.distance(g2)
+            if dist < min_clearance:
+                violations.append(
+                    f"{ref1}-{n1} ({net1}) ↔ {ref2}-{n2} ({net2}): "
+                    f"{dist:.3f} mm"
+                )
+    assert not violations, (
+        "cross-net pad clearance violations:\n" + "\n".join(violations[:10])
+    )
 
 
 def test_count_unattached_pads() -> None:

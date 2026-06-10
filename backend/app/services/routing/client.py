@@ -42,7 +42,20 @@ _CLIENT_VERSION = "0.8.0"
 DEFAULT_BASE_URL = "http://freerouting:37864"
 DEFAULT_MAX_PASSES = 100
 DEFAULT_POLL_INTERVAL_S = 0.5
-DEFAULT_TIMEOUT_S = 300.0  # 5 minutes hard cap on routing
+# Hard wall-clock cap on routing. Hitting it cancels the freerouting job
+# mid-route, and whatever nets it hadn't reached yet stay unrouted — the
+# old 300 s cap was cutting off larger keyboards, which surfaced as "easy
+# nets left unrouted". The route job is async with live progress, so a
+# long cap costs nothing on boards that finish early (freerouting returns
+# as soon as everything is routed). Override via FREEROUTING_TIMEOUT_S.
+DEFAULT_TIMEOUT_S = 1800.0
+
+
+def _default_timeout_s() -> float:
+    try:
+        return float(os.environ.get("FREEROUTING_TIMEOUT_S", DEFAULT_TIMEOUT_S))
+    except ValueError:
+        return DEFAULT_TIMEOUT_S
 
 
 # ---------------------------------------------------------------------------
@@ -142,7 +155,7 @@ async def route(
     *,
     max_passes: int = DEFAULT_MAX_PASSES,
     base_url: str | None = None,
-    timeout_s: float = DEFAULT_TIMEOUT_S,
+    timeout_s: float | None = None,
     poll_interval_s: float = DEFAULT_POLL_INTERVAL_S,
     progress_cb: Optional[ProgressCB] = None,
 ) -> RouteResult:
@@ -155,6 +168,8 @@ async def route(
     the user.
     """
     url = base_url or os.environ.get("FREEROUTING_URL", DEFAULT_BASE_URL)
+    if timeout_s is None:
+        timeout_s = _default_timeout_s()
     job_name = f"keeb-{uuid.uuid4().hex[:8]}"
     filename = f"{job_name}.dsn"
 
@@ -225,17 +240,18 @@ async def _upload_input(
 async def _set_settings(
     client: httpx.AsyncClient, job_id: str, *, max_passes: int
 ) -> None:
-    # Reasonable defaults for keyboard matrices: full optimisation passes,
-    # via cost biased moderately so the router prefers single-layer paths
-    # when possible (we still allow vias — see project.py Matrix netclass).
+    # Only max_passes goes through the REST settings. Everything else
+    # (via costs, ripup costs, per-layer preferred directions) is carried
+    # in the DSN's `(autoroute_settings …)` scope — the REST schema can't
+    # express the per-layer rules at all (they're transient fields in
+    # freerouting's settings model), and API-provided values take merge
+    # priority over the DSN, so duplicating scalars here would silently
+    # shadow the DSN. NOTE: the old payload also sent via_costs /
+    # start_ripup_costs at the top level; freerouting 2.2.4 expects those
+    # nested under "scoring", so they were ignored anyway.
     r = await client.post(
         f"/v1/jobs/{job_id}/settings",
-        json={
-            "max_passes": max_passes,
-            "via_costs": 50,
-            "start_pass_no": 1,
-            "start_ripup_costs": 100,
-        },
+        json={"max_passes": max_passes},
     )
     # Settings endpoint may 200/204 even if it ignores unknown fields; only
     # treat 4xx/5xx as a hard error.
@@ -248,13 +264,19 @@ async def _start_job(client: httpx.AsyncClient, job_id: str) -> None:
     r.raise_for_status()
 
 
+# Score must not match a sentence-ending period: freerouting logs lines
+# like "… score of 0.00." and a greedy [\d.]+ would capture "0.00.",
+# which float() rejects.
+_FLOAT_RE = r"(\d+(?:\.\d+)?)"
 _PASS_LOG_RE = re.compile(
-    r"Auto-router pass #(\d+).*?score of ([\d.]+)(?:\s*\((\d+)\s+unrouted\))?"
+    r"Auto-router pass #(\d+).*?score of " + _FLOAT_RE +
+    r"(?:\s*\((\d+)\s+unrouted\))?"
 )
 _FINAL_LOG_RE = re.compile(
     r"Auto-router session (?:completed|cancelled): "
     r"started with (\d+) unrouted nets.*?"
-    r"final score: ([\d.]+)(?:\s*\((\d+)\s+unrouted\))?"
+    r"final score: " + _FLOAT_RE +
+    r"(?:\s*\((\d+)\s+unrouted\))?"
 )
 
 

@@ -552,11 +552,20 @@ def _diode_position(sw: SwitchDef) -> tuple[float, float]:
     return (sw.cx_mm + dx, sw.cy_mm + dy)
 
 
-# SMD diode anchor in switch local coords: centered on the pad it connects
-# to (switch pin 2 / hotswap socket pad 2). Hotswap shifts +6 mm in X to
+# SMD diode anchor in switch local coords, near the pad it connects to
+# (switch pin 2 / hotswap socket pad 2). Hotswap shifts +6 mm in X to
 # clear the larger Kailh socket pad on B.Cu.
+#
+# Soldered sits 0.35 mm beyond pin 2 (local -Y) rather than dead-center on
+# it: the diode pads are ±1.65 mm from the anchor along the switch's local
+# Y, and pin 2's copper is a 1.25 mm-radius circle on both layers — an
+# anchor at pin 2 puts the far pad (ROW net, 0.5 mm half-length) at
+# 1.65 mm, overlapping the link-net TH pad by 0.10 mm (a designed-in
+# short). At -5.43 the link-side pad still lands on pin 2's copper
+# (same net, direct connection) while the ROW pad clears it by 0.25 mm
+# (> the 0.2 mm clearance rule).
 SMD_DIODE_LOCAL_OFFSET = {
-    "soldered": (2.54, -5.08),
+    "soldered": (2.54, -5.43),
     "hotswap": (8.54, -5.08),
 }
 
