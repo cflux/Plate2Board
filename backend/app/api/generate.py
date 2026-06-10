@@ -18,7 +18,7 @@ from ..services.plate_svg import generate_plate_svg
 from ..services.project import DEFAULT_PROJECT_NAME, generate_project_zip
 from ..services.routing import client as routing_client
 from ..services.routing import jobs as routing_jobs
-from ..services.routing.dsn import pcb_to_dsn
+from ..services.routing.dsn import pad_world_positions, pcb_to_dsn
 from ..services.routing.ses import apply_ses_to_pcb
 from ..services.schematic import generate_schematic
 
@@ -378,7 +378,18 @@ async def _run_routed_job(
             route_result.ses_text,
             total_connections=route_result.stats.total_net_count,
             unrouted_connections=route_result.stats.unrouted_net_count,
+            # Geometry tripwire: verify routed copper actually lands on the
+            # kicad_pcb's pads (catches DSN coordinate-convention drift,
+            # which freerouting itself can't see).
+            pad_positions=pad_world_positions(
+                req, switch_type=switch_type, diode_type=diode_type
+            ),
         )
+        if splice_stats.unattached_pad_count:
+            logger.warning(
+                "routing job %s: %d unattached pad(s) after splice",
+                job_id, splice_stats.unattached_pad_count,
+            )
 
         await store.update(job_id, phase="packaging", percent=97.0)
         zip_bytes = generate_project_zip(

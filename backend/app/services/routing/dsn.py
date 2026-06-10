@@ -13,13 +13,23 @@ Coordinate convention
 Specctra is a Y-up (math) coordinate system; KiCad is Y-down (screen).
 freerouting uses the input DSN coordinates literally — it doesn't know we
 have a Y-down source — so any rotation we hand it is applied as
-CCW-positive in Y-up space. If we feed the kicad_pcb Y coords through as-
-is, a rotated footprint's pad positions end up offset from where KiCad
-places the same footprint, and wires don't quite land on pads. Match
-KiCad's own DSN exporter: Y-flip every coord on emit, negate placement
-rotation, and Y-flip pin local coords inside each image. The SES parser
-then re-flips Y on every wire / via so the splice into kicad_pcb lands on
-the original Y-down coordinates.
+CCW-positive in Y-up space. Match KiCad's own DSN exporter: Y-flip every
+coordinate on emit (placement, image pin locals, boundary, keepouts) and
+emit the placement rotation *unchanged*. The angle survives the flip
+because conjugating KiCad's Y-down rotation matrix by the Y-flip yields
+the standard CCW matrix with the same angle: F·R_k(θ)·F = R_m(θ). (An
+earlier revision negated the rotation here, which mirror-rotated every
+footprint in freerouting's view — self-consistently, so routing
+"succeeded" but the spliced wires missed the real pads on any rotated
+layout.) The SES parser re-flips Y on every wire / via so the splice
+into kicad_pcb lands on the original Y-down coordinates.
+
+All components are placed side=front, even those whose copper lives on
+B.Cu (hotswap sockets, SMD diodes) — the padstack layer list pins the
+copper to the right layer, and side=back would make freerouting mirror
+the image (KiCad's exporter compensates with a 180−θ angle because real
+KiCad files store back-side footprints pre-mirrored; our generator emits
+WYSIWYG coords, so no mirror must be applied).
 """
 
 from __future__ import annotations
@@ -44,6 +54,7 @@ from ..pcb import (
     _kicad_angle,
     _pair_stabs_to_switches,
     _parse_path_points,
+    _rotate_local_to_world,
     _smd_diode_position,
     _stab_sides,
     center_parse_on_page,
@@ -286,8 +297,12 @@ def _diode_components(
                 place_x=cx,
                 place_y=cy,
                 rotation_deg=rot,
-                # SMD diode is on B.Cu — placement side flips the image.
-                side="back" if diode_type == "smd" else "front",
+                # SMD diode copper is on B.Cu via its padstack's layer list;
+                # the place stays side=front because pcb.py emits the B.Cu
+                # footprint WYSIWYG (no mirrored frame), while a DSN back-
+                # side place would make freerouting mirror the pin locations
+                # across the Y axis — swapping pads 1 and 2.
+                side="front",
                 nets={
                     "1": f"ROW{sw.row}",
                     "2": f"NET-SW{sw.id}-D{sw.id}",
@@ -329,25 +344,35 @@ def _mcu_components(parse: ParseResult, nets: dict[str, int]) -> list[Component]
 # ---------------------------------------------------------------------------
 
 
-def _rotate_local(lx: float, ly: float, rot_deg: float) -> tuple[float, float]:
-    rot = math.radians(rot_deg)
-    cos_r, sin_r = math.cos(rot), math.sin(rot)
-    return (lx * cos_r - ly * sin_r, lx * sin_r + ly * cos_r)
+# Switch NPTHs in footprint-local mm: center stem (4 mm) + two peg holes
+# (1.75 mm at ±5.08). Mirrors pcb._switch_npth.
+SWITCH_NPTH_LOCAL = (
+    (0.0, 0.0, 4.0),
+    (-5.08, 0.0, 1.75),
+    (5.08, 0.0, 1.75),
+)
+# Hotswap adds two 3 mm switch-pin clearance holes at the THT pin
+# positions (mirrors pcb._switch_hotswap).
+HOTSWAP_PIN_NPTH_LOCAL = (
+    (-3.81, -2.54, 3.0),
+    (2.54, -5.08, 3.0),
+)
 
 
-def _switch_npth_keepouts(parse: ParseResult) -> list[KeepoutCircle]:
-    """Center stem (4 mm) + two peg holes (1.75 mm at ±5.08) per switch."""
+def _switch_npth_keepouts(
+    parse: ParseResult, switch_type: SwitchType
+) -> list[KeepoutCircle]:
+    """All NPTHs of every switch footprint, rotated to world coords with
+    `_rotate_local_to_world` — the same convention pcb.py uses, so each
+    keepout sits exactly over the hole KiCad drills."""
+    locals_ = SWITCH_NPTH_LOCAL
+    if switch_type == "hotswap":
+        locals_ = locals_ + HOTSWAP_PIN_NPTH_LOCAL
     out: list[KeepoutCircle] = []
     for sw in parse.switches:
-        # Switch rotation is applied via _kicad_angle so signs match pcb.py.
-        rot = _kicad_angle(sw.rotation_deg)
-        for lx, ly, d in [
-            (0.0, 0.0, 4.0),
-            (-5.08, 0.0, 1.75),
-            (5.08, 0.0, 1.75),
-        ]:
-            wx, wy = _rotate_local(lx, ly, rot)
-            out.append(KeepoutCircle(d, sw.cx_mm + wx, sw.cy_mm + wy))
+        for lx, ly, d in locals_:
+            wx, wy = _rotate_local_to_world(lx, ly, sw)
+            out.append(KeepoutCircle(d, wx, wy))
     return out
 
 
@@ -359,7 +384,7 @@ def _stabilizer_keepouts(
     if stab_type != "pcb_mount" or not parse.switches or not parse.stabilizers:
         return []
     out: list[KeepoutCircle] = []
-    pairs = _pair_stabs_to_switches(parse.stabilizers, parse.switches)
+    pairs = _pair_stabs_to_switches(parse.switches, parse.stabilizers)
     by_sw: dict[int, list] = {}
     for sw, stabs in pairs:
         by_sw.setdefault(sw.id, []).extend(stabs)
@@ -368,14 +393,13 @@ def _stabilizer_keepouts(
         if not stabs:
             continue
         sides = _stab_sides(sw, stabs)
-        rot = _kicad_angle(sw.rotation_deg)
         for side_x in sides:
             for ly, d in [
                 (CHERRY_STAB_WIRE_OFFSET_Y_MM, CHERRY_STAB_WIRE_HOLE_MM),
                 (CHERRY_STAB_HOUSING_OFFSET_Y_MM, CHERRY_STAB_HOUSING_HOLE_MM),
             ]:
-                wx, wy = _rotate_local(side_x, ly, rot)
-                out.append(KeepoutCircle(d, sw.cx_mm + wx, sw.cy_mm + wy))
+                wx, wy = _rotate_local_to_world(side_x, ly, sw)
+                out.append(KeepoutCircle(d, wx, wy))
     return out
 
 
@@ -518,11 +542,15 @@ def _emit_placement(components: list[Component]) -> list[str]:
     for image_name, comps in by_image.items():
         out.append(f'    (component "{image_name}"')
         for c in comps:
-            # Y-flip placement Y, negate rotation (Y-flip inverts CCW/CW).
+            # Y-flip placement Y but keep the KiCad rotation angle as-is:
+            # F·R_k(θ)·F = R_m(θ), so the Y-flipped frame uses the same θ
+            # (see module docstring). KiCad's own Specctra exporter does
+            # exactly this for front-side footprints. Normalised to
+            # [0, 360) for freerouting's 90°-multiple fast path.
             out.append(
                 f'      (place "{c.ref}" '
                 f"{_fmt_coord(c.place_x)} {_fmt_y(c.place_y)} "
-                f"{c.side} {-c.rotation_deg:.3f})"
+                f"{c.side} {c.rotation_deg % 360.0:.3f})"
             )
         out.append("    )")
     out.append("  )")
@@ -618,6 +646,70 @@ def _emit_network(
 # ---------------------------------------------------------------------------
 
 
+def _prepare_parse(parse: ParseResult) -> ParseResult:
+    """Apply the same centering shift + matrix renumbering `generate_pcb`
+    performs, so everything derived here lines up coordinate-for-coordinate
+    and refdes-for-refdes with the emitted kicad_pcb."""
+    _paper, parse = center_parse_on_page(parse)
+    from ..matrix import renumber_switches  # local import avoids cycle
+    return parse.model_copy(
+        update={"switches": renumber_switches(parse.switches)}
+    )
+
+
+def _build_components(
+    parse: ParseResult,
+    switch_type: SwitchType,
+    diode_type: DiodeType,
+) -> list[Component]:
+    nets = _enumerate_nets(parse.switches)
+    components: list[Component] = []
+    components.extend(_switch_components(parse, nets, switch_type))
+    components.extend(_diode_components(parse, nets, diode_type, switch_type))
+    components.extend(_mcu_components(parse, nets))
+    return components
+
+
+def pad_world_positions(
+    parse: ParseResult,
+    *,
+    switch_type: SwitchType = "soldered",
+    diode_type: DiodeType = "tht",
+) -> dict[str, list[tuple[float, float, float]]]:
+    """Net name → ``[(x_mm, y_mm, radius_mm)]`` of every connected pad, in
+    KiCad Y-down coordinates after the same centering/renumbering
+    `generate_pcb` applies. ``radius_mm`` is the pad's max half-extent.
+
+    Used by the post-route validator to check that routed wires actually
+    land on pads — the DSN we feed freerouting is self-consistent by
+    construction, so a coordinate-convention bug here doesn't fail routing,
+    it silently misplaces every trace. This recomputes pad positions with
+    KiCad's own rotation convention (world = at + R_k(θ)·local,
+    R_k = [[cos, sin], [−sin, cos]] in Y-down coords) as an independent
+    cross-check at splice time.
+    """
+    parse = _prepare_parse(parse)
+    components = _build_components(parse, switch_type, diode_type)
+    images = {
+        name: IMAGE_BUILDERS[name]()
+        for name in {c.image_name for c in components}
+    }
+    out: dict[str, list[tuple[float, float, float]]] = {}
+    for comp in components:
+        rot = math.radians(comp.rotation_deg)
+        cos_r, sin_r = math.cos(rot), math.sin(rot)
+        for pin in images[comp.image_name].pins:
+            net = comp.nets.get(pin.number)
+            if net is None:
+                continue
+            lx, ly = pin.local_x, pin.local_y
+            wx = comp.place_x + lx * cos_r + ly * sin_r
+            wy = comp.place_y - lx * sin_r + ly * cos_r
+            radius = max(pin.padstack.w_mm, pin.padstack.h_mm) / 2.0
+            out.setdefault(net, []).append((wx, wy, radius))
+    return out
+
+
 def pcb_to_dsn(
     parse: ParseResult,
     *,
@@ -635,21 +727,8 @@ def pcb_to_dsn(
     if not parse.switches:
         raise ValueError("cannot export DSN from a board with zero switches")
 
-    # Same centering shift `generate_pcb` applies — both pipelines need to
-    # agree on coords or the routed SES traces will land in the wrong
-    # place relative to the kicad_pcb footprints.
-    _paper, parse = center_parse_on_page(parse)
-
-    # Renumber switches into matrix-order — same as pcb.generate_pcb does
-    # before emitting, so refdes / net codes line up.
-    from ..matrix import renumber_switches
-    parse = parse.model_copy(update={"switches": renumber_switches(parse.switches)})
-
-    nets = _enumerate_nets(parse.switches)
-    components: list[Component] = []
-    components.extend(_switch_components(parse, nets, switch_type))
-    components.extend(_diode_components(parse, nets, diode_type, switch_type))
-    components.extend(_mcu_components(parse, nets))
+    parse = _prepare_parse(parse)
+    components = _build_components(parse, switch_type, diode_type)
 
     used_images = {c.image_name for c in components}
     pins_per_net = _collect_pins_per_net(components)
@@ -659,7 +738,7 @@ def pcb_to_dsn(
         raise ValueError("board outline has fewer than 3 vertices")
 
     keepouts: list[KeepoutCircle] = []
-    keepouts.extend(_switch_npth_keepouts(parse))
+    keepouts.extend(_switch_npth_keepouts(parse, switch_type))
     keepouts.extend(_stabilizer_keepouts(parse, stabilizer_type))
     keepouts.extend(_mounting_hole_keepouts(parse))
 

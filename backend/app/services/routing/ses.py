@@ -13,9 +13,12 @@ can keep the splice surgical without reformatting the rest of the file.
 
 from __future__ import annotations
 
+import logging
 import re
 import uuid
 from dataclasses import dataclass
+
+logger = logging.getLogger(__name__)
 
 # --- minimal S-expression tokenizer ----------------------------------------
 #
@@ -353,6 +356,57 @@ def splice_routes(
     return pcb_text[:idx] + block + pcb_text[idx:]
 
 
+# --- post-route validation ---------------------------------------------------
+
+# A wire counts as attached to a pad if an endpoint (or via) lands within
+# the pad's half-extent plus this slop. Generous enough for endpoints that
+# terminate on the pad edge rather than dead-center, tight enough to flag
+# the millimetre-scale drift a coordinate-convention bug produces.
+PAD_ATTACH_SLOP_MM = 0.2
+
+
+def count_unattached_pads(
+    segments: list[Segment],
+    vias: list[Via],
+    pad_positions: dict[str, list[tuple[float, float, float]]],
+    net_table: dict[str, int],
+) -> int:
+    """Number of pads whose net has routed copper but where no wire endpoint
+    or via lands on the pad itself.
+
+    This is the tripwire for convention bugs between dsn.py and pcb.py: the
+    DSN is self-consistent by construction, so freerouting happily reports
+    success even when its view of the board is rotated/mirrored relative to
+    the kicad_pcb — the only observable symptom is wires that don't touch
+    pads after the splice. Nets with no copper at all are excluded (those
+    are honest routing failures, already counted in `unrouted_count`).
+
+    `pad_positions` maps net name → ``[(x_mm, y_mm, radius_mm)]`` in KiCad
+    Y-down coords — see `dsn.pad_world_positions`.
+    """
+    points_by_code: dict[int, list[tuple[float, float]]] = {}
+    for s in segments:
+        pts = points_by_code.setdefault(s.net_code, [])
+        pts.append((s.x1_mm, s.y1_mm))
+        pts.append((s.x2_mm, s.y2_mm))
+    for v in vias:
+        points_by_code.setdefault(v.net_code, []).append((v.cx_mm, v.cy_mm))
+
+    unattached = 0
+    for net_name, pads in pad_positions.items():
+        code = net_table.get(net_name)
+        points = points_by_code.get(code) if code is not None else None
+        if not points:
+            continue
+        for px, py, radius in pads:
+            tol_sq = (radius + PAD_ATTACH_SLOP_MM) ** 2
+            if not any(
+                (x - px) ** 2 + (y - py) ** 2 <= tol_sq for x, y in points
+            ):
+                unattached += 1
+    return unattached
+
+
 # --- public top-level helper ------------------------------------------------
 
 
@@ -369,6 +423,10 @@ class RouteStats:
     # API reports it directly.
     total_count: int = 0
     unrouted_count: int = 0
+    # Pads with routed copper on their net but no wire actually touching
+    # them — see `count_unattached_pads`. 0 when the splice is geometrically
+    # sound; only populated when the caller supplies `pad_positions`.
+    unattached_pad_count: int = 0
 
 
 def apply_ses_to_pcb(
@@ -378,12 +436,16 @@ def apply_ses_to_pcb(
     total_connections: int = 0,
     unrouted_connections: int = 0,
     freerouting_quirk: bool = True,
+    pad_positions: dict[str, list[tuple[float, float, float]]] | None = None,
 ) -> tuple[str, RouteStats]:
     """High-level: parse SES, splice into pcb, return (new_pcb, stats).
 
     `total_connections` / `unrouted_connections` come from the freerouting
     job-status response (the SES alone doesn't carry them). If they're 0
     the UI will just show "K wires, V vias" instead of "K of N routed".
+
+    `pad_positions` (from `dsn.pad_world_positions`) enables the post-route
+    geometry check — see `count_unattached_pads`.
 
     `freerouting_quirk` propagates to `parse_ses` (default True). Set
     False only for hand-crafted SES test fixtures.
@@ -393,10 +455,23 @@ def apply_ses_to_pcb(
         ses_text, net_table, freerouting_quirk=freerouting_quirk
     )
     routed_pcb = splice_routes(pcb_text, segments, vias)
+    unattached = 0
+    if pad_positions is not None:
+        unattached = count_unattached_pads(
+            segments, vias, pad_positions, net_table
+        )
+        if unattached:
+            logger.warning(
+                "post-route check: %d pad(s) have routed copper on their "
+                "net but no wire touching them — traces may not land on "
+                "pads (coordinate-convention drift?)",
+                unattached,
+            )
     stats = RouteStats(
         routed_count=len(segments),
         via_count=len(vias),
         total_count=total_connections,
         unrouted_count=unrouted_connections,
+        unattached_pad_count=unattached,
     )
     return routed_pcb, stats
