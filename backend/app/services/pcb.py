@@ -479,21 +479,27 @@ def _common_props(
     rot: float,
     side: str = "F",
     text_offset_y: float = 8.5,
+    text_center: tuple[float, float] = (0.0, 0.0),
 ) -> str:
     """Reference + Value + Footprint + Description properties.
     `side` is "F" for top-side parts or "B" for bottom-side parts; KiCad
     requires text properties to live on the same side as the footprint.
-    `text_offset_y` is the distance from the part anchor to the Reference
+    `text_offset_y` is the distance from `text_center` to the Reference
     (above) and Value (below) text — tune per body height so the labels
-    sit just outside the body."""
+    sit just outside the body. `text_center` is the footprint-local point
+    the pair stacks around; the default (0, 0) suits footprints anchored
+    on their body center, while corner-anchored footprints (Pro Micro,
+    anchored at pin 1) pass their body center so the silkscreen stays on
+    the part instead of hanging off the board edge."""
     silk = f"{side}.SilkS"
     fab = f"{side}.Fab"
-    ref_y = -text_offset_y
-    val_y = text_offset_y
+    cx, cy = text_center
+    ref_y = cy - text_offset_y
+    val_y = cy + text_offset_y
     return (
-        f'\t\t(property "Reference" "{ref}" (at 0 {ref_y} {rot:.3f}) (layer "{silk}") (uuid "{_u()}")\n'
+        f'\t\t(property "Reference" "{ref}" (at {cx:g} {ref_y:g} {rot:.3f}) (layer "{silk}") (uuid "{_u()}")\n'
         f"\t\t\t(effects (font (size 1 1) (thickness 0.15))))\n"
-        f'\t\t(property "Value" "{value}" (at 0 {val_y} {rot:.3f}) (layer "{fab}") (uuid "{_u()}")\n'
+        f'\t\t(property "Value" "{value}" (at {cx:g} {val_y:g} {rot:.3f}) (layer "{fab}") (uuid "{_u()}")\n'
         f"\t\t\t(effects (font (size 1 1) (thickness 0.15))))\n"
         f'\t\t(property "Footprint" "{footprint}" (at 0 0 0) (layer "{fab}") hide (uuid "{_u()}")\n'
         f"\t\t\t(effects (font (size 1.27 1.27))))\n"
@@ -1011,7 +1017,17 @@ def _pro_micro_footprint(
         f'\t\t(descr "SparkFun Pro Micro - ATmega32U4 module, 24-pin DIP-style")\n'
         f'\t\t(tags "Pro Micro Arduino ATmega32U4")\n'
         f"\t\t(attr through_hole)\n"
-        + _common_props(MCU_REF, "ProMicro", MCU_FOOTPRINT, rot)
+        # Anchor is pin 1 (a corner), so stack the labels around the body
+        # center (8.89, 13.97) — between the two pin rows — instead of the
+        # anchor, where they'd hang above the module and usually off-board.
+        + _common_props(
+            MCU_REF,
+            "ProMicro",
+            MCU_FOOTPRINT,
+            rot,
+            text_offset_y=1.5,
+            text_center=(17.78 / 2, 11 * 2.54 / 2),
+        )
         + "\n".join(pad_lines)
         + "\n\t)"
     )

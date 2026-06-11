@@ -813,3 +813,17 @@ def test_dsn_diodes_match_pcb_diodes_after_resolution() -> None:
             abs(_math.hypot(px - ax, py - ay) - 1.65) < 1e-6
             for ax, ay in anchors
         ), f"DSN diode pad ({px}, {py}) doesn't match any pcb anchor"
+
+
+def test_mcu_silkscreen_centered_between_pin_rows() -> None:
+    """The Pro Micro is anchored at pin 1 (a corner), so its Reference/Value
+    text must stack around the body center (8.89, 13.97) — text hanging off
+    the anchor lands outside the footprint and usually off the board."""
+    out = generate_pcb(
+        _result(switches=[_sw(1, 50.0, 50.0)]),
+    )
+    mcu = re.search(r'\(footprint "keeb:Arduino_Pro_Micro".+?\n\t\)', out, re.DOTALL)
+    assert mcu, "Pro Micro footprint missing"
+    block = mcu.group(0)
+    assert re.search(r'\(property "Reference" "U1" \(at 8\.89 12\.47 ', block)
+    assert re.search(r'\(property "Value" "ProMicro" \(at 8\.89 15\.47 ', block)
