@@ -28,8 +28,9 @@ MCU_REF = "U1"
 KICAD_SYMBOL_DIR = os.environ.get("KICAD_SYMBOL_DIR", "/usr/share/kicad/symbols")
 KEEB_SYMBOL_DIR = os.environ.get("KEEB_SYMBOL_DIR", "/opt/keeb-symbols")
 
-# Pro Micro pins available for matrix GPIO. Skips power pins (3, 4, 21, 23, 24)
-# and RST (22). Order matches the silkscreen labels you'd read on the board:
+# Pro Micro pins available for matrix GPIO. Skips the GND pins (3, 4, 23 —
+# wired to the GND net when the ground pour is enabled), power (21, 24) and
+# RST (22). Order matches the silkscreen labels you'd read on the board:
 # left side D2..D9 first, then right side D10..A3.
 PRO_MICRO_GPIO_PINS = [
     5, 6, 7, 8, 9, 10, 11, 12,    # left side: D2, D3, D4, D5, D6, D7, D8, D9
@@ -43,6 +44,7 @@ def generate_schematic(
     *,
     switch_type: SwitchType = "soldered",
     diode_type: DiodeType = "tht",
+    ground_pour: bool = True,
 ) -> str:
     """Emit the .kicad_sch text. `switch_type` / `diode_type` select the
     footprint property that's written into each symbol — they MUST match
@@ -113,6 +115,14 @@ def generate_schematic(
         row_nets[r] += mcu[next(pin_iter)]
     for c in cols:
         col_nets[c] += mcu[next(pin_iter)]
+
+    # GND ties the MCU's ground pins together; on the PCB it's carried by
+    # the copper pours, so it must exist in the schematic too or "Update
+    # PCB from Schematic" would try to remove the zones' net.
+    if ground_pour:
+        gnd = skidl.Net("GND")
+        for pin in (3, 4, 23):
+            gnd += mcu[pin]
 
     with tempfile.TemporaryDirectory() as td:
         # auto_stub converts high-fanout nets (every ROW/COL net here) to

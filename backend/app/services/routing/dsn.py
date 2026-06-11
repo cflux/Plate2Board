@@ -58,6 +58,7 @@ from ..pcb import (
     _rotate_local_to_world,
     _stab_sides,
     center_parse_on_page,
+    compute_stitching_vias,
     resolve_diode_placements,
 )
 
@@ -349,6 +350,10 @@ def _diode_components(
 
 
 def _mcu_components(parse: ParseResult, nets: dict[str, int]) -> list[Component]:
+    # Only ROW/COL pins get nets here — GND (MCU pins 3/4/23) is carried
+    # by the copper pours, not traces, so it deliberately never enters the
+    # DSN network. Freerouting treats those pads as plain obstacles, and
+    # the stitching vias are walled off via `_stitching_via_keepouts`.
     if parse.mcu_placement is None:
         return []
     m = parse.mcu_placement
@@ -432,6 +437,32 @@ def _mounting_hole_keepouts(parse: ParseResult) -> list[KeepoutCircle]:
         KeepoutCircle(max(h.diameter_mm, 1.5), h.cx_mm, h.cy_mm)
         for h in parse.mounting_holes
     ]
+
+
+def _stitching_via_keepouts(
+    parse: ParseResult,
+    switch_type: SwitchType,
+    diode_type: DiodeType,
+    stabilizer_type: StabilizerType,
+) -> list[KeepoutCircle]:
+    """GND stitching vias are real copper on both layers, but GND never
+    enters the DSN network (the pour carries it, not traces — see
+    `_mcu_components`), so freerouting can't see them. Wall each via off
+    with a keepout so routed traces keep the netclass clearance from it.
+    Call symmetry with `generate_pcb` (same prepared parse, same boundary
+    derivation) keeps the keepouts exactly over the emitted vias."""
+    boundary = _boundary_points(parse)
+    positions = compute_stitching_vias(
+        list(parse.switches),
+        list(parse.stabilizers),
+        list(parse.mounting_holes),
+        parse.mcu_placement,
+        boundary,
+        switch_type=switch_type,
+        diode_type=diode_type,
+        stabilizer_type=stabilizer_type,
+    )
+    return [KeepoutCircle(VIA_PAD_DIAMETER_MM, x, y) for x, y in positions]
 
 
 # ---------------------------------------------------------------------------
@@ -877,6 +908,7 @@ def pcb_to_dsn(
     stabilizer_type: StabilizerType = "pcb_mount",
     design_name: str = "keyboard",
     via_costs: int = VIA_COSTS,
+    ground_pour: bool = True,
 ) -> str:
     """Build a Specctra DSN file describing the board to freerouting.
 
@@ -902,6 +934,12 @@ def pcb_to_dsn(
     keepouts.extend(_switch_npth_keepouts(parse, switch_type))
     keepouts.extend(_stabilizer_keepouts(parse, stabilizer_type))
     keepouts.extend(_mounting_hole_keepouts(parse))
+    if ground_pour:
+        keepouts.extend(
+            _stitching_via_keepouts(
+                parse, switch_type, diode_type, stabilizer_type
+            )
+        )
 
     lines: list[str] = []
     lines.append(f'(pcb "{design_name}"')

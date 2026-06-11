@@ -34,7 +34,9 @@ PRO_MICRO_GPIO_PINS = [
 ]
 
 
-def generate_netlist(switches: Iterable[SwitchDef]) -> str:
+def generate_netlist(
+    switches: Iterable[SwitchDef], *, ground_pour: bool = True
+) -> str:
     # Renumber to row-major order so the netlist's SW1..SWN sequence matches
     # the schematic's grid layout (top-left to bottom-right).
     swlist = sorted(renumber_switches(list(switches)), key=lambda s: s.id)
@@ -74,6 +76,11 @@ def generate_netlist(switches: Iterable[SwitchDef]) -> str:
         nets[f"ROW{r}"].append((MCU_REF, next(pin_iter)))
     for c in cols:
         nets[f"COL{c}"].append((MCU_REF, next(pin_iter)))
+
+    # GND last so every existing net keeps its code. Pins 3/4/23 are the
+    # Pro Micro's ground pins; the PCB carries this net via copper pours.
+    if ground_pour:
+        nets["GND"] = [(MCU_REF, p) for p in (3, 4, 23)]
 
     return _format_netlist(components, nets)
 

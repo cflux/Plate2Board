@@ -113,3 +113,16 @@ def test_complex_example_oversized_for_pro_micro(
     result = parse_plate_svg(complex_example_svg, matrix_strategy=strategy)
     with pytest.raises(ValueError, match="Pro Micro"):
         generate_netlist(result.switches)
+
+
+def test_gnd_net_connects_mcu_ground_pins() -> None:
+    from app.models.schemas import SwitchDef
+
+    sws = [SwitchDef(id=1, cx_mm=10.0, cy_mm=10.0, row=0, col=0)]
+    out = generate_netlist(sws)
+    m = re.search(r'\(net \(code "\d+"\) \(name "GND"\)(.*?)\n    \)', out, re.DOTALL)
+    assert m, "GND net missing from netlist"
+    for pin in (3, 4, 23):
+        assert f'(node (ref "U1") (pin "{pin}"))' in m.group(1)
+    off = generate_netlist(sws, ground_pour=False)
+    assert '"GND"' not in off

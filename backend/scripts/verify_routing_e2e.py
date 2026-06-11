@@ -212,10 +212,18 @@ def verify(switch_type: str, diode_type: str) -> bool:
         print(f"{label} FAIL: {stats.unattached_pad_count} unattached pad(s)")
         ok = False
 
+    from app.services.routing.ses import parse_net_table
+    gnd_code = parse_net_table(pcb_text).get("GND")
+
     pads, npths, segments, vias = collect_board_geometry(routed_pcb)
     nets_with_copper = {s[4] for s in segments} | {v[2] for v in vias}
     missed = []
     for ref, number, code, px, py, radius in pads:
+        if code == gnd_code:
+            # GND is carried by the copper pours (filled in KiCad), not
+            # routed traces — stitching vias put GND in nets_with_copper
+            # but no wire ever lands on a GND pad by design.
+            continue
         if code not in nets_with_copper:
             missed.append((ref, number, "net has no copper at all"))
             continue
@@ -251,6 +259,28 @@ def verify(switch_type: str, diode_type: str) -> bool:
     else:
         print(f"{label} no traces cross any of the {len(npths)} NPTHs")
 
+    # GND stitching vias are invisible to freerouting (GND isn't in the
+    # DSN network) — the via-position keepouts must keep routed copper of
+    # every other net clear of them. 0.19 ≈ the 0.2 netclass clearance
+    # minus float slack.
+    stitch = [(v[0], v[1]) for v in vias if gnd_code is not None and v[2] == gnd_code]
+    via_hits = 0
+    for vx, vy in stitch:
+        for x1, y1, x2, y2, code, width, _layer in segments:
+            if code == gnd_code:
+                continue
+            if point_segment_distance(vx, vy, x1, y1, x2, y2) < 0.3 + width / 2.0 + 0.19:
+                via_hits += 1
+        for ox, oy, ocode in vias:
+            if ocode != gnd_code and math.hypot(ox - vx, oy - vy) < 0.6 + 0.19:
+                via_hits += 1
+    if via_hits:
+        print(f"{label} FAIL: routed copper within clearance of "
+              f"{via_hits} stitching via spot(s)")
+        ok = False
+    else:
+        print(f"{label} routed copper clears all {len(stitch)} stitching vias")
+
     # Layer discipline: with the DSN autoroute_settings layer rules, F.Cu
     # should carry mostly horizontal copper (rows) and B.Cu mostly
     # vertical (columns). Compare the horizontal share of copper length
@@ -276,10 +306,13 @@ def verify(switch_type: str, diode_type: str) -> bool:
     )
     # Only meaningful when both layers carry real copper: in the
     # hotswap/smd config every pad is on B.Cu, so F.Cu sees a few mm of
-    # crossover jumps and its share is statistical noise.
+    # crossover jumps and its share is statistical noise. The 5-point
+    # margin tolerates near-ties (routing shifts slightly run to run,
+    # e.g. around stitching-via keepouts) — the signal we care about is
+    # a clear inversion, which is what an inert layer_rule produces.
     if (
         min(total.values()) >= 75.0
-        and share["F.Cu"] <= share["B.Cu"]
+        and share["F.Cu"] < share["B.Cu"] - 0.05
     ):
         print(f"{label} FAIL: no row/column layer discipline "
               f"(F.Cu should be more horizontal than B.Cu)")

@@ -356,7 +356,10 @@ def test_dsn_keepouts_cover_every_npth(switch_type: str) -> None:
         xs, ys = xs[:-1], ys[:-1]  # drop the repeated closing vertex
         centroids.append((sum(xs) / len(xs), -(sum(ys) / len(ys))))
     assert npths, "fixture should produce NPTHs"
-    assert len(centroids) == len(npths)
+    # Keepouts also cover GND stitching vias (and boundary fences on
+    # non-rectangular outlines), so the count is ≥ the NPTH count — the
+    # invariant is that every NPTH has a keepout centered on it.
+    assert len(centroids) >= len(npths)
     for nx, ny in npths:
         assert any(
             math.hypot(cx - nx, cy - ny) < 1e-3 for cx, cy in centroids
@@ -384,6 +387,10 @@ def test_pad_world_positions_match_kicad_pcb() -> None:
     for (ref, number), ((kx, ky), net_name) in kicad_pads.items():
         if not net_name:
             continue  # unconnected MCU pins carry no net
+        if net_name == "GND":
+            # GND is carried by the copper pours, not routed traces — it's
+            # deliberately absent from the router's view of the board.
+            continue
         entries = by_net.get(net_name, [])
         assert any(
             math.hypot(px - kx, py - ky) < 1e-3 for px, py, _r in entries
@@ -899,3 +906,49 @@ def test_dsn_emits_fence_keepouts_for_concave_outline() -> None:
     import re
     m = re.search(r"\(boundary \(path pcb 0 ([^)]*)\)\)", dsn)
     assert m and len(m.group(1).split()) == 10
+
+
+# --- ground pour: GND exclusion + stitching via keepouts ---------------------
+
+
+def test_dsn_excludes_gnd_from_network() -> None:
+    parse = _result_rotated()
+    dsn = pcb_to_dsn(parse, switch_type="soldered", diode_type="tht",
+                     stabilizer_type="pcb_mount")
+    assert '(net "GND"' not in dsn
+    assert '"GND"' not in dsn
+
+
+def test_dsn_keepouts_at_stitching_via_positions() -> None:
+    from app.services.pcb import compute_stitching_vias
+    from app.services.routing.dsn import _boundary_points, _prepare_parse
+
+    parse = _result_rotated()
+    prepared = _prepare_parse(parse)
+    expected = compute_stitching_vias(
+        list(prepared.switches), list(prepared.stabilizers),
+        list(prepared.mounting_holes), prepared.mcu_placement,
+        _boundary_points(prepared),
+        switch_type="soldered", diode_type="tht", stabilizer_type="pcb_mount",
+    )
+    dsn = pcb_to_dsn(parse, switch_type="soldered", diode_type="tht",
+                     stabilizer_type="pcb_mount")
+    structure = _find_child(_parse_dsn(dsn), "structure")
+    centroids = []
+    for keepout in _find_children(structure, "keepout"):
+        poly = _find_child(keepout, "polygon")
+        coords = [float(_atom(v)) / DSN_MM_FACTOR for v in poly[3:]]
+        xs, ys = coords[0::2][:-1], coords[1::2][:-1]
+        centroids.append((sum(xs) / len(xs), -(sum(ys) / len(ys))))
+    assert expected, "fixture should yield stitching vias"
+    for x, y in expected:
+        assert any(
+            math.hypot(cx - x, cy - y) < 1e-3 for cx, cy in centroids
+        ), f"no keepout over stitching via at ({x}, {y})"
+    # With the pour disabled the via keepouts disappear.
+    dsn_off = pcb_to_dsn(parse, switch_type="soldered", diode_type="tht",
+                         stabilizer_type="pcb_mount", ground_pour=False)
+    structure_off = _find_child(_parse_dsn(dsn_off), "structure")
+    n_off = len(_find_children(structure_off, "keepout"))
+    n_on = len(centroids)
+    assert n_on - n_off == len(expected)

@@ -444,3 +444,13 @@ def test_2x2_grid_contains_every_switch_and_diode() -> None:
     # MCU is a Pro Micro (24 pins, fixed) regardless of matrix size.
     assert '(lib_id "Keyboard_MCU:ProMicro")' in text
     assert text.count("(") == text.count(")")
+
+
+def test_gnd_net_present_when_ground_pour_enabled() -> None:
+    """SKiDL renders the GND net as power:GND symbols on the MCU's ground
+    pins. (The bare string "GND" appears in the ProMicro symbol's own pin
+    names regardless, so assert on the power-symbol lib_id.)"""
+    text = generate_schematic([_sw(1, 0, 0)])
+    assert '(lib_id "power:GND")' in text, "GND power symbol missing"
+    off = generate_schematic([_sw(1, 0, 0)], ground_pour=False)
+    assert '(lib_id "power:GND")' not in off

@@ -193,6 +193,7 @@ def generate_pcb(
     stabilizer_type: StabilizerType = "pcb_mount",
     *,
     center_on_page: bool = True,
+    ground_pour: bool = True,
 ) -> str:
     if switch_type not in SWITCH_TYPES:
         raise ValueError(
@@ -219,7 +220,7 @@ def generate_pcb(
     # Renumber switches to row-major order so PCB refdes (`SW{id}`/`D{id}`)
     # match the schematic's grid layout: top-left = SW1, bottom-right = SWN.
     switches = renumber_switches(list(parse.switches))
-    nets = _enumerate_nets(switches)
+    nets = _enumerate_nets(switches, ground_pour=ground_pour)
     rows = sorted({s.row for s in switches})
     cols = sorted({s.col for s in switches})
 
@@ -290,6 +291,22 @@ def generate_pcb(
     base_outline = parse.edited_outline_path_d or parse.pcb_outline.path_d
     out.extend(_edge_cuts(base_outline, parse.outline_grow_mm))
 
+    if ground_pour and switches:
+        out.extend(
+            _gnd_stitching_vias(
+                switches,
+                parse,
+                nets,
+                base_outline,
+                switch_type=switch_type,
+                diode_type=diode_type,
+                stabilizer_type=stabilizer_type,
+            )
+        )
+        out.extend(
+            _gnd_zones(base_outline, parse.outline_grow_mm, nets[GND_NET_NAME])
+        )
+
     out.append(")")
     return "\n".join(out) + "\n"
 
@@ -299,7 +316,9 @@ def generate_pcb(
 # ---------------------------------------------------------------------------
 
 
-def _enumerate_nets(switches: Iterable[SwitchDef]) -> dict[str, int]:
+def _enumerate_nets(
+    switches: Iterable[SwitchDef], *, ground_pour: bool = False
+) -> dict[str, int]:
     swlist = sorted(switches, key=lambda s: s.id)
     rows = sorted({s.row for s in swlist})
     cols = sorted({s.col for s in swlist})
@@ -314,6 +333,10 @@ def _enumerate_nets(switches: Iterable[SwitchDef]) -> dict[str, int]:
     for sw in swlist:
         nets[f"NET-SW{sw.id}-D{sw.id}"] = code
         code += 1
+    # GND comes last so every pre-existing net keeps its code whether or
+    # not the ground pour is enabled.
+    if ground_pour and swlist:
+        nets[GND_NET_NAME] = code
     return nets
 
 
@@ -634,6 +657,25 @@ _DIODE_HOLE_CLEARANCE_MM = 0.3
 # pin-2 copper, which must keep passing.
 _DIODE_PAD_CLEARANCE_MM = 0.2
 
+# --- Ground pour ------------------------------------------------------------
+
+GND_NET_NAME = "GND"
+# Physical Pro Micro ground pins: 3 + 4 (left side) and 23 (right side).
+MCU_GND_PINS = (3, 4, 23)
+# Stitching via geometry matches the Default netclass via (and
+# dsn.VIA_PAD_DIAMETER_MM / VIA_DRILL_DIAMETER_MM — dsn imports from us,
+# not vice versa, so the values are duplicated by convention).
+STITCH_VIA_SIZE_MM = 0.6
+STITCH_VIA_DRILL_MM = 0.3
+STITCH_SPACING_MM = 15.0
+# Via center must stay this far inside the board edge.
+STITCH_EDGE_INSET_MM = 1.0
+# Via copper edge to foreign pad copper / NPTH drill edge.
+STITCH_PAD_CLEARANCE_MM = 0.5
+STITCH_NPTH_CLEARANCE_MM = 0.5
+# GND zone polygon pulls in from the board outline by this much.
+ZONE_EDGE_INSET_MM = 0.3
+
 
 @dataclass(frozen=True)
 class DiodePlacement:
@@ -836,6 +878,199 @@ def resolve_diode_placements(
     return placements
 
 
+# ---------------------------------------------------------------------------
+# Ground pour: stitching vias + zones
+# ---------------------------------------------------------------------------
+
+
+def compute_stitching_vias(
+    switches: list[SwitchDef],
+    stabilizers: list[StabilizerDef],
+    mounting_holes: list[MountingHoleDef],
+    mcu_placement: McuPlacement | None,
+    boundary_points: list[tuple[float, float]],
+    *,
+    switch_type: SwitchType,
+    diode_type: DiodeType,
+    stabilizer_type: StabilizerType,
+) -> list[tuple[float, float]]:
+    """GND stitching via positions: a `STITCH_SPACING_MM` grid over the
+    board, keeping `STITCH_EDGE_INSET_MM` inside the outline and clear of
+    every NPTH and every pad (including resolved diode pads and the MCU's
+    own GND pins — a via hugging a THT barrel adds nothing and crowds the
+    drill file).
+
+    Pure function of its arguments: `generate_pcb` emits the `(via …)`
+    tokens and `dsn.pcb_to_dsn` emits matching router keepouts, both on
+    the same prepared (centered + renumbered) parse, so the two views stay
+    aligned — the same shared-determinism contract as
+    `resolve_diode_placements`.
+
+    A small board can legitimately yield zero vias; the F.Cu/B.Cu pours
+    are still tied together through the three thru-hole MCU GND pins.
+    """
+    from shapely.geometry import Point, Polygon
+
+    if len(boundary_points) < 3 or not switches:
+        return []
+    ring = list(boundary_points)
+    if ring[0] == ring[-1]:
+        ring = ring[:-1]
+    poly = Polygon(ring)
+    if not poly.is_valid:
+        poly = poly.buffer(0)
+    if poly.is_empty:
+        return []
+    inset = poly.buffer(-STITCH_EDGE_INSET_MM, join_style=2)
+    if inset.is_empty:
+        return []
+
+    npths = _npth_obstacles(
+        switches, stabilizers, mounting_holes, switch_type, stabilizer_type
+    )
+    pads = _fixed_pad_obstacles(switches, mcu_placement, switch_type)
+    placements = resolve_diode_placements(
+        switches, stabilizers, mounting_holes, mcu_placement,
+        switch_type=switch_type, diode_type=diode_type,
+        stabilizer_type=stabilizer_type,
+    )
+    diode_pad_r = _DIODE_PAD_RADIUS[diode_type]
+    for sw in switches:
+        p = placements[sw.id]
+        for px, py, key in _diode_pads_world(
+            p.cx_mm, p.cy_mm, p.svg_rotation_deg, sw, diode_type
+        ):
+            pads.append((px, py, diode_pad_r, key))
+
+    via_r = STITCH_VIA_SIZE_MM / 2.0
+    out: list[tuple[float, float]] = []
+    minx, miny, maxx, maxy = poly.bounds
+    y = miny + STITCH_SPACING_MM / 2.0
+    while y < maxy:
+        x = minx + STITCH_SPACING_MM / 2.0
+        while x < maxx:
+            cx, cy = round(x, 4), round(y, 4)
+            x += STITCH_SPACING_MM
+            if not Point(cx, cy).within(inset):
+                continue
+            if any(
+                math.hypot(ox - cx, oy - cy)
+                < orad + via_r + STITCH_NPTH_CLEARANCE_MM
+                for ox, oy, orad in npths
+            ):
+                continue
+            if any(
+                math.hypot(ox - cx, oy - cy)
+                < orad + via_r + STITCH_PAD_CLEARANCE_MM
+                for ox, oy, orad, _key in pads
+            ):
+                continue
+            out.append((cx, cy))
+        y += STITCH_SPACING_MM
+    return out
+
+
+def _gnd_stitching_vias(
+    switches: list[SwitchDef],
+    parse: ParseResult,
+    nets: dict[str, int],
+    base_outline: str,
+    *,
+    switch_type: SwitchType,
+    diode_type: DiodeType,
+    stabilizer_type: StabilizerType,
+) -> list[str]:
+    """Emit `(via …)` tokens for every stitching position (format matches
+    the routed-trace vias `ses._render_via` splices in)."""
+    boundary = _parse_path_points(base_outline)
+    if parse.outline_grow_mm > 0 and len(boundary) >= 3:
+        boundary = _grow_polygon_points(boundary, parse.outline_grow_mm)
+    positions = compute_stitching_vias(
+        switches,
+        list(parse.stabilizers),
+        list(parse.mounting_holes),
+        parse.mcu_placement,
+        boundary,
+        switch_type=switch_type,
+        diode_type=diode_type,
+        stabilizer_type=stabilizer_type,
+    )
+    gnd = nets[GND_NET_NAME]
+    return [
+        f"\t(via (at {x:.4f} {y:.4f}) "
+        f"(size {STITCH_VIA_SIZE_MM:.4f}) (drill {STITCH_VIA_DRILL_MM:.4f}) "
+        f'(layers "F.Cu" "B.Cu") (net {gnd}) (uuid "{_u()}"))'
+        for x, y in positions
+    ]
+
+
+def _zone_polygon_rings(
+    path_d: str, grow_mm: float
+) -> list[list[tuple[float, float]]]:
+    """Outline → zone polygon ring(s): parse + grow exactly like
+    `_edge_cuts`, then pull in by `ZONE_EDGE_INSET_MM`. A negative buffer
+    on a concave outline can split the board into several pieces (or
+    vanish on tiny boards) — emit one ring per piece, falling back to the
+    un-inset outline when the inset eats everything."""
+    from shapely.geometry import Polygon
+
+    pts = _parse_path_points(path_d)
+    if len(pts) < 3:
+        return []
+    if grow_mm > 0:
+        pts = _grow_polygon_points(pts, grow_mm)
+    ring = pts[:-1] if pts[0] == pts[-1] else list(pts)
+    poly = Polygon(ring)
+    if not poly.is_valid:
+        poly = poly.buffer(0)
+    if poly.is_empty:
+        return []
+    inset = poly.buffer(-ZONE_EDGE_INSET_MM, join_style=2)
+    if inset.is_empty:
+        return [ring]
+    pieces = list(inset.geoms) if inset.geom_type == "MultiPolygon" else [inset]
+    return [
+        [(x, y) for x, y in p.exterior.coords[:-1]]
+        for p in pieces
+        if p.geom_type == "Polygon" and not p.is_empty
+    ] or [ring]
+
+
+def _gnd_zones(path_d: str, grow_mm: float, gnd_code: int) -> list[str]:
+    """One unfilled GND pour per copper layer (per outline piece). The
+    fill itself is left to KiCad (press B after opening) — computing
+    thermal spokes / clearance carving server-side isn't realistic, and a
+    stale fill is worse than none. Thermal-relief pad connection so THT
+    pads stay hand-solderable."""
+    out: list[str] = []
+    for ring in _zone_polygon_rings(path_d, grow_mm):
+        pts = "".join(f"\t\t\t\t(xy {x:.4f} {y:.4f})\n" for x, y in ring)
+        for layer in ("F.Cu", "B.Cu"):
+            out.append(
+                f"\t(zone\n"
+                f"\t\t(net {gnd_code})\n"
+                f'\t\t(net_name "{GND_NET_NAME}")\n'
+                f'\t\t(layer "{layer}")\n'
+                f'\t\t(uuid "{_u()}")\n'
+                f'\t\t(name "GND_{layer}")\n'
+                f"\t\t(hatch edge 0.5)\n"
+                f"\t\t(connect_pads (clearance 0.5))\n"
+                f"\t\t(min_thickness 0.25)\n"
+                f"\t\t(filled_areas_thickness no)\n"
+                f"\t\t(fill yes\n"
+                f"\t\t\t(thermal_gap 0.5)\n"
+                f"\t\t\t(thermal_bridge_width 0.5)\n"
+                f"\t\t)\n"
+                f"\t\t(polygon\n"
+                f"\t\t\t(pts\n"
+                f"{pts}"
+                f"\t\t\t)\n"
+                f"\t\t)\n"
+                f"\t)"
+            )
+    return out
+
+
 def _diode_footprint(
     sw: SwitchDef,
     nets: dict[str, int],
@@ -954,9 +1189,13 @@ def _pro_micro_pin_to_net(
     """Map a Pro Micro pin number to its (net_code, net_name).
 
     Pin assignment matches the schematic: rows first, then cols, mapped
-    onto PRO_MICRO_GPIO_PINS in order. Power (3, 4, 21, 23, 24) and RST
-    (22) are left unconnected here — wire those manually if needed.
+    onto PRO_MICRO_GPIO_PINS in order. The GND pins (3, 4, 23) join the
+    GND net when the ground pour is enabled (GND present in `nets`);
+    power (21, 24) and RST (22) are left unconnected — wire those
+    manually if needed.
     """
+    if pin in MCU_GND_PINS and GND_NET_NAME in nets:
+        return (nets[GND_NET_NAME], GND_NET_NAME)
     n_rows = len(rows)
     for i, p in enumerate(PRO_MICRO_GPIO_PINS):
         if p != pin:

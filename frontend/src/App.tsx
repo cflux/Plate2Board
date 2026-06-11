@@ -126,6 +126,7 @@ export function App() {
   const [switchType, setSwitchType] = useState<SwitchType>('soldered')
   const [diodeType, setDiodeType] = useState<DiodeType>('tht')
   const [stabilizerType, setStabilizerType] = useState<StabilizerType>('pcb_mount')
+  const [groundPour, setGroundPour] = useState(true)
   const [inspectMode, setInspectMode] = useState<boolean>(false)
   const [editPlateMode, setEditPlateMode] = useState<boolean>(false)
   const [selectedOutlineNodeIdx, setSelectedOutlineNodeIdx] = useState<number | null>(null)
@@ -614,7 +615,7 @@ export function App() {
   function downloadSchematic() {
     return downloadFile(
       'sch',
-      () => generateSchematic(result!.switches, switchType, diodeType),
+      () => generateSchematic(result!.switches, switchType, diodeType, groundPour),
       'kicad_sch',
     )
   }
@@ -622,7 +623,7 @@ export function App() {
   function downloadPcb() {
     return downloadFile(
       'pcb',
-      () => generatePcb(result!, switchType, diodeType, stabilizerType),
+      () => generatePcb(result!, switchType, diodeType, stabilizerType, groundPour),
       'kicad_pcb',
     )
   }
@@ -647,6 +648,7 @@ export function App() {
         switchType,
         diodeType,
         stabilizerType,
+        groundPour,
       )
       const url = URL.createObjectURL(blob)
       const a = document.createElement('a')
@@ -685,7 +687,7 @@ export function App() {
     const baseName = file.name.replace(/\.svg$/i, '') || 'keyboard'
     try {
       const job = await startRoutedProject(
-        result, baseName, switchType, diodeType, stabilizerType,
+        result, baseName, switchType, diodeType, stabilizerType, groundPour,
       )
       while (!token.cancelled) {
         await new Promise((r) => setTimeout(r, 500))
@@ -842,6 +844,23 @@ export function App() {
               title="Plate-mount stabilizer clips into the plate only. PCB gets an F.Cu footprint-keepout zone under the stab — no drills; tracks and vias still allowed underneath."
             >
               Plate-mount
+            </button>
+          </div>
+          <div className="toolbar toolbar-strategy">
+            <span className="toolbar-label">Ground pour:</span>
+            <button
+              className={groundPour ? 'active' : ''}
+              onClick={() => setGroundPour(true)}
+              title="GND copper pours on both layers, stitched together with vias on a 15 mm grid and tied to the Pro Micro's ground pins. Zones ship unfilled — press B in KiCad to fill them."
+            >
+              On
+            </button>
+            <button
+              className={!groundPour ? 'active' : ''}
+              onClick={() => setGroundPour(false)}
+              title="No ground plane — bare board with matrix traces only, MCU ground pins left unconnected."
+            >
+              Off
             </button>
           </div>
           {result.mcu_placement && (

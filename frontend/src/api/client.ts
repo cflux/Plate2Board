@@ -45,10 +45,12 @@ export function generateSchematic(
   switches: SwitchDef[],
   switchType: SwitchType = 'soldered',
   diodeType: DiodeType = 'tht',
+  groundPour: boolean = true,
 ): Promise<string> {
   const params = new URLSearchParams({
     switch_type: switchType,
     diode_type: diodeType,
+    ground_pour: String(groundPour),
   })
   return postBody(`/api/generate-schematic?${params}`, { switches })
 }
@@ -58,11 +60,13 @@ export function generatePcb(
   switchType: SwitchType = 'soldered',
   diodeType: DiodeType = 'tht',
   stabilizerType: StabilizerType = 'pcb_mount',
+  groundPour: boolean = true,
 ): Promise<string> {
   const params = new URLSearchParams({
     switch_type: switchType,
     diode_type: diodeType,
     stabilizer_type: stabilizerType,
+    ground_pour: String(groundPour),
   })
   return postBody(`/api/generate-pcb?${params}`, result)
 }
@@ -73,12 +77,14 @@ export async function generateProjectZip(
   switchType: SwitchType,
   diodeType: DiodeType,
   stabilizerType: StabilizerType = 'pcb_mount',
+  groundPour: boolean = true,
 ): Promise<Blob> {
   const params = new URLSearchParams({
     project_name: projectName,
     switch_type: switchType,
     diode_type: diodeType,
     stabilizer_type: stabilizerType,
+    ground_pour: String(groundPour),
   })
   const res = await fetch(`/api/generate-project?${params}`, {
     method: 'POST',
@@ -155,12 +161,14 @@ export async function startRoutedProject(
   switchType: SwitchType,
   diodeType: DiodeType,
   stabilizerType: StabilizerType = 'pcb_mount',
+  groundPour: boolean = true,
 ): Promise<RouteJobStart> {
   const params = new URLSearchParams({
     project_name: projectName,
     switch_type: switchType,
     diode_type: diodeType,
     stabilizer_type: stabilizerType,
+    ground_pour: String(groundPour),
   })
   const res = await fetch(`/api/generate-routed-project?${params}`, {
     method: 'POST',

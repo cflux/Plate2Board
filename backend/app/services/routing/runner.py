@@ -37,6 +37,7 @@ async def route_board(
     switch_type: SwitchType = "soldered",
     diode_type: DiodeType = "tht",
     stabilizer_type: StabilizerType = "pcb_mount",
+    ground_pour: bool = True,
     progress_cb: Optional[ProgressCB] = None,
     timeout_s: float | None = None,
 ) -> RouteResult:
@@ -54,6 +55,7 @@ async def route_board(
             diode_type=diode_type,
             stabilizer_type=stabilizer_type,
             via_costs=via_costs,
+            ground_pour=ground_pour,
         )
         try:
             result = await client.route(

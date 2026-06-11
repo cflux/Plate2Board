@@ -28,6 +28,7 @@ def generate_project_zip(
     diode_type: DiodeType = "tht",
     stabilizer_type: StabilizerType = "pcb_mount",
     *,
+    ground_pour: bool = True,
     pcb_text_override: str | None = None,
 ) -> bytes:
     """Bundle the project ZIP. By default the PCB is regenerated from
@@ -39,6 +40,7 @@ def generate_project_zip(
 
     sch_text = generate_schematic(
         parse.switches, switch_type=switch_type, diode_type=diode_type,
+        ground_pour=ground_pour,
     )
     if pcb_text_override is not None:
         pcb_text = pcb_text_override
@@ -48,6 +50,7 @@ def generate_project_zip(
             switch_type=switch_type,
             diode_type=diode_type,
             stabilizer_type=stabilizer_type,
+            ground_pour=ground_pour,
         )
     pro_text = _project_file(project_name, _extract_root_uuid(sch_text))
 

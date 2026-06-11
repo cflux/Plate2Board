@@ -827,3 +827,109 @@ def test_mcu_silkscreen_centered_between_pin_rows() -> None:
     block = mcu.group(0)
     assert re.search(r'\(property "Reference" "U1" \(at 8\.89 12\.47 ', block)
     assert re.search(r'\(property "Value" "ProMicro" \(at 8\.89 15\.47 ', block)
+
+
+# ---------------------------------------------------------------------------
+# Ground pour + stitching vias
+# ---------------------------------------------------------------------------
+
+from app.services.pcb import (  # noqa: E402
+    GND_NET_NAME,
+    MCU_GND_PINS,
+    STITCH_EDGE_INSET_MM,
+    STITCH_NPTH_CLEARANCE_MM,
+    STITCH_PAD_CLEARANCE_MM,
+    STITCH_VIA_SIZE_MM,
+    _fixed_pad_obstacles,
+    compute_stitching_vias,
+)
+
+
+def _pour_result() -> ParseResult:
+    """3×3 grid with an MCU and a mounting hole — big enough for vias."""
+    sws = [
+        _sw(r * 3 + c + 1, 30.0 + c * 19.05, 30.0 + r * 19.05, row=r, col=c)
+        for r in range(3)
+        for c in range(3)
+    ]
+    res = _result(switches=sws, width=100.0, height=100.0,
+                  mounting_holes=[MountingHoleDef(id=1, cx_mm=8.0, cy_mm=8.0, diameter_mm=2.2)])
+    return res.model_copy(update={
+        "mcu_placement": McuPlacement(cx_mm=75.0, cy_mm=8.0, rotation_deg=0.0),
+    })
+
+
+def test_gnd_net_appended_last_and_only_with_pour() -> None:
+    out = generate_pcb(_result(switches=[_sw(1, 50, 50)]))
+    # 1 row + 1 col + 1 link → GND gets code 4, appended last.
+    assert '(net 4 "GND")' in out
+    assert '(net 1 "ROW0")' in out  # existing codes untouched
+    off = generate_pcb(_result(switches=[_sw(1, 50, 50)]), ground_pour=False)
+    assert '"GND"' not in off
+    assert "(zone" not in off
+    assert "(via" not in off
+    empty = generate_pcb(_result())
+    assert '"GND"' not in empty
+
+
+def test_mcu_gnd_pins_carry_gnd_net() -> None:
+    out = generate_pcb(_pour_result())
+    mcu = re.search(r'\(footprint "keeb:Arduino_Pro_Micro".+?\n\t\)', out, re.DOTALL)
+    assert mcu
+    block = mcu.group(0)
+    for pin in MCU_GND_PINS:
+        assert re.search(
+            rf'\(pad "{pin}" thru_hole \w+ \(at [^)]*\)[^(]*\(size [^)]*\) '
+            rf'\(drill [^)]*\) \(layers[^)]*\) \(net \d+ "GND"\)',
+            block,
+        ), f"MCU pin {pin} should carry GND"
+    # Power (21, 24) and RST (22) stay unconnected.
+    for pin in (21, 22, 24):
+        m = re.search(rf'\(pad "{pin}" thru_hole [^\n]*', block)
+        assert m and "(net" not in m.group(0)
+
+
+def test_gnd_zones_on_both_layers_unfilled() -> None:
+    out = generate_pcb(_pour_result())
+    zones = re.findall(r'\(zone\n.*?\n\t\)', out, re.DOTALL)
+    gnd_zones = [z for z in zones if '(net_name "GND")' in z]
+    layers = sorted(re.search(r'\(layer "([^"]+)"\)', z).group(1) for z in gnd_zones)
+    assert layers == ["B.Cu", "F.Cu"]
+    for z in gnd_zones:
+        assert "(fill yes" in z
+        assert "(filled_polygon" not in z
+        assert "(keepout" not in z
+    # Polygon is inset from the 0..100 outline.
+    xs = [float(m) for m in re.findall(r"\(xy ([-\d.]+)", gnd_zones[0])]
+    assert min(xs) >= 0.29 and max(xs) <= 100.0 - 0.29
+
+
+def test_stitching_vias_inside_outline_and_clear_of_obstacles() -> None:
+    from shapely.geometry import Point, Polygon
+
+    parse = _pour_result()
+    boundary = [(0.0, 0.0), (100.0, 0.0), (100.0, 100.0), (0.0, 100.0)]
+    vias = compute_stitching_vias(
+        list(parse.switches), [], list(parse.mounting_holes),
+        parse.mcu_placement, boundary,
+        switch_type="soldered", diode_type="tht", stabilizer_type="pcb_mount",
+    )
+    assert vias, "expected stitching vias on a 100×100 board"
+    poly = Polygon(boundary)
+    via_r = STITCH_VIA_SIZE_MM / 2
+    from app.services.pcb import _npth_obstacles
+    npths = _npth_obstacles(list(parse.switches), [], list(parse.mounting_holes),
+                            "soldered", "pcb_mount")
+    pads = _fixed_pad_obstacles(list(parse.switches), parse.mcu_placement, "soldered")
+    for x, y in vias:
+        assert poly.buffer(-STITCH_EDGE_INSET_MM + 1e-6).contains(Point(x, y))
+        for ox, oy, orad in npths:
+            assert math.hypot(ox - x, oy - y) >= orad + via_r + STITCH_NPTH_CLEARANCE_MM - 1e-6
+        for ox, oy, orad, _k in pads:
+            assert math.hypot(ox - x, oy - y) >= orad + via_r + STITCH_PAD_CLEARANCE_MM - 1e-6
+    # And each position appears as a GND via in the pcb text.
+    out = generate_pcb(parse, ground_pour=True)
+    gnd_code = int(re.search(r'\(net (\d+) "GND"\)', out).group(1))
+    for x, y in vias:
+        assert f"(via (at {x:.4f} {y:.4f}) (size 0.6000) (drill 0.3000)" in out
+    assert out.count(f"(net {gnd_code}) (uuid") == len(vias)

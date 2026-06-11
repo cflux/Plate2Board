@@ -32,8 +32,10 @@ class NetlistRequest(BaseModel):
 
 
 @router.post("/generate-netlist", response_class=PlainTextResponse)
-async def post_generate_netlist(req: NetlistRequest) -> PlainTextResponse:
-    text = generate_netlist(req.switches)
+async def post_generate_netlist(
+    req: NetlistRequest, ground_pour: bool = True
+) -> PlainTextResponse:
+    text = generate_netlist(req.switches, ground_pour=ground_pour)
     return PlainTextResponse(
         content=text,
         headers={"Content-Disposition": 'attachment; filename="keyboard.net"'},
@@ -45,6 +47,7 @@ async def post_generate_schematic(
     req: NetlistRequest,
     switch_type: str = "soldered",
     diode_type: str = "tht",
+    ground_pour: bool = True,
 ) -> PlainTextResponse:
     if not req.switches:
         raise HTTPException(
@@ -63,6 +66,7 @@ async def post_generate_schematic(
     try:
         text = generate_schematic(
             req.switches, switch_type=switch_type, diode_type=diode_type,
+            ground_pour=ground_pour,
         )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"SKiDL failed: {exc}") from exc
@@ -80,6 +84,7 @@ async def post_generate_pcb(
     switch_type: str = "soldered",
     diode_type: str = "tht",
     stabilizer_type: str = "pcb_mount",
+    ground_pour: bool = True,
 ) -> PlainTextResponse:
     if not req.switches:
         raise HTTPException(
@@ -114,6 +119,7 @@ async def post_generate_pcb(
         switch_type=switch_type,
         diode_type=diode_type,
         stabilizer_type=stabilizer_type,
+        ground_pour=ground_pour,
     )
     return PlainTextResponse(
         content=text,
@@ -148,6 +154,7 @@ async def post_generate_project(
     switch_type: str = "soldered",
     diode_type: str = "tht",
     stabilizer_type: str = "pcb_mount",
+    ground_pour: bool = True,
 ) -> Response:
     if not req.switches:
         raise HTTPException(
@@ -184,6 +191,7 @@ async def post_generate_project(
             switch_type=switch_type,
             diode_type=diode_type,
             stabilizer_type=stabilizer_type,
+            ground_pour=ground_pour,
         )
     except Exception as exc:
         raise HTTPException(
@@ -238,6 +246,7 @@ async def post_generate_routed_project(
     switch_type: str = "soldered",
     diode_type: str = "tht",
     stabilizer_type: str = "pcb_mount",
+    ground_pour: bool = True,
 ) -> dict:
     """Kick off an auto-routed project build. Returns immediately with a
     job id; the actual routing happens in a background task. Poll
@@ -249,7 +258,8 @@ async def post_generate_routed_project(
     await routing_jobs.STORE.create(job_id)
     asyncio.create_task(
         _run_routed_job(
-            job_id, req, project_name, switch_type, diode_type, stabilizer_type
+            job_id, req, project_name, switch_type, diode_type,
+            stabilizer_type, ground_pour,
         )
     )
     return {
@@ -322,6 +332,7 @@ async def _run_routed_job(
     switch_type: str,
     diode_type: str,
     stabilizer_type: str,
+    ground_pour: bool = True,
 ) -> None:
     """Background task: full pipeline from ParseResult to routed ZIP.
 
@@ -341,6 +352,7 @@ async def _run_routed_job(
             switch_type=switch_type,
             diode_type=diode_type,
             stabilizer_type=stabilizer_type,
+            ground_pour=ground_pour,
         )
 
         await store.update(job_id, phase="routing", percent=20.0)
@@ -369,6 +381,7 @@ async def _run_routed_job(
             switch_type=switch_type,
             diode_type=diode_type,
             stabilizer_type=stabilizer_type,
+            ground_pour=ground_pour,
             progress_cb=on_progress,
         )
 
@@ -401,6 +414,7 @@ async def _run_routed_job(
             switch_type=switch_type,
             diode_type=diode_type,
             stabilizer_type=stabilizer_type,
+            ground_pour=ground_pour,
             pcb_text_override=routed_pcb,
         )
 
