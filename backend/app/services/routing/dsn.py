@@ -186,6 +186,13 @@ class KeepoutCircle:
     cy_mm: float
 
 
+@dataclass
+class KeepoutPolygon:
+    """Arbitrary-polygon keepout (closed ring, KiCad Y-down mm). Used for the
+    boundary fence — see `_fence_boundary`."""
+    points: list[tuple[float, float]]
+
+
 # ---------------------------------------------------------------------------
 # Padstacks + Images
 # ---------------------------------------------------------------------------
@@ -446,6 +453,76 @@ def _boundary_points(parse: ParseResult) -> list[tuple[float, float]]:
     return pts
 
 
+def _fence_boundary(
+    boundary: list[tuple[float, float]],
+) -> tuple[list[tuple[float, float]], list[KeepoutPolygon]]:
+    """Convert a possibly non-convex board outline into a DSN-safe pair of
+    (boundary polygon, fence keepouts).
+
+    Freerouting (observed on 2.2.4 and the 2026-06 nightly) mis-decomposes
+    non-convex `(boundary …)` polygons: pads near concave outline regions
+    become unreachable in its internal view and their nets are reported
+    unrouted even though the board geometry is perfectly clear (reproduced
+    with a single switch inside an Alice-style outline; the same switch
+    routes with the bounding rectangle). Its keepout handling has no such
+    problem, so instead of handing it the real outline we hand it the
+    bounding rectangle as the boundary plus keepout polygons covering
+    exactly the area between the rectangle and the true outline. Traces
+    keep the standard clearance from keepouts, so they respect the real
+    board edge.
+
+    For rectangular outlines the difference is empty and the original
+    boundary is returned unchanged (no fences, byte-identical DSN).
+    Fence pieces are split until hole-free; freerouting accepts concave
+    keepout polygons.
+    """
+    from shapely.geometry import Polygon, box  # heavy import, keep local
+
+    ring = list(boundary)
+    if ring[0] == ring[-1]:
+        ring = ring[:-1]
+    if len(ring) < 3:
+        return boundary, []
+    poly = Polygon(ring)
+    if not poly.is_valid:
+        poly = poly.buffer(0)
+    if poly.is_empty or poly.geom_type != "Polygon":
+        return boundary, []
+    minx, miny, maxx, maxy = poly.bounds
+    rect = box(minx, miny, maxx, maxy)
+    outside = rect.difference(poly)
+    if outside.is_empty or outside.area < 1e-6:
+        return boundary, []
+
+    # Split into hole-free pieces (the difference is an annulus when the
+    # outline touches the bbox only at isolated extremes).
+    pieces: list = []
+    stack = list(outside.geoms) if outside.geom_type == "MultiPolygon" else [outside]
+    while stack:
+        p = stack.pop()
+        if p.is_empty or p.geom_type != "Polygon" or p.area < 1e-6:
+            continue
+        if not p.interiors:
+            pieces.append(p)
+            continue
+        pminx, pminy, pmaxx, pmaxy = p.bounds
+        cut_x = (pminx + pmaxx) / 2.0
+        for half in (
+            box(pminx - 1.0, pminy - 1.0, cut_x, pmaxy + 1.0),
+            box(cut_x, pminy - 1.0, pmaxx + 1.0, pmaxy + 1.0),
+        ):
+            part = p.intersection(half)
+            stack.extend(
+                list(part.geoms) if part.geom_type == "MultiPolygon" else [part]
+            )
+
+    rect_boundary = [
+        (minx, miny), (maxx, miny), (maxx, maxy), (minx, maxy), (minx, miny),
+    ]
+    fences = [KeepoutPolygon(list(p.exterior.coords)) for p in pieces]
+    return rect_boundary, fences
+
+
 # ---------------------------------------------------------------------------
 # Net collection
 # ---------------------------------------------------------------------------
@@ -502,6 +579,7 @@ def _emit_parser() -> list[str]:
 def _emit_structure(
     boundary: list[tuple[float, float]],
     keepouts: list[KeepoutCircle],
+    fences: list[KeepoutPolygon],
     via_costs: int,
 ) -> list[str]:
     out = ["  (structure"]
@@ -532,6 +610,12 @@ def _emit_structure(
     # KiCad's own Specctra exporter emits.
     for ko in keepouts:
         out.append(_emit_keepout_polygon(ko))
+    # Boundary fences (non-convex outlines only — see `_fence_boundary`).
+    for fence in fences:
+        coord_pairs = " ".join(
+            f"{_fmt_coord(x)} {_fmt_y(y)}" for x, y in fence.points
+        )
+        out.append(f'    (keepout "" (polygon signal 0 {coord_pairs}))')
     out.append(
         f'    (via "Via[0-1]_{VIA_PAD_DIAMETER_MM:.1f}:{VIA_DRILL_DIAMETER_MM:.1f}_um")'
     )
@@ -812,6 +896,7 @@ def pcb_to_dsn(
     boundary = _boundary_points(parse)
     if len(boundary) < 3:
         raise ValueError("board outline has fewer than 3 vertices")
+    boundary, fences = _fence_boundary(boundary)
 
     keepouts: list[KeepoutCircle] = []
     keepouts.extend(_switch_npth_keepouts(parse, switch_type))
@@ -823,7 +908,7 @@ def pcb_to_dsn(
     lines.extend(_emit_parser())
     lines.append(f"  (resolution {DSN_RESOLUTION_UNIT} {DSN_RESOLUTION})")
     lines.append(f"  (unit {DSN_RESOLUTION_UNIT})")
-    lines.extend(_emit_structure(boundary, keepouts, via_costs))
+    lines.extend(_emit_structure(boundary, keepouts, fences, via_costs))
     lines.extend(_emit_placement(components))
     lines.extend(_emit_library(used_images))
     lines.extend(_emit_network(pins_per_net))

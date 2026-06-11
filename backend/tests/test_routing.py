@@ -816,3 +816,86 @@ def test_runner_raises_when_every_rung_hard_fails(monkeypatch) -> None:
     monkeypatch.setattr(rclient, "route", fake_route)
     with pytest.raises(rclient.FreeroutingError, match="sidecar down"):
         asyncio.run(runner.route_board(_runner_parse()))
+
+
+# --- boundary fence for non-convex outlines ----------------------------------
+
+
+def test_fence_boundary_rectangle_is_passthrough() -> None:
+    from app.services.routing.dsn import _fence_boundary
+
+    rect = [(0.0, 0.0), (200.0, 0.0), (200.0, 60.0), (0.0, 60.0), (0.0, 0.0)]
+    boundary, fences = _fence_boundary(rect)
+    assert boundary == rect
+    assert fences == []
+
+
+def test_fence_boundary_concave_outline_builds_fences() -> None:
+    from shapely.geometry import Polygon, box
+
+    from app.services.routing.dsn import _fence_boundary
+
+    # Rectangle with a triangular notch in the bottom edge.
+    outline = [
+        (0.0, 0.0), (200.0, 0.0), (200.0, 60.0),
+        (130.0, 60.0), (120.0, 45.0), (110.0, 60.0),
+        (0.0, 60.0), (0.0, 0.0),
+    ]
+    boundary, fences = _fence_boundary(outline)
+    # Boundary becomes the bounding rectangle.
+    assert set(boundary) == {(0.0, 0.0), (200.0, 0.0), (200.0, 60.0), (0.0, 60.0)}
+    assert fences, "expected fence keepouts for a concave outline"
+    # Fences exactly cover bbox minus the outline (notch area = 150 mm²).
+    poly = Polygon(outline[:-1])
+    expected = box(0, 0, 200, 60).difference(poly)
+    fence_union = None
+    for f in fences:
+        p = Polygon(f.points)
+        assert p.is_valid
+        fence_union = p if fence_union is None else fence_union.union(p)
+    assert abs(fence_union.area - expected.area) < 1e-6
+    assert fence_union.symmetric_difference(expected).area < 1e-6
+
+
+def test_fence_boundary_alice_outline_splits_annulus() -> None:
+    """An outline that touches its bbox only at isolated extremes produces
+    an annulus difference — pieces must come back hole-free."""
+    from shapely.geometry import Polygon
+
+    from app.services.routing.dsn import _fence_boundary
+
+    # Diamond: touches bbox at 4 midpoints; difference = 4 corner triangles
+    # (or an annulus pinched at points, depending on shapely's split).
+    outline = [(100.0, 0.0), (200.0, 50.0), (100.0, 100.0), (0.0, 50.0), (100.0, 0.0)]
+    boundary, fences = _fence_boundary(outline)
+    assert len(boundary) == 5
+    assert fences
+    total = sum(Polygon(f.points).area for f in fences)
+    # bbox 200×100 minus diamond (area 10000) = 10000.
+    assert abs(total - 10000.0) < 1e-3
+    for f in fences:
+        assert Polygon(f.points).is_valid
+
+
+def test_dsn_emits_fence_keepouts_for_concave_outline() -> None:
+    from app.models.schemas import ParseResult, PcbOutline, SwitchDef
+
+    from app.services.routing.dsn import pcb_to_dsn
+
+    parse = ParseResult(
+        svg_width_mm=100.0, svg_height_mm=60.0,
+        pcb_outline=PcbOutline(
+            width_mm=100.0, height_mm=60.0,
+            path_d="M 0 0 L 100 0 L 100 60 L 60 60 L 50 45 L 40 60 L 0 60 Z",
+        ),
+        switches=[SwitchDef(id=1, cx_mm=30.0, cy_mm=20.0, row=0, col=0)],
+        stabilizers=[], mounting_holes=[], unclassified=[],
+    )
+    dsn = pcb_to_dsn(parse)
+    # 3 switch NPTH keepouts + at least one fence keepout.
+    assert dsn.count("(keepout") >= 4
+    # The boundary must be the 4-corner bounding rectangle (5 closed pts
+    # × 2 coords = 10 numbers).
+    import re
+    m = re.search(r"\(boundary \(path pcb 0 ([^)]*)\)\)", dsn)
+    assert m and len(m.group(1).split()) == 10

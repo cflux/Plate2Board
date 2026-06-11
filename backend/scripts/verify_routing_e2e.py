@@ -91,10 +91,16 @@ def build_parse() -> ParseResult:
     return ParseResult(
         svg_width_mm=200.0,
         svg_height_mm=60.0,
+        # Deliberately NON-CONVEX: a multi-vertex concave chain in the
+        # bottom edge. Freerouting mis-decomposes concave boundaries
+        # (nets near the dents go unrouted), so this exercises the
+        # bbox-boundary + keepout-fence path in dsn._fence_boundary —
+        # a plain rectangle here would leave that path untested.
         pcb_outline=PcbOutline(
             width_mm=200.0,
             height_mm=60.0,
-            path_d="M 0 0 L 200 0 L 200 60 L 0 60 Z",
+            path_d="M 0 0 L 200 0 L 200 60 L 130 60 L 120 50 "
+                   "L 110 58 L 100 60 L 0 60 Z",
         ),
         switches=switches,
         stabilizers=stabs,
