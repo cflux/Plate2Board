@@ -126,3 +126,29 @@ def test_gnd_net_connects_mcu_ground_pins() -> None:
         assert f'(node (ref "U1") (pin "{pin}"))' in m.group(1)
     off = generate_netlist(sws, ground_pour=False)
     assert '"GND"' not in off
+
+
+def test_rgb_netlist_components_and_chain() -> None:
+    from app.models.schemas import SwitchDef
+
+    sws = [SwitchDef(id=i + 1, cx_mm=10.0 + i * 19.05, cy_mm=10.0, row=0, col=i)
+           for i in range(3)]
+    out = generate_netlist(sws, rgb=True)
+    for ref in ("LED1", "LED2", "LED3", "C1", "C2", "C3"):
+        assert f'(ref "{ref}")' in out
+    # VCC: RAW pin 24 + every LED pin 1 + every cap pin 1.
+    vcc = re.search(r'\(net \(code "\d+"\) \(name "VCC"\)(.*?)\n    \)', out, re.DOTALL).group(1)
+    assert '(node (ref "U1") (pin "24"))' in vcc
+    for i in (1, 2, 3):
+        assert f'(node (ref "LED{i}") (pin "1"))' in vcc
+        assert f'(node (ref "C{i}") (pin "1"))' in vcc
+    # Chain: RGB_DATA0 = MCU GPIO → LED1.DIN; RGB_DATA1 = LED1.DOUT → LED2.DIN.
+    d0 = re.search(r'\(net \(code "\d+"\) \(name "RGB_DATA0"\)(.*?)\n    \)', out, re.DOTALL).group(1)
+    assert '(node (ref "U1")' in d0 and '(node (ref "LED1") (pin "4"))' in d0
+    d1 = re.search(r'\(net \(code "\d+"\) \(name "RGB_DATA1"\)(.*?)\n    \)', out, re.DOTALL).group(1)
+    assert '(node (ref "LED1") (pin "2"))' in d1 and '(node (ref "LED2") (pin "4"))' in d1
+    # GND exists even though this helper defaults ground_pour=True anyway.
+    gnd = re.search(r'\(net \(code "\d+"\) \(name "GND"\)(.*?)\n    \)', out, re.DOTALL).group(1)
+    assert '(node (ref "LED1") (pin "3"))' in gnd and '(node (ref "C1") (pin "2"))' in gnd
+    off = generate_netlist(sws)
+    assert "LED1" not in off and '"RGB_DATA0"' not in off

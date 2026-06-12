@@ -33,9 +33,9 @@ class NetlistRequest(BaseModel):
 
 @router.post("/generate-netlist", response_class=PlainTextResponse)
 async def post_generate_netlist(
-    req: NetlistRequest, ground_pour: bool = True
+    req: NetlistRequest, ground_pour: bool = True, rgb: bool = False
 ) -> PlainTextResponse:
-    text = generate_netlist(req.switches, ground_pour=ground_pour)
+    text = generate_netlist(req.switches, ground_pour=ground_pour, rgb=rgb)
     return PlainTextResponse(
         content=text,
         headers={"Content-Disposition": 'attachment; filename="keyboard.net"'},
@@ -48,6 +48,7 @@ async def post_generate_schematic(
     switch_type: str = "soldered",
     diode_type: str = "tht",
     ground_pour: bool = True,
+    rgb: bool = False,
 ) -> PlainTextResponse:
     if not req.switches:
         raise HTTPException(
@@ -66,7 +67,7 @@ async def post_generate_schematic(
     try:
         text = generate_schematic(
             req.switches, switch_type=switch_type, diode_type=diode_type,
-            ground_pour=ground_pour,
+            ground_pour=ground_pour, rgb=rgb,
         )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"SKiDL failed: {exc}") from exc
@@ -85,6 +86,7 @@ async def post_generate_pcb(
     diode_type: str = "tht",
     stabilizer_type: str = "pcb_mount",
     ground_pour: bool = True,
+    rgb: bool = False,
 ) -> PlainTextResponse:
     if not req.switches:
         raise HTTPException(
@@ -120,6 +122,7 @@ async def post_generate_pcb(
         diode_type=diode_type,
         stabilizer_type=stabilizer_type,
         ground_pour=ground_pour,
+        rgb=rgb,
     )
     return PlainTextResponse(
         content=text,
@@ -155,6 +158,7 @@ async def post_generate_project(
     diode_type: str = "tht",
     stabilizer_type: str = "pcb_mount",
     ground_pour: bool = True,
+    rgb: bool = False,
 ) -> Response:
     if not req.switches:
         raise HTTPException(
@@ -192,6 +196,7 @@ async def post_generate_project(
             diode_type=diode_type,
             stabilizer_type=stabilizer_type,
             ground_pour=ground_pour,
+            rgb=rgb,
         )
     except Exception as exc:
         raise HTTPException(
@@ -247,6 +252,7 @@ async def post_generate_routed_project(
     diode_type: str = "tht",
     stabilizer_type: str = "pcb_mount",
     ground_pour: bool = True,
+    rgb: bool = False,
 ) -> dict:
     """Kick off an auto-routed project build. Returns immediately with a
     job id; the actual routing happens in a background task. Poll
@@ -259,7 +265,7 @@ async def post_generate_routed_project(
     asyncio.create_task(
         _run_routed_job(
             job_id, req, project_name, switch_type, diode_type,
-            stabilizer_type, ground_pour,
+            stabilizer_type, ground_pour, rgb,
         )
     )
     return {
@@ -333,6 +339,7 @@ async def _run_routed_job(
     diode_type: str,
     stabilizer_type: str,
     ground_pour: bool = True,
+    rgb: bool = False,
 ) -> None:
     """Background task: full pipeline from ParseResult to routed ZIP.
 
@@ -353,6 +360,7 @@ async def _run_routed_job(
             diode_type=diode_type,
             stabilizer_type=stabilizer_type,
             ground_pour=ground_pour,
+            rgb=rgb,
         )
 
         await store.update(job_id, phase="routing", percent=20.0)
@@ -382,6 +390,7 @@ async def _run_routed_job(
             diode_type=diode_type,
             stabilizer_type=stabilizer_type,
             ground_pour=ground_pour,
+            rgb=rgb,
             progress_cb=on_progress,
         )
 
@@ -399,6 +408,8 @@ async def _run_routed_job(
                 switch_type=switch_type,
                 diode_type=diode_type,
                 stabilizer_type=stabilizer_type,
+                rgb=rgb,
+                ground_pour=ground_pour,
             ),
         )
         if splice_stats.unattached_pad_count:
@@ -415,6 +426,7 @@ async def _run_routed_job(
             diode_type=diode_type,
             stabilizer_type=stabilizer_type,
             ground_pour=ground_pour,
+            rgb=rgb,
             pcb_text_override=routed_pcb,
         )
 

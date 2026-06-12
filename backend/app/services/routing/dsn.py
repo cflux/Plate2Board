@@ -45,17 +45,32 @@ from ..pcb import (
     CHERRY_STAB_WIRE_OFFSET_Y_MM,
     DiodePlacement,
     DiodeType,
+    GND_NET_NAME,
     HOTSWAP_PIN_NPTH_LOCAL,
+    MCU_GND_PINS,
+    MCU_RAW_PIN,
     MCU_REF,
     PRO_MICRO_GPIO_PINS,
+    RGB_CAP_PAD_LOCAL,
+    RGB_CAP_PAD_SIZE,
+    RGB_CUTOUT_H_MM,
+    RGB_CUTOUT_W_MM,
+    RGB_DATA_NET_FMT,
+    RGB_LED_PAD_LOCAL,
+    RGB_LED_PAD_SIZE,
     SWITCH_NPTH_LOCAL,
     StabilizerType,
     SwitchType,
+    VCC_NET_NAME,
     _enumerate_nets,
     _kicad_angle,
     _pair_stabs_to_switches,
     _parse_path_points,
+    _rgb_cap_anchor,
+    _rgb_led_anchor,
+    _rgb_led_pad_nets,
     _rotate_local_to_world,
+    rgb_chain_indices,
     _stab_sides,
     center_parse_on_page,
     compute_stitching_vias,
@@ -77,6 +92,12 @@ DSN_MM_FACTOR = 10_000  # 1 mm = 10,000 ticks of (0.1 µm)
 DEFAULT_CLEARANCE_MM = 0.2
 DEFAULT_TRACK_WIDTH_MM = 0.25
 MATRIX_TRACK_WIDTH_MM = 0.30
+# Power nets (VCC for the RGB chain; GND when routed instead of poured)
+# carry real current — mirror the Power netclass in project.py. 0.4 mm is
+# the widest that can still attach to the SK6812's 1.6×0.8 pads when a
+# rotated switch leaves the pad hemmed between the LED cutout keepout and
+# its neighbors (measured: 0.5 mm strands the VDD pad, 0.4 routes fully).
+POWER_TRACK_WIDTH_MM = 0.40
 
 # Standard via for the 2-layer Matrix class: 0.6 mm pad, 0.3 mm drill.
 VIA_PAD_DIAMETER_MM = 0.6
@@ -205,6 +226,14 @@ PS_SW_HOTSWAP = Padstack("Smd_2p55x2p5_B", "rect", 2.55, 2.5, layers=(LAYER_B_CU
 PS_DIODE_TH = Padstack("Round_1p6_TH", "circle", 1.6, 1.6)
 PS_DIODE_SMD = Padstack("Smd_1p0x0p6_B", "rect", 1.0, 0.6, layers=(LAYER_B_CU,))
 PS_PROMICRO_TH = Padstack("Round_1p7_TH", "circle", 1.7, 1.7)
+PS_RGB_LED = Padstack(
+    "Smd_1p6x0p8_B", "rect",
+    RGB_LED_PAD_SIZE[0], RGB_LED_PAD_SIZE[1], layers=(LAYER_B_CU,),
+)
+PS_RGB_CAP = Padstack(
+    "Smd_0p9x0p95_B", "rect",
+    RGB_CAP_PAD_SIZE[0], RGB_CAP_PAD_SIZE[1], layers=(LAYER_B_CU,),
+)
 
 ALL_PADSTACKS: tuple[Padstack, ...] = (
     PS_SW_TH,
@@ -212,6 +241,8 @@ ALL_PADSTACKS: tuple[Padstack, ...] = (
     PS_DIODE_TH,
     PS_DIODE_SMD,
     PS_PROMICRO_TH,
+    PS_RGB_LED,
+    PS_RGB_CAP,
 )
 
 
@@ -270,6 +301,27 @@ def _pro_micro_image() -> Image:
     return Image(name="u_pro_micro", pins=pins)
 
 
+def _rgb_led_image() -> Image:
+    """SK6812 MINI-E reverse-mount: pads mirror `pcb.RGB_LED_PAD_LOCAL`."""
+    return Image(
+        name="led_sk6812_mini_e",
+        pins=[
+            ImagePin(num, PS_RGB_LED, lx, ly)
+            for num, (lx, ly) in RGB_LED_PAD_LOCAL.items()
+        ],
+    )
+
+
+def _rgb_cap_image() -> Image:
+    return Image(
+        name="c_0603",
+        pins=[
+            ImagePin(num, PS_RGB_CAP, lx, ly)
+            for num, (lx, ly) in RGB_CAP_PAD_LOCAL.items()
+        ],
+    )
+
+
 # Map image name → builder so the assembler only emits images it actually uses.
 IMAGE_BUILDERS = {
     "sw_cherry_mx_soldered": _switch_soldered_image,
@@ -277,6 +329,8 @@ IMAGE_BUILDERS = {
     "d_diode_tht": _diode_tht_image,
     "d_diode_smd": _diode_smd_image,
     "u_pro_micro": _pro_micro_image,
+    "led_sk6812_mini_e": _rgb_led_image,
+    "c_0603": _rgb_cap_image,
 }
 
 
@@ -349,11 +403,18 @@ def _diode_components(
     return out
 
 
-def _mcu_components(parse: ParseResult, nets: dict[str, int]) -> list[Component]:
-    # Only ROW/COL pins get nets here — GND (MCU pins 3/4/23) is carried
-    # by the copper pours, not traces, so it deliberately never enters the
-    # DSN network. Freerouting treats those pads as plain obstacles, and
-    # the stitching vias are walled off via `_stitching_via_keepouts`.
+def _mcu_components(
+    parse: ParseResult,
+    nets: dict[str, int],
+    *,
+    rgb: bool = False,
+    route_gnd: bool = False,
+) -> list[Component]:
+    # Only ROW/COL (+ RGB) pins get nets here by default — GND (MCU pins
+    # 3/4/23) is carried by the copper pours, not traces, so it stays out
+    # of the DSN network unless the pour is disabled while RGB needs GND
+    # (`route_gnd`). Freerouting treats netless pads as plain obstacles,
+    # and the stitching vias are walled off via `_stitching_via_keepouts`.
     if parse.mcu_placement is None:
         return []
     m = parse.mcu_placement
@@ -368,6 +429,13 @@ def _mcu_components(parse: ParseResult, nets: dict[str, int]) -> list[Component]
             c_idx = i - n_rows
             if c_idx < len(cols):
                 nets_per_pin[str(pin)] = f"COL{cols[c_idx]}"
+            elif rgb and c_idx == len(cols):
+                nets_per_pin[str(pin)] = RGB_DATA_NET_FMT.format(0)
+    if rgb:
+        nets_per_pin[str(MCU_RAW_PIN)] = VCC_NET_NAME
+    if route_gnd:
+        for pin in MCU_GND_PINS:
+            nets_per_pin[str(pin)] = GND_NET_NAME
     return [
         Component(
             image_name="u_pro_micro",
@@ -378,6 +446,46 @@ def _mcu_components(parse: ParseResult, nets: dict[str, int]) -> list[Component]
             nets=nets_per_pin,
         )
     ]
+
+
+def _rgb_components(
+    parse: ParseResult, *, route_gnd: bool
+) -> list[Component]:
+    """One SK6812 MINI-E + one 100 nF cap per switch, on B.Cu. GND pins
+    are netted only when GND must be routed (no pour); otherwise the pour
+    reaches them and they stay out of the router's netlist."""
+    out: list[Component] = []
+    order = sorted(parse.switches, key=lambda s: s.id)
+    chain = rgb_chain_indices(list(parse.switches))
+    n = len(order)
+    for sw in order:
+        ax, ay, led_rot = _rgb_led_anchor(sw)
+        pad_nets = _rgb_led_pad_nets(sw, chain[sw.id], n)
+        led_nets = {
+            num: name for num, name in pad_nets.items()
+            if name is not None and (name != GND_NET_NAME or route_gnd)
+        }
+        out.append(Component(
+            image_name="led_sk6812_mini_e",
+            ref=f"LED{sw.id}",
+            place_x=ax,
+            place_y=ay,
+            rotation_deg=_kicad_angle(led_rot),
+            nets=led_nets,
+        ))
+        bx, by, cap_rot = _rgb_cap_anchor(sw)
+        cap_nets = {"1": VCC_NET_NAME}
+        if route_gnd:
+            cap_nets["2"] = GND_NET_NAME
+        out.append(Component(
+            image_name="c_0603",
+            ref=f"C{sw.id}",
+            place_x=bx,
+            place_y=by,
+            rotation_deg=_kicad_angle(cap_rot),
+            nets=cap_nets,
+        ))
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -439,11 +547,31 @@ def _mounting_hole_keepouts(parse: ParseResult) -> list[KeepoutCircle]:
     ]
 
 
+def _rgb_cutout_keepouts(parse: ParseResult) -> list[KeepoutPolygon]:
+    """The milled LED cutout per switch as a rotated-rect keepout (+0.05 mm
+    oversize, same convention as the NPTH circles) so traces keep clearance
+    from the slot edge."""
+    hw = RGB_CUTOUT_W_MM / 2 + 0.05
+    hh = RGB_CUTOUT_H_MM / 2 + 0.05
+    corners = [(-hw, -hh), (hw, -hh), (hw, hh), (-hw, hh), (-hw, -hh)]
+    out: list[KeepoutPolygon] = []
+    for sw in parse.switches:
+        ax, ay, svg_rot = _rgb_led_anchor(sw)
+        r = math.radians(svg_rot)
+        cos_r, sin_r = math.cos(r), math.sin(r)
+        out.append(KeepoutPolygon([
+            (ax + lx * cos_r - ly * sin_r, ay + lx * sin_r + ly * cos_r)
+            for lx, ly in corners
+        ]))
+    return out
+
+
 def _stitching_via_keepouts(
     parse: ParseResult,
     switch_type: SwitchType,
     diode_type: DiodeType,
     stabilizer_type: StabilizerType,
+    rgb: bool = False,
 ) -> list[KeepoutCircle]:
     """GND stitching vias are real copper on both layers, but GND never
     enters the DSN network (the pour carries it, not traces — see
@@ -461,6 +589,7 @@ def _stitching_via_keepouts(
         switch_type=switch_type,
         diode_type=diode_type,
         stabilizer_type=stabilizer_type,
+        rgb=rgb,
     )
     return [KeepoutCircle(VIA_PAD_DIAMETER_MM, x, y) for x, y in positions]
 
@@ -790,14 +919,20 @@ def _emit_network(
         pins = pins_per_net[net_name]
         out.append(f'    (net "{net_name}"')
         out.append(f"      (pins {' '.join(pins)}))")
-    # Two classes mirror project.py's netclasses: default = 0.25 mm,
-    # matrix (ROW*/COL*/NET-SW*-D*) = 0.30 mm. Freerouting will pick
-    # the wider width for matrix traces accordingly.
+    # Classes mirror project.py's netclasses: default = 0.25 mm, matrix
+    # (ROW*/COL*/NET-SW*-D*) = 0.30 mm, power (VCC + routed GND) =
+    # 0.50 mm. Freerouting picks the per-class width accordingly.
     matrix_nets = sorted(
         n for n in pins_per_net
         if n.startswith("ROW") or n.startswith("COL") or n.startswith("NET-SW")
     )
-    default_nets = sorted(n for n in pins_per_net if n not in matrix_nets)
+    power_nets = sorted(
+        n for n in pins_per_net if n in (VCC_NET_NAME, GND_NET_NAME)
+    )
+    default_nets = sorted(
+        n for n in pins_per_net
+        if n not in matrix_nets and n not in power_nets
+    )
     if default_nets:
         out.append('    (class "default"')
         for n in default_nets:
@@ -812,6 +947,14 @@ def _emit_network(
             out.append(f'      "{n}"')
         out.append(f'      (circuit (use_via "Via[0-1]_{VIA_PAD_DIAMETER_MM:.1f}:{VIA_DRILL_DIAMETER_MM:.1f}_um"))')
         out.append(f"      (rule (width {_fmt_coord(MATRIX_TRACK_WIDTH_MM)}) "
+                   f"(clearance {_fmt_coord(DEFAULT_CLEARANCE_MM)}))")
+        out.append("    )")
+    if power_nets:
+        out.append('    (class "power"')
+        for n in power_nets:
+            out.append(f'      "{n}"')
+        out.append(f'      (circuit (use_via "Via[0-1]_{VIA_PAD_DIAMETER_MM:.1f}:{VIA_DRILL_DIAMETER_MM:.1f}_um"))')
+        out.append(f"      (rule (width {_fmt_coord(POWER_TRACK_WIDTH_MM)}) "
                    f"(clearance {_fmt_coord(DEFAULT_CLEARANCE_MM)}))")
         out.append("    )")
     out.append("  )")
@@ -839,6 +982,9 @@ def _build_components(
     switch_type: SwitchType,
     diode_type: DiodeType,
     stabilizer_type: StabilizerType,
+    *,
+    rgb: bool = False,
+    ground_pour: bool = True,
 ) -> list[Component]:
     nets = _enumerate_nets(parse.switches)
     # Same resolver call generate_pcb makes on the same prepared parse, so
@@ -851,11 +997,19 @@ def _build_components(
         switch_type=switch_type,
         diode_type=diode_type,
         stabilizer_type=stabilizer_type,
+        rgb=rgb,
     )
+    # GND is pour-carried when the pour exists; without it the RGB parts
+    # still need ground, so GND becomes an ordinary routed net.
+    route_gnd = rgb and not ground_pour
     components: list[Component] = []
     components.extend(_switch_components(parse, nets, switch_type))
     components.extend(_diode_components(parse, nets, diode_type, placements))
-    components.extend(_mcu_components(parse, nets))
+    components.extend(
+        _mcu_components(parse, nets, rgb=rgb, route_gnd=route_gnd)
+    )
+    if rgb:
+        components.extend(_rgb_components(parse, route_gnd=route_gnd))
     return components
 
 
@@ -865,6 +1019,8 @@ def pad_world_positions(
     switch_type: SwitchType = "soldered",
     diode_type: DiodeType = "tht",
     stabilizer_type: StabilizerType = "pcb_mount",
+    rgb: bool = False,
+    ground_pour: bool = True,
 ) -> dict[str, list[tuple[float, float, float]]]:
     """Net name → ``[(x_mm, y_mm, radius_mm)]`` of every connected pad, in
     KiCad Y-down coordinates after the same centering/renumbering
@@ -879,7 +1035,10 @@ def pad_world_positions(
     cross-check at splice time.
     """
     parse = _prepare_parse(parse)
-    components = _build_components(parse, switch_type, diode_type, stabilizer_type)
+    components = _build_components(
+        parse, switch_type, diode_type, stabilizer_type,
+        rgb=rgb, ground_pour=ground_pour,
+    )
     images = {
         name: IMAGE_BUILDERS[name]()
         for name in {c.image_name for c in components}
@@ -909,6 +1068,7 @@ def pcb_to_dsn(
     design_name: str = "keyboard",
     via_costs: int = VIA_COSTS,
     ground_pour: bool = True,
+    rgb: bool = False,
 ) -> str:
     """Build a Specctra DSN file describing the board to freerouting.
 
@@ -920,7 +1080,10 @@ def pcb_to_dsn(
         raise ValueError("cannot export DSN from a board with zero switches")
 
     parse = _prepare_parse(parse)
-    components = _build_components(parse, switch_type, diode_type, stabilizer_type)
+    components = _build_components(
+        parse, switch_type, diode_type, stabilizer_type,
+        rgb=rgb, ground_pour=ground_pour,
+    )
 
     used_images = {c.image_name for c in components}
     pins_per_net = _collect_pins_per_net(components)
@@ -937,16 +1100,20 @@ def pcb_to_dsn(
     if ground_pour:
         keepouts.extend(
             _stitching_via_keepouts(
-                parse, switch_type, diode_type, stabilizer_type
+                parse, switch_type, diode_type, stabilizer_type, rgb=rgb
             )
         )
+
+    cutout_fences = list(fences)
+    if rgb:
+        cutout_fences.extend(_rgb_cutout_keepouts(parse))
 
     lines: list[str] = []
     lines.append(f'(pcb "{design_name}"')
     lines.extend(_emit_parser())
     lines.append(f"  (resolution {DSN_RESOLUTION_UNIT} {DSN_RESOLUTION})")
     lines.append(f"  (unit {DSN_RESOLUTION_UNIT})")
-    lines.extend(_emit_structure(boundary, keepouts, fences, via_costs))
+    lines.extend(_emit_structure(boundary, keepouts, cutout_fences, via_costs))
     lines.extend(_emit_placement(components))
     lines.extend(_emit_library(used_images))
     lines.extend(_emit_network(pins_per_net))

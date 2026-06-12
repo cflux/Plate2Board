@@ -933,3 +933,143 @@ def test_stitching_vias_inside_outline_and_clear_of_obstacles() -> None:
     for x, y in vias:
         assert f"(via (at {x:.4f} {y:.4f}) (size 0.6000) (drill 0.3000)" in out
     assert out.count(f"(net {gnd_code}) (uuid") == len(vias)
+
+
+# ---------------------------------------------------------------------------
+# Per-key RGB (SK6812 MINI-E)
+# ---------------------------------------------------------------------------
+
+from app.services.pcb import (  # noqa: E402
+    RGB_LED_PAD_LOCAL,
+    VCC_NET_NAME,
+    _rgb_led_anchor,
+    _rgb_obstacles,
+)
+
+
+def _rgb_result() -> ParseResult:
+    sws = [
+        _sw(r * 3 + c + 1, 30.0 + c * 19.05, 30.0 + r * 19.05, row=r, col=c)
+        for r in range(2)
+        for c in range(3)
+    ]
+    res = _result(switches=sws, width=100.0, height=80.0)
+    return res.model_copy(update={
+        "mcu_placement": McuPlacement(cx_mm=75.0, cy_mm=5.0, rotation_deg=0.0),
+    })
+
+
+def test_rgb_off_emits_no_led_parts() -> None:
+    out = generate_pcb(_rgb_result())
+    assert "LED_SK6812MINI-E" not in out
+    assert "keeb:C_0603" not in out
+    assert '"VCC"' not in out
+    assert '"RGB_DATA0"' not in out
+
+
+def test_rgb_emits_led_and_cap_per_switch_with_cutout() -> None:
+    out = generate_pcb(_rgb_result(), rgb=True)
+    assert out.count('(footprint "keeb:LED_SK6812MINI-E"') == 6
+    assert out.count('(footprint "keeb:C_0603"') == 6
+    # Each LED carries the milled cutout slot + a B.SilkS pin-1 marker.
+    assert out.count("(drill oval 3.4 3.0)") == 6
+    led_block = re.search(
+        r'\(footprint "keeb:LED_SK6812MINI-E".+?\n\t\)', out, re.DOTALL
+    ).group(0)
+    assert '"B.SilkS"' in led_block
+    assert '(layers "B.Cu" "B.Paste" "B.Mask")' in led_block
+    assert out.count("(") == out.count(")")
+
+
+def test_rgb_net_codes_appended_after_gnd() -> None:
+    out = generate_pcb(_rgb_result(), rgb=True)
+    # 2 rows + 3 cols + 6 links = 11, GND=12, VCC=13, RGB_DATA0..5=14..19.
+    assert '(net 12 "GND")' in out
+    assert '(net 13 "VCC")' in out
+    assert '(net 14 "RGB_DATA0")' in out
+    assert '(net 19 "RGB_DATA5")' in out
+
+
+def test_rgb_chain_is_continuous_and_last_dout_open() -> None:
+    out = generate_pcb(_rgb_result(), rgb=True)
+    led_blocks = re.findall(
+        r'\(footprint "keeb:LED_SK6812MINI-E".+?\n\t\)', out, re.DOTALL
+    )
+    by_ref = {}
+    for b in led_blocks:
+        ref = re.search(r'\(property "Reference" "(LED\d+)"', b).group(1)
+        pads = dict(re.findall(
+            r'\(pad "(\d)" smd rect \(at [^)]*\) \(size [^)]*\)\s*'
+            r'\(layers "B\.Cu"[^)]*\)(?: \(net \d+ "([^"]*)"\))?',
+            b,
+        ))
+        by_ref[ref] = pads
+    # Chain follows the serpentine order (row 0 left→right, row 1
+    # right→left): LED1→LED2→LED3→LED6→LED5→LED4.
+    from app.services.pcb import rgb_chain_indices
+    parse = _rgb_result()
+    indices = rgb_chain_indices(list(parse.switches))
+    order = sorted(indices, key=indices.get)
+    assert by_ref[f"LED{order[0]}"]["4"] == "RGB_DATA0"
+    for a, b in zip(order, order[1:]):
+        assert by_ref[f"LED{a}"]["2"] == by_ref[f"LED{b}"]["4"], f"chain broken at LED{a}"
+    # Last DOUT unconnected.
+    assert by_ref[f"LED{order[-1]}"].get("2", "") == ""
+    # VDD/GND on every LED.
+    for ref, pads in by_ref.items():
+        assert pads["1"] == "VCC"
+        assert pads["3"] == "GND"
+
+
+def test_rgb_mcu_pins() -> None:
+    out = generate_pcb(_rgb_result(), rgb=True)
+    mcu = re.search(r'\(footprint "keeb:Arduino_Pro_Micro".+?\n\t\)', out, re.DOTALL).group(0)
+    # RAW (24) → VCC; next free GPIO after 2 rows + 3 cols (index 5 → pin 10) → RGB_DATA0.
+    assert re.search(r'\(pad "24" [^\n]*\(net \d+ "VCC"\)', mcu)
+    assert re.search(r'\(pad "10" [^\n]*\(net \d+ "RGB_DATA0"\)', mcu)
+
+
+def test_rgb_tht_diode_relocates_off_led() -> None:
+    """The THT diode default anchor (0, +5.5) overlaps the LED cutout at
+    (0, +4.7) — with RGB on, the resolver must move every diode and the
+    result must clear the LED obstacles."""
+    parse = _rgb_result()
+    placements = _placements(parse, switch_type="soldered", diode_type="tht", rgb=True)
+    rgb_npths, rgb_pads = _rgb_obstacles(list(parse.switches))
+    from app.services.pcb import _DIODE_PAD_RADIUS, _diode_pads_world
+    for sw in parse.switches:
+        p = placements[sw.id]
+        default = math.hypot(p.cx_mm - sw.cx_mm, p.cy_mm - (sw.cy_mm + 5.5))
+        assert default > 0.5, f"D{sw.id} should have moved off the LED"
+        for px, py, _key in _diode_pads_world(p.cx_mm, p.cy_mm, p.svg_rotation_deg, sw, "tht"):
+            for ox, oy, orad in rgb_npths:
+                assert math.hypot(ox - px, oy - py) >= orad + _DIODE_PAD_RADIUS["tht"] + 0.29
+
+
+def test_rgb_stitching_vias_avoid_leds() -> None:
+    parse = _rgb_result()
+    boundary = [(0.0, 0.0), (100.0, 0.0), (100.0, 80.0), (0.0, 80.0)]
+    vias = compute_stitching_vias(
+        list(parse.switches), [], [], parse.mcu_placement, boundary,
+        switch_type="soldered", diode_type="tht", stabilizer_type="pcb_mount",
+        rgb=True,
+    )
+    rgb_npths, rgb_pads = _rgb_obstacles(list(parse.switches))
+    for x, y in vias:
+        for ox, oy, orad in rgb_npths:
+            assert math.hypot(ox - x, oy - y) >= orad + 0.3 + STITCH_NPTH_CLEARANCE_MM - 1e-6
+        for ox, oy, orad, _k in rgb_pads:
+            assert math.hypot(ox - x, oy - y) >= orad + 0.3 + STITCH_PAD_CLEARANCE_MM - 1e-6
+
+
+def test_rgb_gpio_budget_enforced() -> None:
+    # 5 rows × 13 cols = 18 pins — full budget; +1 for RGB must raise.
+    sws = [
+        _sw(r * 13 + c + 1, 15.0 + c * 19.05, 15.0 + r * 19.05, row=r, col=c)
+        for r in range(5)
+        for c in range(13)
+    ]
+    parse = _result(switches=sws, width=280.0, height=120.0)
+    generate_pcb(parse)  # fits without rgb
+    with pytest.raises(ValueError, match="RGB"):
+        generate_pcb(parse, rgb=True)

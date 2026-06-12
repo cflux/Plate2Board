@@ -194,6 +194,7 @@ def generate_pcb(
     *,
     center_on_page: bool = True,
     ground_pour: bool = True,
+    rgb: bool = False,
 ) -> str:
     if switch_type not in SWITCH_TYPES:
         raise ValueError(
@@ -220,14 +221,16 @@ def generate_pcb(
     # Renumber switches to row-major order so PCB refdes (`SW{id}`/`D{id}`)
     # match the schematic's grid layout: top-left = SW1, bottom-right = SWN.
     switches = renumber_switches(list(parse.switches))
-    nets = _enumerate_nets(switches, ground_pour=ground_pour)
+    nets = _enumerate_nets(switches, ground_pour=ground_pour, rgb=rgb)
     rows = sorted({s.row for s in switches})
     cols = sorted({s.col for s in switches})
 
-    if len(rows) + len(cols) > len(PRO_MICRO_GPIO_PINS):
+    pins_needed = len(rows) + len(cols) + (1 if rgb else 0)
+    if pins_needed > len(PRO_MICRO_GPIO_PINS):
         raise ValueError(
-            f"matrix has {len(rows) + len(cols)} row+col pins, but Pro Micro "
-            f"only has {len(PRO_MICRO_GPIO_PINS)} GPIO pins available"
+            f"matrix needs {pins_needed} GPIO pins"
+            f"{' (incl. 1 for the RGB chain)' if rgb else ''}, but Pro Micro "
+            f"only has {len(PRO_MICRO_GPIO_PINS)} available"
         )
 
     out: list[str] = []
@@ -251,14 +254,23 @@ def generate_pcb(
         switch_type=switch_type,
         diode_type=diode_type,
         stabilizer_type=stabilizer_type,
+        rgb=rgb,
     )
-    for sw in sorted(switches, key=lambda s: s.id):
+    ordered = sorted(switches, key=lambda s: s.id)
+    for sw in ordered:
         out.append(_switch_footprint(sw, nets, switch_type))
         out.append(
             _diode_footprint(
                 sw, nets, diode_type, switch_type, diode_placements[sw.id]
             )
         )
+    if rgb:
+        chain = rgb_chain_indices(switches)
+        for sw in ordered:
+            out.append(
+                _rgb_led_footprint(sw, nets, chain[sw.id], len(ordered))
+            )
+            out.append(_rgb_cap_footprint(sw, nets))
 
     if switches:
         # Pro Micro footprint is 2 × 12 thru-hole, 17.78 mm wide. Anchor at
@@ -301,6 +313,7 @@ def generate_pcb(
                 switch_type=switch_type,
                 diode_type=diode_type,
                 stabilizer_type=stabilizer_type,
+                rgb=rgb,
             )
         )
         out.extend(
@@ -317,7 +330,10 @@ def generate_pcb(
 
 
 def _enumerate_nets(
-    switches: Iterable[SwitchDef], *, ground_pour: bool = False
+    switches: Iterable[SwitchDef],
+    *,
+    ground_pour: bool = False,
+    rgb: bool = False,
 ) -> dict[str, int]:
     swlist = sorted(switches, key=lambda s: s.id)
     rows = sorted({s.row for s in swlist})
@@ -333,10 +349,18 @@ def _enumerate_nets(
     for sw in swlist:
         nets[f"NET-SW{sw.id}-D{sw.id}"] = code
         code += 1
-    # GND comes last so every pre-existing net keeps its code whether or
-    # not the ground pour is enabled.
-    if ground_pour and swlist:
+    # GND/VCC/RGB_DATA* come last (in this order) so every pre-existing
+    # net keeps its code regardless of which features are enabled. The
+    # RGB LEDs and their caps need GND even without the ground pour.
+    if (ground_pour or rgb) and swlist:
         nets[GND_NET_NAME] = code
+        code += 1
+    if rgb and swlist:
+        nets[VCC_NET_NAME] = code
+        code += 1
+        for i in range(len(swlist)):
+            nets[RGB_DATA_NET_FMT.format(i)] = code
+            code += 1
     return nets
 
 
@@ -676,6 +700,45 @@ STITCH_NPTH_CLEARANCE_MM = 0.5
 # GND zone polygon pulls in from the board outline by this much.
 ZONE_EDGE_INSET_MM = 0.3
 
+# --- Per-key RGB (SK6812 MINI-E, reverse-mount) -----------------------------
+
+VCC_NET_NAME = "VCC"
+# Pro Micro RAW pin — USB 5 V, feeds the LED chain at full brightness
+# without the regulator in the path.
+MCU_RAW_PIN = 24
+RGB_DATA_NET_FMT = "RGB_DATA{}"
+# LED anchor in switch-local coords: south of the stem ("south-facing"),
+# clear of the 4 mm stem hole (cutout starts at y=3.2, stem ends at 2.0)
+# and of the hotswap socket, which occupies the back's north half.
+RGB_LED_LOCAL = (0.0, 4.7)
+# The LED is flipped 180° relative to the switch so VDD/DIN land on the
+# east side, right next to the decoupling cap.
+RGB_LED_EXTRA_ROT_DEG = 180.0
+# 100 nF 0603 decoupling cap, due east of the LED — beside the VDD pad
+# (short decoupling loop) and clear of the stabilizer wire, which crosses
+# the back at y ≈ 6.8–7.5 on stabilized keys.
+RGB_CAP_LOCAL = (4.9, 4.7)
+# Milled cutout the LED nests into to shine through the board (emitted as
+# an oval-drill NPTH slot; mills cut it with rounded corners).
+RGB_CUTOUT_W_MM = 3.4
+RGB_CUTOUT_H_MM = 3.0
+# SK6812 MINI-E pads in LED-local mm (Keebio/eBastler reverse-mount
+# geometry): 1=VDD, 2=DOUT, 3=GND, 4=DIN.
+RGB_LED_PAD_LOCAL = {
+    "1": (-2.675, 0.75),
+    "2": (-2.675, -0.75),
+    "3": (2.675, -0.75),
+    "4": (2.675, 0.75),
+}
+RGB_LED_PAD_SIZE = (1.6, 0.8)
+RGB_CAP_PAD_LOCAL = {"1": (-0.775, 0.0), "2": (0.775, 0.0)}
+RGB_CAP_PAD_SIZE = (0.9, 0.95)
+# Obstacle radii for the shared placement checks: cutout = circumscribed
+# circle of the slot; pads = half-diagonals.
+_RGB_CUTOUT_OBSTACLE_R = math.hypot(RGB_CUTOUT_W_MM / 2, RGB_CUTOUT_H_MM / 2)
+_RGB_LED_PAD_R = math.hypot(RGB_LED_PAD_SIZE[0] / 2, RGB_LED_PAD_SIZE[1] / 2)
+_RGB_CAP_PAD_R = math.hypot(RGB_CAP_PAD_SIZE[0] / 2, RGB_CAP_PAD_SIZE[1] / 2)
+
 
 @dataclass(frozen=True)
 class DiodePlacement:
@@ -810,6 +873,7 @@ def resolve_diode_placements(
     switch_type: SwitchType,
     diode_type: DiodeType,
     stabilizer_type: StabilizerType,
+    rgb: bool = False,
 ) -> dict[int, DiodePlacement]:
     """Pick a conflict-free placement for every switch's diode.
 
@@ -830,6 +894,13 @@ def resolve_diode_placements(
         switches, stabilizers, mounting_holes, switch_type, stabilizer_type
     )
     fixed_pads = _fixed_pad_obstacles(switches, mcu_placement, switch_type)
+    if rgb:
+        # The per-key LED cutout sits at (0, +4.7) switch-local — directly
+        # under the THT diode's default anchor — so with RGB enabled most
+        # THT diodes relocate (typically to the north candidate).
+        rgb_npths, rgb_pads = _rgb_obstacles(switches)
+        npths = npths + rgb_npths
+        fixed_pads = fixed_pads + rgb_pads
     pad_r = _DIODE_PAD_RADIUS[diode_type]
     candidates = _diode_candidate_offsets(switch_type, diode_type)
 
@@ -893,6 +964,7 @@ def compute_stitching_vias(
     switch_type: SwitchType,
     diode_type: DiodeType,
     stabilizer_type: StabilizerType,
+    rgb: bool = False,
 ) -> list[tuple[float, float]]:
     """GND stitching via positions: a `STITCH_SPACING_MM` grid over the
     board, keeping `STITCH_EDGE_INSET_MM` inside the outline and clear of
@@ -929,10 +1001,14 @@ def compute_stitching_vias(
         switches, stabilizers, mounting_holes, switch_type, stabilizer_type
     )
     pads = _fixed_pad_obstacles(switches, mcu_placement, switch_type)
+    if rgb:
+        rgb_npths, rgb_pads = _rgb_obstacles(switches)
+        npths = npths + rgb_npths
+        pads = pads + rgb_pads
     placements = resolve_diode_placements(
         switches, stabilizers, mounting_holes, mcu_placement,
         switch_type=switch_type, diode_type=diode_type,
-        stabilizer_type=stabilizer_type,
+        stabilizer_type=stabilizer_type, rgb=rgb,
     )
     diode_pad_r = _DIODE_PAD_RADIUS[diode_type]
     for sw in switches:
@@ -979,6 +1055,7 @@ def _gnd_stitching_vias(
     switch_type: SwitchType,
     diode_type: DiodeType,
     stabilizer_type: StabilizerType,
+    rgb: bool = False,
 ) -> list[str]:
     """Emit `(via …)` tokens for every stitching position (format matches
     the routed-trace vias `ses._render_via` splices in)."""
@@ -994,6 +1071,7 @@ def _gnd_stitching_vias(
         switch_type=switch_type,
         diode_type=diode_type,
         stabilizer_type=stabilizer_type,
+        rgb=rgb,
     )
     gnd = nets[GND_NET_NAME]
     return [
@@ -1069,6 +1147,234 @@ def _gnd_zones(path_d: str, grow_mm: float, gnd_code: int) -> list[str]:
                 f"\t)"
             )
     return out
+
+
+# ---------------------------------------------------------------------------
+# Per-key RGB: SK6812 MINI-E + decoupling cap
+# ---------------------------------------------------------------------------
+
+
+def rgb_chain_indices(switches: list[SwitchDef]) -> dict[int, int]:
+    """Switch id → 0-based position in the LED daisy-chain.
+
+    Hop length decides routability (plain row-major order produced a
+    58 mm hop across an Alice-layout split that freerouting could not
+    close), and firmware maps LED indices to coordinates anyway, so the
+    order is free to optimize. Start from a row serpentine (rows
+    top-to-bottom, alternating direction), then run a deterministic
+    2-opt pass to shorten the path — on a real Alice board this cut the
+    worst hop from 94 mm to 56 mm and the average from 25 to 20 mm.
+    Shared by the pcb/dsn/netlist/schematic generators.
+    """
+    by_row: dict[int, list[SwitchDef]] = {}
+    for sw in switches:
+        by_row.setdefault(sw.row, []).append(sw)
+    order: list[SwitchDef] = []
+    for i, row in enumerate(sorted(by_row)):
+        order.extend(
+            sorted(by_row[row], key=lambda s: s.cx_mm, reverse=(i % 2 == 1))
+        )
+
+    def void_hop(a: SwitchDef, b: SwitchDef) -> bool:
+        # A hop whose path strays far from every switch is probably
+        # crossing a board void (e.g. the notch between an Alice
+        # layout's bottom feet) — freerouting then has to detour through
+        # congested necks. Penalize so 2-opt routes the chain through
+        # the switch field instead. Switch positions are the only input,
+        # so all four generators stay byte-identical without needing the
+        # outline polygon.
+        for t in (0.25, 0.5, 0.75):
+            mx = a.cx_mm + (b.cx_mm - a.cx_mm) * t
+            my = a.cy_mm + (b.cy_mm - a.cy_mm) * t
+            if min(
+                math.hypot(s.cx_mm - mx, s.cy_mm - my) for s in switches
+            ) > 12.0:
+                return True
+        return False
+
+    def dist(a: SwitchDef, b: SwitchDef) -> float:
+        d = math.hypot(a.cx_mm - b.cx_mm, a.cy_mm - b.cy_mm)
+        return d * 4.0 if void_hop(a, b) else d
+
+    n = len(order)
+    for _ in range(20):
+        improved = False
+        for i in range(n - 2):
+            for j in range(i + 2, n - 1):
+                old = dist(order[i], order[i + 1]) + dist(order[j], order[j + 1])
+                new = dist(order[i], order[j]) + dist(order[i + 1], order[j + 1])
+                if new < old - 1e-9:
+                    order[i + 1:j + 1] = reversed(order[i + 1:j + 1])
+                    improved = True
+        if not improved:
+            break
+    return {sw.id: idx for idx, sw in enumerate(order)}
+
+
+def _rgb_led_anchor(sw: SwitchDef) -> tuple[float, float, float]:
+    """LED world anchor + its SVG rotation. The LED rides the switch's
+    rotation plus 180° so VDD/DIN face east, toward the cap."""
+    cx, cy = _rotate_local_to_world(*RGB_LED_LOCAL, sw)
+    return cx, cy, (sw.rotation_deg + RGB_LED_EXTRA_ROT_DEG) % 360
+
+
+def _rgb_cap_anchor(sw: SwitchDef) -> tuple[float, float, float]:
+    cx, cy = _rotate_local_to_world(*RGB_CAP_LOCAL, sw)
+    return cx, cy, sw.rotation_deg % 360
+
+
+def _rgb_pad_world(
+    ax: float, ay: float, svg_rot: float, lx: float, ly: float
+) -> tuple[float, float]:
+    """Pad world position for a footprint at (ax, ay) rotated `svg_rot`
+    (SVG CW convention — same math KiCad applies to `(at … −svg_rot)`)."""
+    r = math.radians(svg_rot)
+    cos_r, sin_r = math.cos(r), math.sin(r)
+    return (ax + lx * cos_r - ly * sin_r, ay + lx * sin_r + ly * cos_r)
+
+
+def _rgb_led_pad_nets(
+    sw: SwitchDef, chain_idx: int, n_total: int
+) -> dict[str, str | None]:
+    """Pin → net-name map for the LED at 0-based chain position
+    `chain_idx`. RGB_DATA{j} runs (MCU if j==0 else LED_j.DOUT) →
+    LED_{j+1}.DIN; the last LED's DOUT is left unconnected."""
+    dout = (
+        RGB_DATA_NET_FMT.format(chain_idx + 1)
+        if chain_idx + 1 < n_total
+        else None
+    )
+    return {
+        "1": VCC_NET_NAME,
+        "2": dout,
+        "3": GND_NET_NAME,
+        "4": RGB_DATA_NET_FMT.format(chain_idx),
+    }
+
+
+def _rgb_led_footprint(
+    sw: SwitchDef, nets: dict[str, int], chain_idx: int, n_total: int
+) -> str:
+    cx, cy, svg_rot = _rgb_led_anchor(sw)
+    rot = _kicad_angle(svg_rot)
+    ref = f"LED{sw.id}"
+    pad_nets = _rgb_led_pad_nets(sw, chain_idx, n_total)
+    pads: list[str] = []
+    # The milled cutout the LED nests into (reverse-mount: body drops
+    # through, light shines out the front). Oval drill = routed slot.
+    pads.append(
+        f'\t\t(pad "" np_thru_hole rect (at 0 0) '
+        f"(size {RGB_CUTOUT_W_MM} {RGB_CUTOUT_H_MM}) "
+        f"(drill oval {RGB_CUTOUT_W_MM} {RGB_CUTOUT_H_MM})\n"
+        f'\t\t\t(layers "*.Cu" "*.Mask") (uuid "{_u()}"))\n'
+    )
+    w, h = RGB_LED_PAD_SIZE
+    for num, (lx, ly) in RGB_LED_PAD_LOCAL.items():
+        net_name = pad_nets[num]
+        net_attr = ""
+        if net_name is not None:
+            net_attr = f' (net {nets[net_name]} "{net_name}")'
+        pads.append(
+            f'\t\t(pad "{num}" smd rect (at {lx} {ly}) (size {w} {h})\n'
+            f'\t\t\t(layers "B.Cu" "B.Paste" "B.Mask"){net_attr} (uuid "{_u()}"))\n'
+        )
+    return (
+        f'\t(footprint "keeb:LED_SK6812MINI-E"\n'
+        f'\t\t(layer "B.Cu")\n'
+        f'\t\t(uuid "{_u()}")\n'
+        f"\t\t(at {cx:.4f} {cy:.4f} {rot:.3f})\n"
+        f'\t\t(descr "SK6812 MINI-E reverse-mount RGB LED (shines through '
+        f'the board); pin 1 = VDD at the marked corner")\n'
+        f'\t\t(tags "RGB LED SK6812 MINI-E reverse")\n'
+        f"\t\t(attr smd)\n"
+        + _common_props(
+            ref, "SK6812MINI-E", "keeb:LED_SK6812MINI-E", rot,
+            side="B", text_offset_y=2.8,
+        )
+        # Body outline on B.Fab.
+        + f"\t\t(fp_line (start -1.6 -1.4) (end 1.6 -1.4) "
+        f'(stroke (width 0.1) (type solid)) (layer "B.Fab") (uuid "{_u()}"))\n'
+        f"\t\t(fp_line (start 1.6 -1.4) (end 1.6 1.4) "
+        f'(stroke (width 0.1) (type solid)) (layer "B.Fab") (uuid "{_u()}"))\n'
+        f"\t\t(fp_line (start 1.6 1.4) (end -1.6 1.4) "
+        f'(stroke (width 0.1) (type solid)) (layer "B.Fab") (uuid "{_u()}"))\n'
+        f"\t\t(fp_line (start -1.6 1.4) (end -1.6 -1.4) "
+        f'(stroke (width 0.1) (type solid)) (layer "B.Fab") (uuid "{_u()}"))\n'
+        # Pin-1 (VDD) marker: corner bracket + dot on B.SilkS just outside
+        # the pad-1 corner so it survives soldering.
+        f"\t\t(fp_line (start -3.7 1.6) (end -3.7 0.9) "
+        f'(stroke (width 0.2) (type solid)) (layer "B.SilkS") (uuid "{_u()}"))\n'
+        f"\t\t(fp_line (start -3.7 1.6) (end -3.0 1.6) "
+        f'(stroke (width 0.2) (type solid)) (layer "B.SilkS") (uuid "{_u()}"))\n'
+        f"\t\t(fp_circle (center -4.2 2.0) (end -3.95 2.0) "
+        f'(stroke (width 0.25) (type solid)) (layer "B.SilkS") (uuid "{_u()}"))\n'
+        + "".join(pads)
+        + "\t)"
+    )
+
+
+def _rgb_cap_footprint(sw: SwitchDef, nets: dict[str, int]) -> str:
+    cx, cy, svg_rot = _rgb_cap_anchor(sw)
+    rot = _kicad_angle(svg_rot)
+    ref = f"C{sw.id}"
+    w, h = RGB_CAP_PAD_SIZE
+    pad_nets = {"1": VCC_NET_NAME, "2": GND_NET_NAME}
+    pads: list[str] = []
+    for num, (lx, ly) in RGB_CAP_PAD_LOCAL.items():
+        name = pad_nets[num]
+        pads.append(
+            f'\t\t(pad "{num}" smd rect (at {lx} {ly}) (size {w} {h})\n'
+            f'\t\t\t(layers "B.Cu" "B.Paste" "B.Mask") '
+            f'(net {nets[name]} "{name}") (uuid "{_u()}"))\n'
+        )
+    return (
+        f'\t(footprint "keeb:C_0603"\n'
+        f'\t\t(layer "B.Cu")\n'
+        f'\t\t(uuid "{_u()}")\n'
+        f"\t\t(at {cx:.4f} {cy:.4f} {rot:.3f})\n"
+        f'\t\t(descr "100 nF 0603 decoupling cap for the adjacent RGB LED")\n'
+        f'\t\t(tags "capacitor 0603 decoupling")\n'
+        f"\t\t(attr smd)\n"
+        + _common_props(ref, "100nF", "keeb:C_0603", rot, side="B",
+                        text_offset_y=1.6)
+        + f"\t\t(fp_line (start -0.8 -0.4) (end 0.8 -0.4) "
+        f'(stroke (width 0.1) (type solid)) (layer "B.Fab") (uuid "{_u()}"))\n'
+        f"\t\t(fp_line (start 0.8 -0.4) (end 0.8 0.4) "
+        f'(stroke (width 0.1) (type solid)) (layer "B.Fab") (uuid "{_u()}"))\n'
+        f"\t\t(fp_line (start 0.8 0.4) (end -0.8 0.4) "
+        f'(stroke (width 0.1) (type solid)) (layer "B.Fab") (uuid "{_u()}"))\n'
+        f"\t\t(fp_line (start -0.8 0.4) (end -0.8 -0.4) "
+        f'(stroke (width 0.1) (type solid)) (layer "B.Fab") (uuid "{_u()}"))\n'
+        + "".join(pads)
+        + "\t)"
+    )
+
+
+def _rgb_obstacles(
+    switches: list[SwitchDef],
+) -> tuple[list[tuple[float, float, float]], list[tuple[float, float, float, str]]]:
+    """LED cutouts (as circumscribed circles), LED pads, and cap pads as
+    obstacles for the shared placement checks (diode resolver + stitching
+    vias). Net keys let same-net overlaps through, mirroring
+    `_fixed_pad_obstacles`."""
+    npths: list[tuple[float, float, float]] = []
+    pads: list[tuple[float, float, float, str]] = []
+    chain = rgb_chain_indices(switches)
+    n = len(switches)
+    for sw in sorted(switches, key=lambda s: s.id):
+        ax, ay, lrot = _rgb_led_anchor(sw)
+        npths.append((ax, ay, _RGB_CUTOUT_OBSTACLE_R))
+        pad_nets = _rgb_led_pad_nets(sw, chain[sw.id], n)
+        for num, (lx, ly) in RGB_LED_PAD_LOCAL.items():
+            px, py = _rgb_pad_world(ax, ay, lrot, lx, ly)
+            key = pad_nets[num] or f"LED{sw.id}-{num}"
+            pads.append((px, py, _RGB_LED_PAD_R, key))
+        bx, by, brot = _rgb_cap_anchor(sw)
+        for num, (lx, ly) in RGB_CAP_PAD_LOCAL.items():
+            px, py = _rgb_pad_world(bx, by, brot, lx, ly)
+            key = VCC_NET_NAME if num == "1" else GND_NET_NAME
+            pads.append((px, py, _RGB_CAP_PAD_R, key))
+    return npths, pads
 
 
 def _diode_footprint(
@@ -1189,13 +1495,16 @@ def _pro_micro_pin_to_net(
     """Map a Pro Micro pin number to its (net_code, net_name).
 
     Pin assignment matches the schematic: rows first, then cols, mapped
-    onto PRO_MICRO_GPIO_PINS in order. The GND pins (3, 4, 23) join the
-    GND net when the ground pour is enabled (GND present in `nets`);
-    power (21, 24) and RST (22) are left unconnected — wire those
-    manually if needed.
+    onto PRO_MICRO_GPIO_PINS in order; with RGB enabled the next free
+    GPIO after the matrix drives the LED chain (RGB_DATA0) and RAW
+    (pin 24) feeds the LED supply (VCC). The GND pins (3, 4, 23) join
+    the GND net when it exists; VCC-the-regulated-rail (21) and RST (22)
+    are left unconnected — wire those manually if needed.
     """
     if pin in MCU_GND_PINS and GND_NET_NAME in nets:
         return (nets[GND_NET_NAME], GND_NET_NAME)
+    if pin == MCU_RAW_PIN and VCC_NET_NAME in nets:
+        return (nets[VCC_NET_NAME], VCC_NET_NAME)
     n_rows = len(rows)
     for i, p in enumerate(PRO_MICRO_GPIO_PINS):
         if p != pin:
@@ -1207,6 +1516,12 @@ def _pro_micro_pin_to_net(
         if c_idx < len(cols):
             name = f"COL{cols[c_idx]}"
             return (nets[name], name)
+        if c_idx == len(cols):
+            # First pin past the matrix drives the LED chain when RGB
+            # is enabled.
+            name = RGB_DATA_NET_FMT.format(0)
+            if name in nets:
+                return (nets[name], name)
         return None
     return None
 

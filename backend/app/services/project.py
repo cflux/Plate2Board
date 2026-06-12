@@ -29,6 +29,7 @@ def generate_project_zip(
     stabilizer_type: StabilizerType = "pcb_mount",
     *,
     ground_pour: bool = True,
+    rgb: bool = False,
     pcb_text_override: str | None = None,
 ) -> bytes:
     """Bundle the project ZIP. By default the PCB is regenerated from
@@ -40,7 +41,7 @@ def generate_project_zip(
 
     sch_text = generate_schematic(
         parse.switches, switch_type=switch_type, diode_type=diode_type,
-        ground_pour=ground_pour,
+        ground_pour=ground_pour, rgb=rgb,
     )
     if pcb_text_override is not None:
         pcb_text = pcb_text_override
@@ -51,6 +52,7 @@ def generate_project_zip(
             diode_type=diode_type,
             stabilizer_type=stabilizer_type,
             ground_pour=ground_pour,
+            rgb=rgb,
         )
     pro_text = _project_file(project_name, _extract_root_uuid(sch_text))
 
@@ -163,6 +165,23 @@ def _project_file(project_name: str, sch_uuid: str) -> str:
                     "via_drill": 0.3,
                     "wire_width": 6,
                 },
+                {
+                    "bus_width": 12,
+                    "clearance": 0.2,
+                    "diff_pair_gap": 0.25,
+                    "diff_pair_via_gap": 0.25,
+                    "diff_pair_width": 0.2,
+                    "line_style": 0,
+                    "microvia_diameter": 0.3,
+                    "microvia_drill": 0.1,
+                    "name": "Power",
+                    "pcb_color": "rgba(0, 0, 0, 0.000)",
+                    "schematic_color": "rgba(0, 0, 0, 0.000)",
+                    "track_width": 0.4,
+                    "via_diameter": 0.6,
+                    "via_drill": 0.3,
+                    "wire_width": 6,
+                },
             ],
             "meta": {"version": 3},
             "net_colors": None,
@@ -171,6 +190,8 @@ def _project_file(project_name: str, sch_uuid: str) -> str:
                 {"netclass": "Matrix", "pattern": "ROW*"},
                 {"netclass": "Matrix", "pattern": "COL*"},
                 {"netclass": "Matrix", "pattern": "NET-SW*-D*"},
+                {"netclass": "Power", "pattern": "VCC"},
+                {"netclass": "Power", "pattern": "GND"},
             ],
         },
         "pcbnew": {

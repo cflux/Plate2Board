@@ -134,7 +134,17 @@ def collect_board_geometry(pcb_text: str):
             wy = fy - lx * sin_r + ly * cos_r
             if _atom(pad[2]) == "np_thru_hole":
                 drill = _find_child(pad, "drill")
-                npths.append((wx, wy, float(_atom(drill[1])) / 2.0))
+                if _atom(drill[1]) == "oval":
+                    # Slot (e.g. the RGB LED cutout) — use the inscribed
+                    # circle: the circumscribed one would false-positive
+                    # on legal traces near the slot's corners (the exact
+                    # rect keepout is unit-tested in test_routing.py).
+                    r = min(
+                        float(_atom(drill[2])), float(_atom(drill[3]))
+                    ) / 2.0
+                else:
+                    r = float(_atom(drill[1])) / 2.0
+                npths.append((wx, wy, r))
                 continue
             net = _find_child(pad, "net")
             if net is None:
@@ -174,12 +184,12 @@ def point_segment_distance(
     return math.hypot(px - (x1 + t * dx), py - (y1 + t * dy))
 
 
-def verify(switch_type: str, diode_type: str) -> bool:
-    label = f"[{switch_type}/{diode_type}]"
+def verify(switch_type: str, diode_type: str, rgb: bool = False) -> bool:
+    label = f"[{switch_type}/{diode_type}{'/rgb' if rgb else ''}]"
     parse = build_parse()
     pcb_text = generate_pcb(
         parse, switch_type=switch_type, diode_type=diode_type,
-        stabilizer_type="pcb_mount",
+        stabilizer_type="pcb_mount", rgb=rgb,
     )
     print(f"{label} routing via freerouting…", flush=True)
     # Routes through the same via-cost-ladder runner production uses.
@@ -188,7 +198,7 @@ def verify(switch_type: str, diode_type: str) -> bool:
     # rather than waiting out the production timeout.
     result = asyncio.run(routing_runner.route_board(
         parse, switch_type=switch_type, diode_type=diode_type,
-        stabilizer_type="pcb_mount", timeout_s=240.0,
+        stabilizer_type="pcb_mount", rgb=rgb, timeout_s=240.0,
     ))
     routed_pcb, stats = apply_ses_to_pcb(
         pcb_text,
@@ -196,7 +206,7 @@ def verify(switch_type: str, diode_type: str) -> bool:
         total_connections=result.stats.total_net_count,
         unrouted_connections=result.stats.unrouted_net_count,
         pad_positions=pad_world_positions(
-            parse, switch_type=switch_type, diode_type=diode_type
+            parse, switch_type=switch_type, diode_type=diode_type, rgb=rgb
         ),
     )
     ok = True
@@ -322,16 +332,20 @@ def verify(switch_type: str, diode_type: str) -> bool:
 
 def main() -> int:
     all_ok = True
-    for switch_type, diode_type in (
-        ("soldered", "tht"),
-        ("soldered", "smd"),
-        ("hotswap", "tht"),
-        ("hotswap", "smd"),
+    for switch_type, diode_type, rgb in (
+        ("soldered", "tht", False),
+        ("soldered", "smd", False),
+        ("hotswap", "tht", False),
+        ("hotswap", "smd", False),
+        # RGB adds LED/cap pads + cutout keepouts + VCC/data nets on the
+        # already-busy B.Cu — route the two extreme variants.
+        ("soldered", "tht", True),
+        ("hotswap", "smd", True),
     ):
         try:
-            all_ok &= verify(switch_type, diode_type)
+            all_ok &= verify(switch_type, diode_type, rgb)
         except Exception as exc:  # noqa: BLE001 — report and fail
-            print(f"[{switch_type}/{diode_type}] ERROR: {exc}")
+            print(f"[{switch_type}/{diode_type}{'/rgb' if rgb else ''}] ERROR: {exc}")
             all_ok = False
     print("E2E RESULT:", "PASS" if all_ok else "FAIL")
     return 0 if all_ok else 1

@@ -454,3 +454,30 @@ def test_gnd_net_present_when_ground_pour_enabled() -> None:
     assert '(lib_id "power:GND")' in text, "GND power symbol missing"
     off = generate_schematic([_sw(1, 0, 0)], ground_pour=False)
     assert '(lib_id "power:GND")' not in off
+
+
+def test_rgb_schematic_has_led_chain_and_grid_targets() -> None:
+    sws = [_sw(i + 1, 0, i) for i in range(3)]
+    text = generate_schematic(sws, rgb=True)
+    assert text.count('(lib_id "Keyboard_LED:SK6812MINI-E")') == 3
+    assert text.count('(lib_id "Device:C")') == 3
+    assert '"RGB_DATA0"' in text and '"RGB_DATA1"' in text and '"RGB_DATA2"' in text
+    assert '(lib_id "power:VCC")' in text
+    assert text.count("(") == text.count(")")
+    # LED symbols landed on their grid targets (not SKiDL's auto placement):
+    # LED for col c sits at GRID_ORIGIN_X + c*56, GRID_ORIGIN_Y + 24.
+    from app.services.schematic import (
+        GRID_COL_SPACING_RGB_MM,
+        GRID_LED_OFFSET_Y_MM,
+        GRID_ORIGIN_X_MM,
+        GRID_ORIGIN_Y_MM,
+    )
+    import re as _re
+    for c in range(3):
+        x = GRID_ORIGIN_X_MM + c * GRID_COL_SPACING_RGB_MM
+        y = GRID_ORIGIN_Y_MM + GRID_LED_OFFSET_Y_MM
+        assert _re.search(
+            rf'\(at {x:.4f} {y:.4f} 0\.000\)', text
+        ), f"LED for col {c} not at grid target ({x}, {y})"
+    off = generate_schematic(sws)
+    assert "SK6812MINI-E" not in off

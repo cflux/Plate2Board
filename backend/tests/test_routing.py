@@ -952,3 +952,49 @@ def test_dsn_keepouts_at_stitching_via_positions() -> None:
     n_off = len(_find_children(structure_off, "keepout"))
     n_on = len(centroids)
     assert n_on - n_off == len(expected)
+
+
+# --- per-key RGB in the DSN ---------------------------------------------------
+
+
+def test_dsn_rgb_nets_and_keepouts() -> None:
+    from app.services.pcb import _rgb_led_anchor
+    from app.services.routing.dsn import _prepare_parse
+
+    parse = _result_two_keys()
+    dsn = pcb_to_dsn(parse, rgb=True)
+    # VCC + chain nets present with LED/cap pins; GND stays pour-carried.
+    assert '(net "VCC"' in dsn and "LED1-1" in dsn and "C1-1" in dsn
+    assert '(net "RGB_DATA0"' in dsn and '(net "RGB_DATA1"' in dsn
+    assert '(net "GND"' not in dsn
+    assert '(class "power"' in dsn
+    # The MCU feeds the chain + supplies VCC from RAW.
+    assert re.search(r'\(net "RGB_DATA0"\s*\(pins [^)]*U1-\d+', dsn)
+    assert re.search(r'\(net "VCC"\s*\(pins [^)]*U1-24', dsn)
+    # One cutout keepout polygon per LED, centered on the LED anchor.
+    prepared = _prepare_parse(parse)
+    structure = _find_child(_parse_dsn(dsn), "structure")
+    centroids = []
+    for keepout in _find_children(structure, "keepout"):
+        poly = _find_child(keepout, "polygon")
+        coords = [float(_atom(v)) / DSN_MM_FACTOR for v in poly[3:]]
+        xs, ys = coords[0::2][:-1], coords[1::2][:-1]
+        centroids.append((sum(xs) / len(xs), -(sum(ys) / len(ys))))
+    for sw in prepared.switches:
+        ax, ay, _rot = _rgb_led_anchor(sw)
+        assert any(
+            math.hypot(cx - ax, cy - ay) < 1e-3 for cx, cy in centroids
+        ), f"no cutout keepout at LED anchor of SW{sw.id}"
+
+
+def test_dsn_rgb_routes_gnd_when_pour_off() -> None:
+    parse = _result_two_keys()
+    dsn = pcb_to_dsn(parse, rgb=True, ground_pour=False)
+    m = re.search(r'\(net "GND"\s*\(pins ([^)]*)\)', dsn)
+    assert m, "GND must be routed when the pour is off and RGB is on"
+    pins = m.group(1).split()
+    assert "U1-3" in pins and "U1-4" in pins and "U1-23" in pins
+    assert "LED1-3" in pins and "C1-2" in pins
+    # GND joins the power class alongside VCC.
+    power_class = re.search(r'\(class "power"(.*?)\)\s*\)', dsn, re.DOTALL).group(1)
+    assert '"GND"' in power_class and '"VCC"' in power_class

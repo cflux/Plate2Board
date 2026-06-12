@@ -45,6 +45,7 @@ def generate_schematic(
     switch_type: SwitchType = "soldered",
     diode_type: DiodeType = "tht",
     ground_pour: bool = True,
+    rgb: bool = False,
 ) -> str:
     """Emit the .kicad_sch text. `switch_type` / `diode_type` select the
     footprint property that's written into each symbol — they MUST match
@@ -69,11 +70,12 @@ def generate_schematic(
 
     rows = sorted({s.row for s in switches})
     cols = sorted({s.col for s in switches})
-    n_pins_needed = len(rows) + len(cols)
+    n_pins_needed = len(rows) + len(cols) + (1 if rgb else 0)
     if n_pins_needed > len(PRO_MICRO_GPIO_PINS):
         raise ValueError(
-            f"matrix has {n_pins_needed} row+col pins, but Pro Micro only "
-            f"has {len(PRO_MICRO_GPIO_PINS)} GPIO pins available"
+            f"matrix needs {n_pins_needed} GPIO pins"
+            f"{' (incl. 1 for the RGB chain)' if rgb else ''}, but Pro Micro "
+            f"only has {len(PRO_MICRO_GPIO_PINS)} available"
         )
 
     SW = skidl.Part(
@@ -117,12 +119,47 @@ def generate_schematic(
         col_nets[c] += mcu[next(pin_iter)]
 
     # GND ties the MCU's ground pins together; on the PCB it's carried by
-    # the copper pours, so it must exist in the schematic too or "Update
-    # PCB from Schematic" would try to remove the zones' net.
-    if ground_pour:
+    # the copper pours (or routed traces when RGB is on without the pour),
+    # so it must exist in the schematic too or "Update PCB from Schematic"
+    # would try to remove the zones' net.
+    if ground_pour or rgb:
         gnd = skidl.Net("GND")
         for pin in (3, 4, 23):
             gnd += mcu[pin]
+
+    if rgb:
+        # SK6812 MINI-E chain (custom Keyboard_LED symbol — pin numbers
+        # match the keeb:LED_SK6812MINI-E footprint: 1=VDD, 2=DOUT,
+        # 3=GND, 4=DIN) + a 100 nF decoupling cap per LED. Power comes
+        # from RAW (pin 24, USB 5 V); data from the next free GPIO. The
+        # chain nets have fanout 2, so auto_stub renders them as global
+        # labels — SKiDL's wire router never sees them.
+        LED = skidl.Part(
+            "Keyboard_LED", "SK6812MINI-E", dest=skidl.TEMPLATE,
+            footprint="keeb:LED_SK6812MINI-E",
+        )
+        CAP = skidl.Part(
+            "Device", "C", dest=skidl.TEMPLATE, value="100nF",
+            footprint="keeb:C_0603",
+        )
+        from .pcb import rgb_chain_indices
+
+        vcc = skidl.Net("VCC")
+        vcc += mcu[24]
+        data_pin = PRO_MICRO_GPIO_PINS[len(rows) + len(cols)]
+        chain = skidl.Net("RGB_DATA0")
+        chain += mcu[data_pin]
+        indices = rgb_chain_indices(switches)
+        ordered = sorted(switches, key=lambda s: indices[s.id])
+        for j, sw in enumerate(ordered):
+            led = LED(ref=f"LED{sw.id}")
+            cap = CAP(ref=f"C{sw.id}")
+            vcc += led[1], cap[1]
+            gnd += led[3], cap[2]
+            chain += led[4]
+            if j + 1 < len(ordered):
+                chain = skidl.Net(f"RGB_DATA{j + 1}")
+                chain += led[2]
 
     with tempfile.TemporaryDirectory() as td:
         # auto_stub converts high-fanout nets (every ROW/COL net here) to
@@ -139,7 +176,7 @@ def generate_schematic(
         text = Path(td, "keyboard.kicad_sch").read_text()
 
     text = _fix_visibility_tokens(text)
-    text = _reorganize_to_grid(text, switches)
+    text = _reorganize_to_grid(text, switches, rgb=rgb)
     return text
 
 
@@ -189,6 +226,12 @@ GRID_ORIGIN_Y_MM = 35.0
 GRID_COL_SPACING_MM = 40.0
 GRID_ROW_SPACING_MM = 30.0
 GRID_DIODE_OFFSET_Y_MM = 12.0
+# With per-key RGB each cell also holds an LED + cap below the diode, and
+# the LED's DIN/DOUT global labels stick out sideways — both spacings grow.
+GRID_COL_SPACING_RGB_MM = 56.0
+GRID_ROW_SPACING_RGB_MM = 44.0
+GRID_LED_OFFSET_Y_MM = 24.0
+GRID_CAP_OFFSET_X_MM = 26.0
 GRID_PADDING_MM = 25.0
 # How far left of the leftmost diode K pin to place the row's net label.
 ROW_LABEL_OFFSET_MM = 5.0
@@ -200,7 +243,9 @@ _AT_RE = re.compile(r"\(at\s+([-+\d.]+)\s+([-+\d.]+)(\s+[-+\d.]+)?\s*\)")
 _PAPER_RE = re.compile(r'\(paper "[^"]+"\)')
 
 
-def _reorganize_to_grid(text: str, switches: list[SwitchDef]) -> str:
+def _reorganize_to_grid(
+    text: str, switches: list[SwitchDef], *, rgb: bool = False
+) -> str:
     """Move each placed symbol (and its associated labels) to a deterministic
     grid. Diodes get rotated 270° so their cathode points down toward the
     row label; intra-cell N$ labels (linking switch pin 2 to diode anode)
@@ -213,7 +258,7 @@ def _reorganize_to_grid(text: str, switches: list[SwitchDef]) -> str:
         return text
 
     lib_pins = _parse_lib_pins(text)
-    targets = _grid_targets(switches)
+    targets = _grid_targets(switches, rgb=rgb)
 
     # PHASE 1 — char-range deletions (N$ link labels). These have to happen
     # via char ranges because the last label in the file shares its closing
@@ -304,6 +349,31 @@ def _reorganize_to_grid(text: str, switches: list[SwitchDef]) -> str:
         for li in range(mov["line_start"], mov["line_end"] + 1):
             new_lines[li] = _translate_ats_in_line(new_lines[li], dx, dy)
 
+    # Power symbols (power:GND / power:VCC) aren't grid targets, but SKiDL
+    # plants one on each connected pin — without this they'd be left
+    # floating at SKiDL's auto placement. Give them the label treatment:
+    # associate each to the nearest old pin among MOVED symbols and ride
+    # along with that pin's delta.
+    moved_refs_and_old_pins = [
+        (ps["ref"], ps["pins_old"]) for ps in placed if "new_x" in ps
+    ]
+    for ps in placed:
+        if "new_x" in ps or not ps["lib_id"].startswith("power:"):
+            continue
+        match = _nearest_pin_match(ps["x"], ps["y"], moved_refs_and_old_pins)
+        if match is None:
+            continue
+        host_ref, pin_idx = match
+        host = by_ref.get(host_ref)
+        if host is None or "pins_new" not in host:
+            continue
+        if pin_idx >= len(host["pins_new"]):
+            continue
+        dx = host["pins_new"][pin_idx][0] - host["pins_old"][pin_idx][0]
+        dy = host["pins_new"][pin_idx][1] - host["pins_old"][pin_idx][1]
+        for li in range(ps["line_start"], ps["line_end"] + 1):
+            new_lines[li] = _translate_ats_in_line(new_lines[li], dx, dy)
+
     text = "\n".join(new_lines)
 
     # PHASE 3 — Consolidate ROW labels: keep ONE on the left side, connect
@@ -381,7 +451,7 @@ def _reorganize_to_grid(text: str, switches: list[SwitchDef]) -> str:
             extras_text = "\n".join(extras)
             text = text[:insert_at] + "\n" + extras_text + "\n" + text[insert_at:]
 
-    paper_w, paper_h = _paper_size(switches)
+    paper_w, paper_h = _paper_size(switches, rgb=rgb)
     return _PAPER_RE.sub(
         f'(paper "User" {paper_w:.1f} {paper_h:.1f})',
         text,
@@ -389,27 +459,40 @@ def _reorganize_to_grid(text: str, switches: list[SwitchDef]) -> str:
     )
 
 
-def _paper_size(switches: list[SwitchDef]) -> tuple[float, float]:
+def _paper_size(
+    switches: list[SwitchDef], *, rgb: bool = False
+) -> tuple[float, float]:
     """Return (width, height) of the schematic page in mm, sized to fit
     the grid plus padding for global-label tails on each side."""
     n_cols = max(s.col for s in switches) + 1
     n_rows = max(s.row for s in switches) + 1
+    col_sp, row_sp = _grid_spacing(rgb)
+    cell_depth = (
+        GRID_LED_OFFSET_Y_MM + 10.0 if rgb else GRID_DIODE_OFFSET_Y_MM
+    )
     width = (
         GRID_ORIGIN_X_MM
-        + (n_cols - 1) * GRID_COL_SPACING_MM
+        + (n_cols - 1) * col_sp
+        + (GRID_CAP_OFFSET_X_MM if rgb else 0.0)
         + GRID_PADDING_MM
     )
     height = (
         GRID_ORIGIN_Y_MM
-        + (n_rows - 1) * GRID_ROW_SPACING_MM
-        + GRID_DIODE_OFFSET_Y_MM
+        + (n_rows - 1) * row_sp
+        + cell_depth
         + GRID_PADDING_MM
     )
     return width, height
 
 
+def _grid_spacing(rgb: bool) -> tuple[float, float]:
+    if rgb:
+        return GRID_COL_SPACING_RGB_MM, GRID_ROW_SPACING_RGB_MM
+    return GRID_COL_SPACING_MM, GRID_ROW_SPACING_MM
+
+
 def _grid_targets(
-    switches: list[SwitchDef],
+    switches: list[SwitchDef], *, rgb: bool = False
 ) -> dict[str, tuple[float, float, float]]:
     """Target (x, y, rotation_deg) per placed-symbol reference.
 
@@ -418,13 +501,21 @@ def _grid_targets(
     row → diode → switch → col. Anchor X is offset by SW pin 2's local X
     (5.08 mm) so D.K lines up directly under SW pin 2; a single vertical
     wire connects them, and the row bus runs across all D.A pins below.
+    With RGB, the cell also holds the key's LED (below the diode) and its
+    decoupling cap (beside the LED).
     """
+    col_sp, row_sp = _grid_spacing(rgb)
     targets: dict[str, tuple[float, float, float]] = {}
     for sw in switches:
-        sx = GRID_ORIGIN_X_MM + sw.col * GRID_COL_SPACING_MM
-        sy = GRID_ORIGIN_Y_MM + sw.row * GRID_ROW_SPACING_MM
+        sx = GRID_ORIGIN_X_MM + sw.col * col_sp
+        sy = GRID_ORIGIN_Y_MM + sw.row * row_sp
         targets[f"SW{sw.id}"] = (sx, sy, 0.0)
         targets[f"D{sw.id}"] = (sx + 5.08, sy + GRID_DIODE_OFFSET_Y_MM, 90.0)
+        if rgb:
+            targets[f"LED{sw.id}"] = (sx, sy + GRID_LED_OFFSET_Y_MM, 0.0)
+            targets[f"C{sw.id}"] = (
+                sx + GRID_CAP_OFFSET_X_MM, sy + GRID_LED_OFFSET_Y_MM, 0.0
+            )
     targets[MCU_REF] = (GRID_HEADER_X_MM, _header_y(switches), 0.0)
     return targets
 

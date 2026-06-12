@@ -37,8 +37,12 @@ async function postBody(path: string, body: unknown): Promise<string> {
   return res.text()
 }
 
-export function generateNetlist(switches: SwitchDef[]): Promise<string> {
-  return postBody('/api/generate-netlist', { switches })
+export function generateNetlist(
+  switches: SwitchDef[],
+  rgb: boolean = false,
+): Promise<string> {
+  const params = new URLSearchParams({ rgb: String(rgb) })
+  return postBody(`/api/generate-netlist?${params}`, { switches })
 }
 
 export function generateSchematic(
@@ -46,11 +50,13 @@ export function generateSchematic(
   switchType: SwitchType = 'soldered',
   diodeType: DiodeType = 'tht',
   groundPour: boolean = true,
+  rgb: boolean = false,
 ): Promise<string> {
   const params = new URLSearchParams({
     switch_type: switchType,
     diode_type: diodeType,
     ground_pour: String(groundPour),
+    rgb: String(rgb),
   })
   return postBody(`/api/generate-schematic?${params}`, { switches })
 }
@@ -61,12 +67,14 @@ export function generatePcb(
   diodeType: DiodeType = 'tht',
   stabilizerType: StabilizerType = 'pcb_mount',
   groundPour: boolean = true,
+  rgb: boolean = false,
 ): Promise<string> {
   const params = new URLSearchParams({
     switch_type: switchType,
     diode_type: diodeType,
     stabilizer_type: stabilizerType,
     ground_pour: String(groundPour),
+    rgb: String(rgb),
   })
   return postBody(`/api/generate-pcb?${params}`, result)
 }
@@ -78,6 +86,7 @@ export async function generateProjectZip(
   diodeType: DiodeType,
   stabilizerType: StabilizerType = 'pcb_mount',
   groundPour: boolean = true,
+  rgb: boolean = false,
 ): Promise<Blob> {
   const params = new URLSearchParams({
     project_name: projectName,
@@ -85,6 +94,7 @@ export async function generateProjectZip(
     diode_type: diodeType,
     stabilizer_type: stabilizerType,
     ground_pour: String(groundPour),
+    rgb: String(rgb),
   })
   const res = await fetch(`/api/generate-project?${params}`, {
     method: 'POST',
@@ -162,6 +172,7 @@ export async function startRoutedProject(
   diodeType: DiodeType,
   stabilizerType: StabilizerType = 'pcb_mount',
   groundPour: boolean = true,
+  rgb: boolean = false,
 ): Promise<RouteJobStart> {
   const params = new URLSearchParams({
     project_name: projectName,
@@ -169,6 +180,7 @@ export async function startRoutedProject(
     diode_type: diodeType,
     stabilizer_type: stabilizerType,
     ground_pour: String(groundPour),
+    rgb: String(rgb),
   })
   const res = await fetch(`/api/generate-routed-project?${params}`, {
     method: 'POST',

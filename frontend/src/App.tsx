@@ -127,6 +127,7 @@ export function App() {
   const [diodeType, setDiodeType] = useState<DiodeType>('tht')
   const [stabilizerType, setStabilizerType] = useState<StabilizerType>('pcb_mount')
   const [groundPour, setGroundPour] = useState(true)
+  const [rgb, setRgb] = useState(false)
   const [inspectMode, setInspectMode] = useState<boolean>(false)
   const [editPlateMode, setEditPlateMode] = useState<boolean>(false)
   const [selectedOutlineNodeIdx, setSelectedOutlineNodeIdx] = useState<number | null>(null)
@@ -609,13 +610,13 @@ export function App() {
   }
 
   function downloadNetlist() {
-    return downloadFile('net', () => generateNetlist(result!.switches), 'net')
+    return downloadFile('net', () => generateNetlist(result!.switches, rgb), 'net')
   }
 
   function downloadSchematic() {
     return downloadFile(
       'sch',
-      () => generateSchematic(result!.switches, switchType, diodeType, groundPour),
+      () => generateSchematic(result!.switches, switchType, diodeType, groundPour, rgb),
       'kicad_sch',
     )
   }
@@ -623,7 +624,7 @@ export function App() {
   function downloadPcb() {
     return downloadFile(
       'pcb',
-      () => generatePcb(result!, switchType, diodeType, stabilizerType, groundPour),
+      () => generatePcb(result!, switchType, diodeType, stabilizerType, groundPour, rgb),
       'kicad_pcb',
     )
   }
@@ -649,6 +650,7 @@ export function App() {
         diodeType,
         stabilizerType,
         groundPour,
+        rgb,
       )
       const url = URL.createObjectURL(blob)
       const a = document.createElement('a')
@@ -687,7 +689,7 @@ export function App() {
     const baseName = file.name.replace(/\.svg$/i, '') || 'keyboard'
     try {
       const job = await startRoutedProject(
-        result, baseName, switchType, diodeType, stabilizerType, groundPour,
+        result, baseName, switchType, diodeType, stabilizerType, groundPour, rgb,
       )
       while (!token.cancelled) {
         await new Promise((r) => setTimeout(r, 500))
@@ -859,6 +861,23 @@ export function App() {
               className={!groundPour ? 'active' : ''}
               onClick={() => setGroundPour(false)}
               title="No ground plane — bare board with matrix traces only, MCU ground pins left unconnected."
+            >
+              Off
+            </button>
+          </div>
+          <div className="toolbar toolbar-strategy">
+            <span className="toolbar-label">RGB LEDs:</span>
+            <button
+              className={rgb ? 'active' : ''}
+              onClick={() => setRgb(true)}
+              title="Per-key SK6812 MINI-E reverse-mount RGB on the board's back, shining through a milled cutout under each switch (south-facing). DIN→DOUT daisy-chain from a free Pro Micro GPIO, 100nF cap per LED, power from RAW (USB 5V)."
+            >
+              On
+            </button>
+            <button
+              className={!rgb ? 'active' : ''}
+              onClick={() => setRgb(false)}
+              title="No per-key RGB."
             >
               Off
             </button>
