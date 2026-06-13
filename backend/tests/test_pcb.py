@@ -1030,6 +1030,52 @@ def test_rgb_chain_is_continuous_and_last_dout_open() -> None:
         assert pads["3"] == "GND"
 
 
+def test_rgb_chain_ignores_electrical_matrix() -> None:
+    """The daisy-chain order is purely geometric — re-gridding the matrix
+    (row/col) on the SAME physical layout must not change the chain. This is
+    the regression for matrix edits producing long DIN->DOUT hops."""
+    from app.services.pcb import rgb_chain_indices
+
+    sane = [
+        _sw(r * 3 + c + 1, 30.0 + c * 19.05, 30.0 + r * 19.05, row=r, col=c)
+        for r in range(2)
+        for c in range(3)
+    ]
+    # Same positions/ids, but the matrix is scrambled (all one row, reversed
+    # columns) the way a hand-edited grid might be.
+    scrambled = [
+        SwitchDef(id=s.id, cx_mm=s.cx_mm, cy_mm=s.cy_mm, row=0, col=99 - s.id)
+        for s in sane
+    ]
+    assert rgb_chain_indices(sane) == rgb_chain_indices(scrambled)
+
+
+def test_rgb_chain_crosses_split_gap_once() -> None:
+    """On a layout with two clusters separated by a wide void, the chain
+    should cross the gap exactly once — the worst hop equals that single
+    crossing, not several long hops from a tangled seed."""
+    import math
+    from app.services.pcb import rgb_chain_indices
+
+    # Two 3x2 clusters, a 60 mm void between their nearest columns.
+    sws = []
+    nid = 1
+    for base_x in (0.0, 60.0 + 2 * 19.05):
+        for r in range(3):
+            for c in range(2):
+                sws.append(_sw(nid, base_x + c * 19.05, r * 19.05, row=r, col=c))
+                nid += 1
+    chain = rgb_chain_indices(sws)
+    by_idx = sorted(sws, key=lambda s: chain[s.id])
+    hops = [
+        math.hypot(by_idx[k + 1].cx_mm - by_idx[k].cx_mm,
+                   by_idx[k + 1].cy_mm - by_idx[k].cy_mm)
+        for k in range(len(by_idx) - 1)
+    ]
+    long_hops = [h for h in hops if h > 40.0]
+    assert len(long_hops) == 1, f"expected one gap crossing, got {long_hops}"
+
+
 def test_rgb_mcu_pins() -> None:
     out = generate_pcb(_rgb_result(), rgb=True)
     mcu = re.search(r'\(footprint "keeb:Arduino_Pro_Micro".+?\n\t\)', out, re.DOTALL).group(0)

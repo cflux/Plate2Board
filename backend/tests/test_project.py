@@ -86,6 +86,45 @@ def test_unsafe_project_name_sanitised() -> None:
             assert ".." not in name
 
 
+def test_rgb_led_map_csv_present_and_matches_chain() -> None:
+    from app.services.pcb import rgb_chain_indices
+
+    sws = [_sw(r * 3 + c + 1, 30.0 + c * 19.05, 30.0 + r * 19.05, row=r, col=c)
+           for r in range(2) for c in range(3)]
+    w, h = 150.0, 150.0
+    parse = ParseResult(
+        svg_width_mm=w, svg_height_mm=h,
+        pcb_outline=PcbOutline(
+            width_mm=w, height_mm=h,
+            path_d=f"M 0 0 L {w} 0 L {w} {h} L 0 {h} Z",
+        ),
+        switches=sws, stabilizers=[], mounting_holes=[], unclassified=[],
+    )
+    blob = generate_project_zip(parse, project_name="kbd", rgb=True)
+    with zipfile.ZipFile(io.BytesIO(blob)) as zf:
+        assert "kbd/rgb-led-map.csv" in zf.namelist()
+        csv = zf.read("kbd/rgb-led-map.csv").decode()
+
+    rows = [ln for ln in csv.splitlines() if ln and not ln.startswith("#")]
+    assert rows[0] == "led_index,switch_ref,matrix_row,matrix_col,x_mm,y_mm"
+    data = [r.split(",") for r in rows[1:]]
+    # One row per switch, contiguous 0..n-1 led_index, order matches the chain.
+    assert len(data) == len(sws)
+    assert [int(r[0]) for r in data] == list(range(len(sws)))
+    chain = rgb_chain_indices(sws)
+    for r in data:
+        led_index = int(r[0])
+        sw_id = int(r[1].removeprefix("SW"))
+        assert chain[sw_id] == led_index
+
+
+def test_rgb_led_map_absent_without_rgb() -> None:
+    sws = [_sw(1, 30.0, 30.0, row=0, col=0)]
+    blob = generate_project_zip(_result(sws), project_name="kbd", rgb=False)
+    with zipfile.ZipFile(io.BytesIO(blob)) as zf:
+        assert "kbd/rgb-led-map.csv" not in zf.namelist()
+
+
 def test_kbplate_full_project_zip(example_plate_svg: str) -> None:
     parse = parse_plate_svg(example_plate_svg)
     blob = generate_project_zip(parse, project_name="kbplate")

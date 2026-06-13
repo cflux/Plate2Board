@@ -11,7 +11,13 @@ import zipfile
 
 from ..models.schemas import ParseResult
 from .embed_footprints import extract_kicad_mod_templates, fp_lib_table_text
-from .pcb import DiodeType, StabilizerType, SwitchType, generate_pcb
+from .pcb import (
+    DiodeType,
+    StabilizerType,
+    SwitchType,
+    generate_pcb,
+    rgb_chain_indices,
+)
 from .schematic import generate_schematic
 
 DEFAULT_PROJECT_NAME = "keyboard"
@@ -76,7 +82,35 @@ def generate_project_zip(
                 f"{project_name}/footprints.pretty/{bare_name}.kicad_mod",
                 mod_text,
             )
+        if rgb:
+            zf.writestr(
+                f"{project_name}/rgb-led-map.csv",
+                _rgb_led_map_csv(parse),
+            )
     return buf.getvalue()
+
+
+def _rgb_led_map_csv(parse: ParseResult) -> str:
+    """Map each physical key/LED to its position in the WS2812-style data
+    chain, for firmware (e.g. QMK `g_led_config`). `led_index` is the chain
+    position — RGB_DATA0 is the MCU's data-out to LED index 0, then each LED's
+    DOUT feeds the next. The chain order is purely geometric (see
+    `rgb_chain_indices`), so it does not follow the electrical matrix; this
+    file is how firmware recovers which physical key each LED index lights.
+    The LED footprint for switch `id` is `LED{id}`."""
+    chain = rgb_chain_indices(parse.switches)
+    by_id = {sw.id: sw for sw in parse.switches}
+    lines = [
+        "# rgb-led-map: physical key -> WS2812 chain (firmware LED) index.",
+        "# led_index is the position in the data chain (DIN order from the MCU).",
+        "led_index,switch_ref,matrix_row,matrix_col,x_mm,y_mm",
+    ]
+    for sw_id, idx in sorted(chain.items(), key=lambda kv: kv[1]):
+        sw = by_id[sw_id]
+        lines.append(
+            f"{idx},SW{sw_id},{sw.row},{sw.col},{sw.cx_mm:.3f},{sw.cy_mm:.3f}"
+        )
+    return "\n".join(lines) + "\n"
 
 
 def _extract_root_uuid(sch_text: str) -> str:

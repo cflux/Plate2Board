@@ -1293,22 +1293,34 @@ def _vcc_vias(switches: list[SwitchDef], nets: dict[str, int]) -> list[str]:
 def rgb_chain_indices(switches: list[SwitchDef]) -> dict[int, int]:
     """Switch id → 0-based position in the LED daisy-chain.
 
-    Hop length decides routability (plain row-major order produced a
-    58 mm hop across an Alice-layout split that freerouting could not
-    close), and firmware maps LED indices to coordinates anyway, so the
-    order is free to optimize. Start from a row serpentine (rows
-    top-to-bottom, alternating direction), then run a deterministic
-    2-opt pass to shorten the path — on a real Alice board this cut the
-    worst hop from 94 mm to 56 mm and the average from 25 to 20 mm.
-    Shared by the pcb/dsn/netlist/schematic generators.
+    The chain order is purely geometric — it must NOT depend on the
+    electrical key matrix (`sw.row`/`sw.col`). Firmware maps LED indices to
+    coordinates anyway (see the generated rgb-led-map.csv), and seeding from
+    the matrix meant a user re-gridding the matrix in review could tangle the
+    seed and leave 2-opt stuck in a bad local minimum with long DIN→DOUT hops
+    (e.g. an 84 mm hop on a real Alice board where a neighbour was adjacent).
+
+    Seed from a physical-Y band serpentine (sort by cy, group rows within
+    ROW_TOLERANCE_MM, alternate direction by cx) — the same banding
+    `matrix.py` uses — then run a deterministic, void-hop-penalized 2-opt to
+    shorten the path. On the real Alice board this reaches the optimal worst
+    hop (a single crossing of the genuine inter-cluster gap) regardless of how
+    the matrix is gridded. Shared by the pcb/dsn/netlist/schematic generators,
+    so it stays byte-identical across all four.
     """
-    by_row: dict[int, list[SwitchDef]] = {}
-    for sw in switches:
-        by_row.setdefault(sw.row, []).append(sw)
+    from .matrix import ROW_TOLERANCE_MM
+
+    by_cy = sorted(switches, key=lambda s: (s.cy_mm, s.cx_mm, s.id))
+    bands: list[list[SwitchDef]] = [[by_cy[0]]] if by_cy else []
+    for sw in by_cy[1:]:
+        if sw.cy_mm - bands[-1][-1].cy_mm <= ROW_TOLERANCE_MM:
+            bands[-1].append(sw)
+        else:
+            bands.append([sw])
     order: list[SwitchDef] = []
-    for i, row in enumerate(sorted(by_row)):
+    for i, band in enumerate(bands):
         order.extend(
-            sorted(by_row[row], key=lambda s: s.cx_mm, reverse=(i % 2 == 1))
+            sorted(band, key=lambda s: s.cx_mm, reverse=(i % 2 == 1))
         )
 
     def void_hop(a: SwitchDef, b: SwitchDef) -> bool:
