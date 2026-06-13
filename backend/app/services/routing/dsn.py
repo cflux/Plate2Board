@@ -600,16 +600,16 @@ def _stitching_via_keepouts(
 
 
 def _boundary_points(parse: ParseResult) -> list[tuple[float, float]]:
-    """Return the closed polygon of the board edge: edited outline if present
-    else parsed, then dilated by outline_grow_mm. Mirrors what pcb._edge_cuts
+    """Return the closed polygon of the PCB edge: edited outline if present
+    else parsed, then inset by outline_shrink_mm. Mirrors what pcb._edge_cuts
     emits so DSN and Edge.Cuts agree to the millimetre."""
     base_path = parse.edited_outline_path_d or parse.pcb_outline.path_d
     pts = _parse_path_points(base_path)
-    if parse.outline_grow_mm > 0 and len(pts) >= 3:
-        # Re-use the same Shapely buffer pcb._grow_polygon_points uses so
+    if parse.outline_shrink_mm > 0 and len(pts) >= 3:
+        # Re-use the same Shapely buffer pcb._shrink_outline_points uses so
         # the boundary tracks Edge.Cuts exactly.
-        from ..pcb import _grow_polygon_points  # local import avoids cycle
-        pts = _grow_polygon_points(pts, parse.outline_grow_mm)
+        from ..pcb import _shrink_outline_points  # local import avoids cycle
+        pts = _shrink_outline_points(pts, parse.outline_shrink_mm)
     return pts
 
 

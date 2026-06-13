@@ -2,8 +2,9 @@
 
 Output is laser-cut-ready: every feature is a black-stroked, fill-less
 outline so a typical CO2 / fiber cutter interprets each shape as a cut.
-The plate outline uses ``outline_grow_mm`` (Shapely mitered buffer) so
-the exported plate matches the PCB Edge.Cuts the generator emits.
+The plate outline is the raw parsed/edited outline — `outline_shrink_mm`
+applies to the PCB only (the plate IS the reference), so the exported
+plate is the mounting plate that the (equal-or-smaller) PCB sits under.
 """
 
 from __future__ import annotations
@@ -13,7 +14,7 @@ from ..models.schemas import (
     StabilizerDef,
     SwitchDef,
 )
-from .pcb import _grow_polygon_points, _parse_path_points
+from .pcb import _parse_path_points
 from .svg_parser import _polygon_to_path_d
 
 SWITCH_CUTOUT_MM = 14.0
@@ -22,22 +23,17 @@ STROKE_WIDTH_MM = 0.1
 
 
 def generate_plate_svg(parse: ParseResult) -> str:
-    """Emit a single-layer SVG with the (optionally grown) outline plus
-    every cutout. Coordinates stay in mm; the SVG viewBox matches the
-    grown outline bbox plus a small margin so the file is print-ready."""
-    # Use the user-edited polygon (if any) as the base shape; otherwise the
-    # parsed outline. Either way, `outline_grow_mm` dilates the result so
-    # the grow control keeps working after edits.
+    """Emit a single-layer SVG with the plate outline plus every cutout.
+    Coordinates stay in mm; the SVG viewBox matches the outline bbox plus
+    a small margin so the file is print-ready."""
+    # The plate is the user-edited polygon (if any), else the parsed
+    # outline — never offset. `outline_shrink_mm` shrinks the PCB only.
     base_path = parse.edited_outline_path_d or parse.pcb_outline.path_d
     outline_points = _parse_path_points(base_path)
     if not outline_points:
         # Fall back to a rectangle matching the SVG viewBox.
         w, h = parse.svg_width_mm, parse.svg_height_mm
         outline_points = [(0.0, 0.0), (w, 0.0), (w, h), (0.0, h), (0.0, 0.0)]
-    if parse.outline_grow_mm > 0:
-        outline_points = _grow_polygon_points(
-            outline_points, parse.outline_grow_mm
-        )
 
     xs = [p[0] for p in outline_points]
     ys = [p[1] for p in outline_points]
@@ -59,7 +55,7 @@ def generate_plate_svg(parse: ParseResult) -> str:
         f'  <g fill="none" stroke="black" stroke-width="{STROKE_WIDTH_MM}">'
     )
 
-    # Plate outline (grown if outline_grow_mm > 0).
+    # Plate outline.
     outline_d = _polygon_to_path_d(list(outline_points))
     parts.append(f'    <path d="{outline_d}" />')
 

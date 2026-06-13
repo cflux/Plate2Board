@@ -335,9 +335,9 @@ export function App() {
     })
   }
 
-  function setOutlineGrow(mm: number) {
+  function setOutlineShrink(mm: number) {
     if (!result) return
-    setResult({ ...result, outline_grow_mm: Math.max(0, mm) })
+    setResult({ ...result, outline_shrink_mm: Math.max(0, mm) })
   }
 
   // Pro Micro body dims + offsets (mm) — must match SvgPreview.tsx. The
@@ -431,7 +431,7 @@ export function App() {
     if (!result) return
     setEditPlateMode(true)
     if (result.edited_outline_path_d) return // already initialized
-    // Seed the editable polygon from the parsed outline only. `outline_grow_mm`
+    // Seed the editable polygon from the parsed outline only. `outline_shrink_mm`
     // is an independent dilation applied on top of the base outline by both
     // the backend and the SvgPreview overlay, so seeding the editable polygon
     // with the pre-grown shape would cause grow to be applied twice.
@@ -453,7 +453,7 @@ export function App() {
     if (!result) return
     setSelectedOutlineNodeIdx(null)
     // Re-seed the editable polygon from the parsed outline so node handles
-    // stay on screen for further editing. `outline_grow_mm` is layered on top
+    // stay on screen for further editing. `outline_shrink_mm` is layered on top
     // by the renderer / backend, so we deliberately don't bake it in here.
     const baseVerts = parseOutlineVerts(result.pcb_outline.path_d)
     setResult({ ...result, edited_outline_path_d: vertsToPathD(baseVerts) })
@@ -952,23 +952,23 @@ export function App() {
             </button>
           </div>
           <div className="toolbar toolbar-strategy">
-            <span className="toolbar-label">Outline grow:</span>
+            <span className="toolbar-label">PCB inset:</span>
             <label className="toolbar-input">
               <NumberInput
                 step={0.5}
                 min={0}
-                max={50}
+                max={10}
                 decimals={1}
-                value={result.outline_grow_mm}
-                onChange={(n) => setOutlineGrow(n)}
-                title="Dilate the PCB outline by N mm on all four sides. Useful when the plate SVG has zero clearance around the outermost cutouts and you need room for screw bosses or perimeter routing."
+                value={result.outline_shrink_mm}
+                onChange={(n) => setOutlineShrink(n)}
+                title="Shrink the PCB outline N mm inside the plate outline on all sides — most assemblies need the PCB the same size or smaller than the plate. The plate SVG export keeps the original outline. Generation fails if any pad ends up within 0.5 mm of the new PCB edge."
               />
               <span className="toolbar-unit">mm</span>
             </label>
             <button
               onClick={downloadPlateSvg}
               disabled={busyExport !== null}
-              title="Export a clean plate SVG with the (possibly grown) outline and all switch / stab / mounting-hole cutouts. Hairline-stroked, fill-less — ready for laser cutting."
+              title="Export a clean plate SVG with the plate outline (unaffected by PCB inset) and all switch / stab / mounting-hole cutouts. Hairline-stroked, fill-less — ready for laser cutting."
             >
               {busyExport === 'plate' ? 'Generating…' : 'Download plate SVG'}
             </button>
@@ -980,7 +980,7 @@ export function App() {
               onClick={() =>
                 editPlateMode ? exitEditPlateMode() : enterEditPlateMode()
               }
-              title="Edit the plate outline (drag, add, or delete vertices) and mounting holes. When growth was applied, the grown polygon becomes editable; the original parsed outline stays visible as a dashed reference."
+              title="Edit the plate outline (drag, add, or delete vertices) and mounting holes. The PCB inset is applied on top of whatever you draw here."
             >
               {editPlateMode ? 'Editing (exit)' : 'Edit plate'}
             </button>
@@ -996,7 +996,7 @@ export function App() {
                 {result.edited_outline_path_d && (
                   <button
                     onClick={resetEditedOutline}
-                    title="Discard outline edits and revert to the parsed outline (plus any outline_grow_mm)."
+                    title="Discard outline edits and revert to the parsed outline (the PCB inset still applies on top)."
                   >
                     Reset outline
                   </button>

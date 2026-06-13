@@ -29,7 +29,9 @@ def _result(
     stabilizers: list[StabilizerDef] | None = None,
     mounting_holes: list[MountingHoleDef] | None = None,
     width: float = 100.0,
-    height: float = 50.0,
+    # Tall default so the common `_sw(1, 50, 50)` fixture sits centered —
+    # the pad edge-setback validation rejects components on the outline.
+    height: float = 100.0,
 ) -> ParseResult:
     return ParseResult(
         svg_width_mm=width,
@@ -234,12 +236,12 @@ def test_plate_mount_stab_emits_footprint_keepout_zone() -> None:
 def test_stab_pairing_picks_nearest_switch() -> None:
     """Two switches; stab cutouts flank the second one. The assembly should
     anchor on switch 2, not switch 1."""
-    sws = [_sw(1, 0.0, 0.0), _sw(2, 100.0, 0.0)]
-    stabs = _stab_pair_for_switch(2, 100.0, 0.0, 11.938)
+    sws = [_sw(1, 20.0, 40.0), _sw(2, 80.0, 40.0)]
+    stabs = _stab_pair_for_switch(2, 80.0, 40.0, 11.938)
     out = generate_pcb(_result(switches=sws, stabilizers=stabs))
 
-    # PCB-mount footprint anchored at switch 2's stem (100, 0).
-    assert "(at 100.0000 0.0000 0.000)" in out
+    # PCB-mount footprint anchored at switch 2's stem (80, 40).
+    assert "(at 80.0000 40.0000 0.000)" in out
     # Exactly one stab assembly footprint (only switch 2 has stabs). Count
     # the opening `(footprint "..."` token, not the name's appearance inside
     # the Footprint property of common props.
@@ -276,7 +278,8 @@ def test_stab_pair_stays_together_when_row_is_sparse() -> None:
         ),
     ]
     out = generate_pcb(
-        _result(switches=row_above + [spacebar], stabilizers=stabs)
+        _result(switches=row_above + [spacebar], stabilizers=stabs,
+                width=250.0, height=120.0)
     )
 
     # Exactly one stab assembly footprint, anchored on the spacebar.
@@ -329,7 +332,9 @@ def test_stab_pairing_handles_rotated_switch() -> None:
             rotation_deg=rot_deg,
         ),
     ]
-    out = generate_pcb(_result(switches=[sw], stabilizers=stabs))
+    out = generate_pcb(
+        _result(switches=[sw], stabilizers=stabs, width=200.0, height=200.0)
+    )
 
     fps = re.findall(
         r'^\t\(footprint "keeb:Stabilizer_PCB_Mount"',
@@ -407,23 +412,24 @@ def test_mcu_placement_default_matches_legacy_position() -> None:
 def test_mcu_placement_override_carries_through() -> None:
     """User-supplied mcu_placement controls anchor and rotation. SVG-CW
     rotation (90°) emits as KiCad CCW negative (-90.000)."""
-    parse = _result(switches=[_sw(1, 50, 25)])
-    parse.mcu_placement = McuPlacement(cx_mm=20.0, cy_mm=10.0, rotation_deg=90.0)
+    parse = _result(switches=[_sw(1, 50, 60)])
+    # Rotated 90° the module spans x ≈ (cx − 27.94)..cx — keep it inboard.
+    parse.mcu_placement = McuPlacement(cx_mm=40.0, cy_mm=12.0, rotation_deg=90.0)
     out = generate_pcb(parse)
-    # Pro Micro footprint anchored at (20, 10) with KiCad angle -90 (SVG CW = KiCad CCW negative).
+    # Pro Micro footprint anchored at (40, 12) with KiCad angle -90 (SVG CW = KiCad CCW negative).
     assert re.search(
-        r'\(footprint "keeb:Arduino_Pro_Micro".*?\(at 20\.0000 10\.0000 -90\.000\)',
+        r'\(footprint "keeb:Arduino_Pro_Micro".*?\(at 40\.0000 12\.0000 -90\.000\)',
         out,
         re.DOTALL,
     )
 
 
-def test_outline_grow_dilates_edge_cuts() -> None:
-    """A 100 × 50 mm rectangular plate dilated by 5 mm should produce an
-    Edge.Cuts ring at (-5, -5)..(105, 55) — a 110 × 60 rectangle with
+def test_outline_shrink_insets_edge_cuts() -> None:
+    """A 100 × 50 mm plate with a 5 mm PCB inset should produce an
+    Edge.Cuts ring at (5, 5)..(95, 45) — a 90 × 40 rectangle with
     mitered corners (no arc segments)."""
     parse = _result(switches=[_sw(1, 50, 25)], width=100.0, height=50.0)
-    parse.outline_grow_mm = 5.0
+    parse.outline_shrink_mm = 5.0
     out = generate_pcb(parse)
     edge_lines = re.findall(
         r'gr_line \(start ([-+\d.]+) ([-+\d.]+)\) \(end ([-+\d.]+) ([-+\d.]+)\).+?Edge\.Cuts',
@@ -432,8 +438,8 @@ def test_outline_grow_dilates_edge_cuts() -> None:
     assert len(edge_lines) == 4, f"expected 4 mitered edges, got {len(edge_lines)}"
     xs = {round(float(c), 2) for seg in edge_lines for c in (seg[0], seg[2])}
     ys = {round(float(c), 2) for seg in edge_lines for c in (seg[1], seg[3])}
-    assert xs == {-5.0, 105.0}, f"x extremes wrong: {xs}"
-    assert ys == {-5.0, 55.0}, f"y extremes wrong: {ys}"
+    assert xs == {5.0, 95.0}, f"x extremes wrong: {xs}"
+    assert ys == {5.0, 45.0}, f"y extremes wrong: {ys}"
 
 
 def test_edited_outline_replaces_parsed_outline() -> None:
@@ -443,7 +449,7 @@ def test_edited_outline_replaces_parsed_outline() -> None:
     parse.edited_outline_path_d = (
         "M -1 -1 L 101 -1 L 101 51 L 60 51 L 60 40 L 40 40 L 40 51 L -1 51 Z"
     )
-    parse.outline_grow_mm = 0.0
+    parse.outline_shrink_mm = 0.0
     out = generate_pcb(parse)
     edges = re.findall(
         r'gr_line \(start ([-+\d.]+) ([-+\d.]+)\) \(end ([-+\d.]+) ([-+\d.]+)\)',
@@ -455,14 +461,15 @@ def test_edited_outline_replaces_parsed_outline() -> None:
     assert (40.0, 40.0) in coords
 
 
-def test_edited_outline_plus_grow_dilates_the_edited_polygon() -> None:
-    """outline_grow_mm should still work on top of an edited polygon —
-    dilating it rather than the parsed outline. Confirms grow is not
+def test_edited_outline_plus_shrink_insets_the_edited_polygon() -> None:
+    """outline_shrink_mm should still work on top of an edited polygon —
+    insetting it rather than the parsed outline. Confirms shrink is not
     silently ignored after edits."""
     parse = _result(switches=[_sw(1, 50, 25)], width=100.0, height=50.0)
-    # 80×40 mm rect centered in the parse's 100×50 viewport.
-    parse.edited_outline_path_d = "M 10 5 L 90 5 L 90 45 L 10 45 Z"
-    parse.outline_grow_mm = 3.0
+    # 100×50 mm rect slightly past the parse's viewport so the 3 mm inset
+    # keeps the lone switch's pads comfortably inside.
+    parse.edited_outline_path_d = "M -2 -2 L 102 -2 L 102 52 L -2 52 Z"
+    parse.outline_shrink_mm = 3.0
     out = generate_pcb(parse)
     edges = re.findall(
         r'gr_line \(start ([-+\d.]+) ([-+\d.]+)\) \(end ([-+\d.]+) ([-+\d.]+)\)',
@@ -470,18 +477,18 @@ def test_edited_outline_plus_grow_dilates_the_edited_polygon() -> None:
     )
     xs = {round(float(c), 1) for seg in edges for c in (seg[0], seg[2])}
     ys = {round(float(c), 1) for seg in edges for c in (seg[1], seg[3])}
-    # Edited rect (10..90 × 5..45) dilated 3 mm → (7..93 × 2..48).
-    assert xs == {7.0, 93.0}
-    assert ys == {2.0, 48.0}
+    # Edited rect (-2..102 × -2..52) inset 3 mm → (1..99 × 1..49).
+    assert xs == {1.0, 99.0}
+    assert ys == {1.0, 49.0}
 
 
-def test_outline_grow_zero_is_passthrough() -> None:
-    """outline_grow_mm == 0 must take the no-buffer path so generation
-    stays byte-identical to the pre-feature behavior (regression guard
-    against accidental Shapely round-trip)."""
+def test_outline_shrink_zero_is_passthrough() -> None:
+    """outline_shrink_mm == 0 must take the no-buffer path so generation
+    stays byte-identical (regression guard against an accidental Shapely
+    round-trip of the outline)."""
     parse_a = _result(switches=[_sw(1, 50, 25)])
     parse_b = _result(switches=[_sw(1, 50, 25)])
-    parse_b.outline_grow_mm = 0.0
+    parse_b.outline_shrink_mm = 0.0
     out_a = generate_pcb(parse_a)
     out_b = generate_pcb(parse_b)
     # Strip UUIDs (they're randomized per call) before comparing.
@@ -586,9 +593,9 @@ def test_pcb_emits_no_track_segments() -> None:
     ratsnest so Freerouting (or KiCad's interactive router) can handle it
     correctly. Verify no `(segment ...)` tracks ever appear in output."""
     sws = [
-        _sw(1, 0.0, 0.0, row=0, col=0),
-        _sw(2, 19.05, 0.0, row=0, col=1),
-        _sw(3, 0.0, 19.05, row=1, col=0),
+        _sw(1, 30.0, 30.0, row=0, col=0),
+        _sw(2, 49.05, 30.0, row=0, col=1),
+        _sw(3, 30.0, 49.05, row=1, col=0),
     ]
     for switch_type in ("soldered", "hotswap"):
         for diode_type in ("tht", "smd"):
@@ -624,12 +631,12 @@ def test_proper_footprint_includes_silkscreen_and_courtyard() -> None:
 
 def test_centering_shifts_switch_to_page_center_on_a4() -> None:
     """A 100×50 board with a switch at its top-left corner should land
-    centered on A4 (297×210, landscape). The switch at (0, 0) of the
-    parsed board should move by half the page minus half the board."""
-    sws = [_sw(1, 0.0, 0.0)]
+    centered on A4 (297×210, landscape): the board's bbox center maps
+    onto the page center."""
+    sws = [_sw(1, 50.0, 25.0)]
     out = _real_generate_pcb(_result(switches=sws, width=100.0, height=50.0))
-    # A4 (page center 148.5, 105) minus board half (50, 25) → switch lands at
-    # (98.5, 80) in page coords.
+    # The board's center maps onto the A4 page center (148.5, 105), so a
+    # switch at the board center lands exactly there.
     m = re.search(
         r'\(footprint "keeb:SW_Cherry_MX_PCB_1\.00u".*?'
         r'\(at ([-\d.]+) ([-\d.]+)',
@@ -637,15 +644,15 @@ def test_centering_shifts_switch_to_page_center_on_a4() -> None:
     )
     assert m is not None, "no soldered switch footprint found"
     x, y = float(m.group(1)), float(m.group(2))
-    assert abs(x - 98.5) < 0.01, f"expected switch x≈98.5, got {x}"
-    assert abs(y - 80.0) < 0.01, f"expected switch y≈80.0, got {y}"
+    assert abs(x - 148.5) < 0.01, f"expected switch x≈148.5, got {x}"
+    assert abs(y - 105.0) < 0.01, f"expected switch y≈105.0, got {y}"
 
 
 def test_centering_picks_a3_when_board_exceeds_a4() -> None:
     """A 300×200 board doesn't fit A4 (must clear 297×210 minus 2×20mm
     margin = 257×170) but fits A3 (380×257 inside its margin). Verify
     the paper token reflects that pick."""
-    sws = [_sw(1, 0, 0)]
+    sws = [_sw(1, 150, 100)]
     parse = _result(switches=sws, width=300.0, height=200.0)
     out = _real_generate_pcb(parse)
     assert '(paper "A3")' in out
@@ -1073,3 +1080,95 @@ def test_rgb_gpio_budget_enforced() -> None:
     generate_pcb(parse)  # fits without rgb
     with pytest.raises(ValueError, match="RGB"):
         generate_pcb(parse, rgb=True)
+
+
+# ---------------------------------------------------------------------------
+# Outline shrink degeneracy + pad edge-setback validation
+# ---------------------------------------------------------------------------
+
+from app.services.pcb import (  # noqa: E402
+    PAD_EDGE_SETBACK_MM,
+    validate_pad_setback,
+)
+
+
+def test_shrink_that_removes_outline_raises() -> None:
+    parse = _result(switches=[_sw(1, 50, 50)])
+    parse.outline_shrink_mm = 60.0  # 100×100 board — 60 mm eats it all
+    with pytest.raises(ValueError, match="removes the entire PCB outline"):
+        generate_pcb(parse)
+
+
+def test_shrink_that_splits_outline_raises() -> None:
+    # Dumbbell: two 40-wide lobes joined by a 4 mm-tall neck. A 3 mm
+    # shrink severs the neck into two islands.
+    parse = _result(switches=[_sw(1, 20, 20), _sw(2, 80, 20, col=1)],
+                    width=100.0, height=40.0)
+    parse.edited_outline_path_d = (
+        "M 0 0 L 40 0 L 40 18 L 60 18 L 60 0 L 100 0 "
+        "L 100 40 L 60 40 L 60 22 L 40 22 L 40 40 L 0 40 Z"
+    )
+    parse.outline_shrink_mm = 3.0
+    with pytest.raises(ValueError, match="splits the PCB outline"):
+        generate_pcb(parse)
+
+
+def test_pad_setback_rejects_pad_near_edge() -> None:
+    """Shrinking until a switch pad sits closer than 0.5 mm to the PCB
+    edge must fail with the offending ref named."""
+    # Switch at (50, 11): soldered pad 2 at (52.54, 5.92), r 1.25 — bottom
+    # pad copper edge is 4.67 mm from y=0. A 4 mm shrink leaves 0.67 - ok;
+    # 4.5 leaves 0.17 — violation.
+    parse = _result(switches=[_sw(1, 50, 11)], width=100.0, height=100.0)
+    parse.outline_shrink_mm = 4.5
+    with pytest.raises(ValueError, match="SW1"):
+        generate_pcb(parse)
+    parse.outline_shrink_mm = 3.0
+    generate_pcb(parse)  # comfortably clear — no raise
+
+
+def test_pad_setback_rejects_mcu_on_edge_at_zero_shrink() -> None:
+    """The setback check runs even without any shrink — an MCU dragged
+    onto the plate edge fails with a clear message."""
+    parse = _result(switches=[_sw(1, 50, 50)])
+    parse.mcu_placement = McuPlacement(cx_mm=-2.0, cy_mm=30.0, rotation_deg=0.0)
+    with pytest.raises(ValueError, match="U1"):
+        generate_pcb(parse)
+
+
+def test_validate_pad_setback_reports_distances() -> None:
+    boundary = [(0.0, 0.0), (100.0, 0.0), (100.0, 100.0), (0.0, 100.0)]
+    sw = _sw(1, 50, 50)
+    ok = validate_pad_setback(
+        [sw], [], [], None, boundary,
+        switch_type="soldered", diode_type="tht", stabilizer_type="pcb_mount",
+    )
+    assert ok == []
+    # Same switch against a boundary whose edge passes right next to it.
+    tight = [(0.0, 0.0), (52.0, 0.0), (52.0, 100.0), (0.0, 100.0)]
+    bad = validate_pad_setback(
+        [sw], [], [], None, tight,
+        switch_type="soldered", diode_type="tht", stabilizer_type="pcb_mount",
+    )
+    assert bad and any("SW1" in v or "D1" in v for v in bad)
+
+
+def test_shrink_applies_to_zones_vias_and_dsn_boundary() -> None:
+    from app.services.routing.dsn import _boundary_points
+
+    parse = _result(switches=[_sw(1, 50, 50)])
+    parse.outline_shrink_mm = 5.0
+    # DSN boundary = outline inset by 5.
+    pts = _boundary_points(parse)
+    xs = {round(x, 1) for x, _y in pts}
+    ys = {round(y, 1) for _x, y in pts}
+    assert xs == {5.0, 95.0} and ys == {5.0, 95.0}
+    # GND zone polygon insets a further 0.3 from the shrunk outline.
+    out = generate_pcb(parse)
+    zone = re.search(r'\(zone\n.*?\n\t\)', out, re.DOTALL).group(0)
+    zxs = [float(m) for m in re.findall(r"\(xy ([-\d.]+)", zone)]
+    assert min(zxs) >= 5.3 - 1e-6 and max(zxs) <= 94.7 + 1e-6
+    # Stitching vias stay inside the shrunk outline.
+    for m in re.finditer(r"\(via \(at ([-\d.]+) ([-\d.]+)\) \(size 0\.6000\)", out):
+        x, y = float(m.group(1)), float(m.group(2))
+        assert 5.0 < x < 95.0 and 5.0 < y < 95.0

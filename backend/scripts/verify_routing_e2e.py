@@ -109,6 +109,9 @@ def build_parse() -> ParseResult:
         ],
         unclassified=[],
         mcu_placement=McuPlacement(cx_mm=100.0, cy_mm=6.0, rotation_deg=0.0),
+        # Exercise the PCB inset end-to-end: Edge.Cuts, DSN boundary,
+        # fences, zones, and stitching vias all follow the shrunk outline.
+        outline_shrink_mm=1.0,
     )
 
 

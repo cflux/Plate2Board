@@ -16,7 +16,7 @@ def _result(
     switches: list[SwitchDef] | None = None,
     stabilizers: list[StabilizerDef] | None = None,
     mounting_holes: list[MountingHoleDef] | None = None,
-    outline_grow_mm: float = 0.0,
+    outline_shrink_mm: float = 0.0,
     width: float = 100.0,
     height: float = 50.0,
 ) -> ParseResult:
@@ -32,7 +32,7 @@ def _result(
         stabilizers=stabilizers or [],
         mounting_holes=mounting_holes or [],
         unclassified=[],
-        outline_grow_mm=outline_grow_mm,
+        outline_shrink_mm=outline_shrink_mm,
         mcu_placement=McuPlacement(cx_mm=0, cy_mm=0, rotation_deg=0.0),
     )
 
@@ -55,23 +55,14 @@ def test_generate_plate_svg_emits_well_formed_svg() -> None:
     )
 
 
-def test_generate_plate_svg_with_grow_dilates_outline() -> None:
-    """With outline_grow_mm > 0 the plate border uses the offset polygon
-    (rectangular case: bbox + grow on each side, mitered corners)."""
-    out = generate_plate_svg(
-        _result(switches=[_sw(1, 50, 25)], outline_grow_mm=5.0)
+def test_generate_plate_svg_ignores_shrink() -> None:
+    """The plate IS the reference outline: `outline_shrink_mm` insets the
+    PCB only, so the plate export must be identical with or without it."""
+    plain = generate_plate_svg(_result(switches=[_sw(1, 50, 25)]))
+    shrunk = generate_plate_svg(
+        _result(switches=[_sw(1, 50, 25)], outline_shrink_mm=5.0)
     )
-    # ViewBox bounds include the grown outline (-5..105, -5..55) plus the
-    # 2 mm SVG margin — so xmin should be ≤ -7.
-    m = re.search(r'viewBox="([-\d.]+) ([-\d.]+)', out)
-    assert m
-    vb_xmin = float(m.group(1))
-    vb_ymin = float(m.group(2))
-    assert vb_xmin <= -7.0 + 0.01
-    assert vb_ymin <= -7.0 + 0.01
-    # Outline path contains a vertex at (-5, -5) (top-left corner of grown
-    # rect, mitered).
-    assert re.search(r'M\s*-5\.0000\s+-5\.0000', out)
+    assert plain == shrunk
 
 
 def test_generate_plate_svg_no_grow_matches_original_bounds() -> None:
@@ -83,22 +74,22 @@ def test_generate_plate_svg_no_grow_matches_original_bounds() -> None:
     assert abs(float(m.group(2)) + 2.0) < 0.01
 
 
-def test_edited_outline_with_zero_grow_uses_edited_polygon() -> None:
-    parse = _result(switches=[_sw(1, 50, 25)], outline_grow_mm=0.0)
+def test_edited_outline_with_zero_shrink_uses_edited_polygon() -> None:
+    parse = _result(switches=[_sw(1, 50, 25)], outline_shrink_mm=0.0)
     parse.edited_outline_path_d = "M 5 5 L 95 5 L 95 45 L 5 45 Z"
     out = generate_plate_svg(parse)
     # Outline path starts with the edited polygon's first point.
     assert re.search(r'<path d="M\s+5\.0000\s+5\.0000', out)
 
 
-def test_edited_outline_plus_grow_dilates_the_edited_polygon() -> None:
-    """outline_grow_mm dilates the edited polygon — confirms grow keeps
-    working after edits instead of being silently ignored."""
-    parse = _result(switches=[_sw(1, 50, 25)], outline_grow_mm=4.0)
+def test_edited_outline_plate_ignores_shrink() -> None:
+    """Shrink never touches the plate export, even with an edited outline:
+    the plate path keeps the edited polygon verbatim."""
+    parse = _result(switches=[_sw(1, 50, 25)], outline_shrink_mm=4.0)
     parse.edited_outline_path_d = "M 10 10 L 90 10 L 90 40 L 10 40 Z"
     out = generate_plate_svg(parse)
-    # Outline path's first vertex is the grown bottom-left at (6, 6).
-    assert re.search(r'<path d="M\s+6\.0000\s+6\.0000', out)
+    # Outline path's first vertex is the edited polygon's own (10, 10).
+    assert re.search(r'<path d="M\s+10\.0000\s+10\.0000', out)
 
 
 def test_unit_override_rescales(example_plate_svg: str) -> None:
@@ -112,13 +103,15 @@ def test_unit_override_rescales(example_plate_svg: str) -> None:
 
 
 def test_generate_plate_svg_kbplate_round_trip(example_plate_svg: str) -> None:
-    """End-to-end on the real kbplate fixture, with growth of 6 mm."""
+    """End-to-end on the real kbplate fixture — the PCB inset must not
+    leak into the plate export."""
     parse = parse_plate_svg(example_plate_svg)
-    parse.outline_grow_mm = 6.0
+    parse.outline_shrink_mm = 2.0
     out = generate_plate_svg(parse)
 
     # Every switch ends up with a cutout rect — count them.
     n_sw_rects = len(re.findall(r'<rect [^>]*width="14(?:\.0+)?"', out))
     assert n_sw_rects == len(parse.switches)
-    # Outline includes (-6, -6) corner from the mitered grow.
-    assert re.search(r'-6\.0000\s+-6\.0000', out)
+    # Identical to the un-shrunk export.
+    parse.outline_shrink_mm = 0.0
+    assert out == generate_plate_svg(parse)

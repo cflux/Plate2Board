@@ -116,14 +116,19 @@ async def post_generate_pcb(
                 f"got {stabilizer_type!r}"
             ),
         )
-    text = generate_pcb(
-        req,
-        switch_type=switch_type,
-        diode_type=diode_type,
-        stabilizer_type=stabilizer_type,
-        ground_pour=ground_pour,
-        rgb=rgb,
-    )
+    try:
+        text = generate_pcb(
+            req,
+            switch_type=switch_type,
+            diode_type=diode_type,
+            stabilizer_type=stabilizer_type,
+            ground_pour=ground_pour,
+            rgb=rgb,
+        )
+    except ValueError as exc:
+        # Board-level validation (pad edge setback, degenerate shrink,
+        # GPIO budget) — user-fixable, so 400 with the explanation.
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     return PlainTextResponse(
         content=text,
         headers={
@@ -134,8 +139,9 @@ async def post_generate_pcb(
 
 @router.post("/generate-plate-svg", response_class=PlainTextResponse)
 async def post_generate_plate_svg(req: ParseResult) -> PlainTextResponse:
-    """Emit a clean plate SVG from the parsed result, using the grown
-    outline polygon as the plate border when `outline_grow_mm > 0`."""
+    """Emit a clean plate SVG from the parsed result. The plate is the
+    raw (edited or parsed) outline — `outline_shrink_mm` applies to the
+    PCB only, never the plate export."""
     if not req.switches:
         raise HTTPException(
             status_code=400, detail="cannot generate plate SVG from zero switches"
@@ -198,6 +204,8 @@ async def post_generate_project(
             ground_pour=ground_pour,
             rgb=rgb,
         )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(
             status_code=500, detail=f"project generation failed: {exc}"
@@ -260,6 +268,20 @@ async def post_generate_routed_project(
     once `state == "done"` to download the routed ZIP.
     """
     _validate_project_args(req, switch_type, diode_type, stabilizer_type)
+    # Pre-flight: run the full board validation (pad edge setback, shrink
+    # degeneracy, GPIO budget) before spinning up a job, so the user gets
+    # an instant 400 instead of a failed job.
+    try:
+        generate_pcb(
+            req,
+            switch_type=switch_type,
+            diode_type=diode_type,
+            stabilizer_type=stabilizer_type,
+            ground_pour=ground_pour,
+            rgb=rgb,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     job_id = str(uuid.uuid4())
     await routing_jobs.STORE.create(job_id)
     asyncio.create_task(

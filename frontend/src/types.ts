@@ -63,7 +63,8 @@ export interface ParseResult {
   mounting_holes: MountingHoleDef[]
   unclassified: UnclassifiedShape[]
   mcu_placement: McuPlacement | null
-  outline_grow_mm: number
+  // PCB inset: the outline is the plate; the PCB edge pulls IN by this.
+  outline_shrink_mm: number
   matrix_strategy: MatrixStrategy
   edited_outline_path_d: string | null
   detected_svg_unit: string

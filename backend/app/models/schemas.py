@@ -56,11 +56,14 @@ class ParseResult(BaseModel):
     mounting_holes: list[MountingHoleDef] = []
     unclassified: list[UnclassifiedShape]
     mcu_placement: McuPlacement | None = None
-    outline_grow_mm: float = 0.0
+    # PCB inset: the outline is the keyboard PLATE; the PCB edge is pulled
+    # IN by this much on every side (assemblies need the PCB ≤ the plate,
+    # never larger). The plate SVG export always keeps the raw outline.
+    outline_shrink_mm: float = 0.0
     matrix_strategy: str = "row_first"
     # User-edited outline polygon (set when the user is in edit-plate mode).
-    # When non-null, every generator uses this verbatim instead of applying
-    # `outline_grow_mm` to `pcb_outline.path_d`.
+    # When non-null, every generator uses this as the plate outline instead
+    # of `pcb_outline.path_d`; `outline_shrink_mm` still applies on top.
     edited_outline_path_d: str | None = None
     # Unit info — the parser detects the SVG's unit (mm / cm / in / pt / pc /
     # px-inferred via switch-cutout heuristic) and reports it for the UI.

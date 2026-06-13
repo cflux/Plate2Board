@@ -69,13 +69,13 @@ SWITCH_TYPES: tuple[SwitchType, ...] = ("soldered", "hotswap")
 
 
 def _outline_bbox_mm(parse: ParseResult) -> tuple[float, float, float, float]:
-    """Return ``(xmin, ymin, xmax, ymax)`` of the effective board outline:
-    edited polygon if present (else parsed), grown by ``outline_grow_mm``.
+    """Return ``(xmin, ymin, xmax, ymax)`` of the effective PCB outline:
+    edited polygon if present (else parsed), inset by ``outline_shrink_mm``.
     Falls back to the SVG width/height when the path has too few points."""
     base = parse.edited_outline_path_d or parse.pcb_outline.path_d
     pts = _parse_path_points(base)
-    if parse.outline_grow_mm > 0 and len(pts) >= 3:
-        pts = _grow_polygon_points(pts, parse.outline_grow_mm)
+    if parse.outline_shrink_mm > 0 and len(pts) >= 3:
+        pts = _shrink_outline_points(pts, parse.outline_shrink_mm)
     if len(pts) < 2:
         return (0.0, 0.0, parse.svg_width_mm, parse.svg_height_mm)
     xs = [p[0] for p in pts]
@@ -233,6 +233,34 @@ def generate_pcb(
             f"only has {len(PRO_MICRO_GPIO_PINS)} available"
         )
 
+    # Every pad must keep PAD_EDGE_SETBACK_MM of copper-to-edge clearance
+    # on the final (shrunk) PCB outline — catches both an over-aggressive
+    # PCB inset and components dragged onto the plate edge.
+    if switches:
+        v_outline = parse.edited_outline_path_d or parse.pcb_outline.path_d
+        v_boundary = _parse_path_points(v_outline)
+        if parse.outline_shrink_mm > 0 and len(v_boundary) >= 3:
+            v_boundary = _shrink_outline_points(
+                v_boundary, parse.outline_shrink_mm
+            )
+        violations = validate_pad_setback(
+            switches,
+            list(parse.stabilizers),
+            list(parse.mounting_holes),
+            parse.mcu_placement,
+            v_boundary,
+            switch_type=switch_type,
+            diode_type=diode_type,
+            stabilizer_type=stabilizer_type,
+            rgb=rgb,
+        )
+        if violations:
+            shown = "; ".join(violations[:5])
+            more = (
+                f" (+{len(violations) - 5} more)" if len(violations) > 5 else ""
+            )
+            raise ValueError(f"components too close to the PCB edge: {shown}{more}")
+
     out: list[str] = []
     out.append("(kicad_pcb")
     out.append(f"\t(version {KICAD_PCB_VERSION})")
@@ -298,10 +326,10 @@ def generate_pcb(
         out.append(_mounting_hole_footprint(hole))
 
     # User-edited outline (from edit-plate mode) replaces the parsed
-    # outline as the base shape; `outline_grow_mm` still dilates whichever
-    # base is in use, so the grow slider keeps working after edits.
+    # outline as the plate shape; `outline_shrink_mm` still insets whichever
+    # base is in use, so the PCB-inset control keeps working after edits.
     base_outline = parse.edited_outline_path_d or parse.pcb_outline.path_d
-    out.extend(_edge_cuts(base_outline, parse.outline_grow_mm))
+    out.extend(_edge_cuts(base_outline, parse.outline_shrink_mm))
 
     if ground_pour and switches:
         out.extend(
@@ -317,7 +345,7 @@ def generate_pcb(
             )
         )
         out.extend(
-            _gnd_zones(base_outline, parse.outline_grow_mm, nets[GND_NET_NAME])
+            _gnd_zones(base_outline, parse.outline_shrink_mm, nets[GND_NET_NAME])
         )
 
     out.append(")")
@@ -1060,8 +1088,8 @@ def _gnd_stitching_vias(
     """Emit `(via …)` tokens for every stitching position (format matches
     the routed-trace vias `ses._render_via` splices in)."""
     boundary = _parse_path_points(base_outline)
-    if parse.outline_grow_mm > 0 and len(boundary) >= 3:
-        boundary = _grow_polygon_points(boundary, parse.outline_grow_mm)
+    if parse.outline_shrink_mm > 0 and len(boundary) >= 3:
+        boundary = _shrink_outline_points(boundary, parse.outline_shrink_mm)
     positions = compute_stitching_vias(
         switches,
         list(parse.stabilizers),
@@ -1083,9 +1111,9 @@ def _gnd_stitching_vias(
 
 
 def _zone_polygon_rings(
-    path_d: str, grow_mm: float
+    path_d: str, shrink_mm: float
 ) -> list[list[tuple[float, float]]]:
-    """Outline → zone polygon ring(s): parse + grow exactly like
+    """Outline → zone polygon ring(s): parse + shrink exactly like
     `_edge_cuts`, then pull in by `ZONE_EDGE_INSET_MM`. A negative buffer
     on a concave outline can split the board into several pieces (or
     vanish on tiny boards) — emit one ring per piece, falling back to the
@@ -1095,8 +1123,8 @@ def _zone_polygon_rings(
     pts = _parse_path_points(path_d)
     if len(pts) < 3:
         return []
-    if grow_mm > 0:
-        pts = _grow_polygon_points(pts, grow_mm)
+    if shrink_mm > 0:
+        pts = _shrink_outline_points(pts, shrink_mm)
     ring = pts[:-1] if pts[0] == pts[-1] else list(pts)
     poly = Polygon(ring)
     if not poly.is_valid:
@@ -1114,14 +1142,14 @@ def _zone_polygon_rings(
     ] or [ring]
 
 
-def _gnd_zones(path_d: str, grow_mm: float, gnd_code: int) -> list[str]:
+def _gnd_zones(path_d: str, shrink_mm: float, gnd_code: int) -> list[str]:
     """One unfilled GND pour per copper layer (per outline piece). The
     fill itself is left to KiCad (press B after opening) — computing
     thermal spokes / clearance carving server-side isn't realistic, and a
     stale fill is worse than none. Thermal-relief pad connection so THT
     pads stay hand-solderable."""
     out: list[str] = []
-    for ring in _zone_polygon_rings(path_d, grow_mm):
+    for ring in _zone_polygon_rings(path_d, shrink_mm):
         pts = "".join(f"\t\t\t\t(xy {x:.4f} {y:.4f})\n" for x, y in ring)
         for layer in ("F.Cu", "B.Cu"):
             out.append(
@@ -1375,6 +1403,103 @@ def _rgb_obstacles(
             key = VCC_NET_NAME if num == "1" else GND_NET_NAME
             pads.append((px, py, _RGB_CAP_PAD_R, key))
     return npths, pads
+
+
+# ---------------------------------------------------------------------------
+# Pad edge-setback validation
+# ---------------------------------------------------------------------------
+
+# Minimum distance from any pad's copper edge to the PCB edge. Applied on
+# the shrunk outline, and also at shrink 0 (catches e.g. an MCU dragged to
+# the plate edge).
+PAD_EDGE_SETBACK_MM = 0.5
+
+
+def validate_pad_setback(
+    switches: list[SwitchDef],
+    stabilizers: list[StabilizerDef],
+    mounting_holes: list[MountingHoleDef],
+    mcu_placement: McuPlacement | None,
+    boundary_points: list[tuple[float, float]],
+    *,
+    switch_type: SwitchType,
+    diode_type: DiodeType,
+    stabilizer_type: StabilizerType,
+    rgb: bool = False,
+) -> list[str]:
+    """Return human-readable violations for every pad whose copper sits
+    outside the PCB outline or closer than `PAD_EDGE_SETBACK_MM` to its
+    edge. `boundary_points` is the FINAL PCB outline (post-shrink)."""
+    from shapely.geometry import Point, Polygon
+
+    ring = list(boundary_points)
+    if ring and ring[0] == ring[-1]:
+        ring = ring[:-1]
+    if len(ring) < 3:
+        return []
+    poly = Polygon(ring)
+    if not poly.is_valid:
+        poly = poly.buffer(0)
+    if poly.is_empty:
+        return ["PCB outline is empty"]
+
+    pads: list[tuple[str, float, float, float]] = []  # (label, x, y, r)
+    for sw in switches:
+        for lx, ly, r, _role in _SWITCH_PAD_LOCAL[switch_type]:
+            x, y = _rotate_local_to_world(lx, ly, sw)
+            pads.append((f"SW{sw.id}", x, y, r))
+    placements = resolve_diode_placements(
+        switches, stabilizers, mounting_holes, mcu_placement,
+        switch_type=switch_type, diode_type=diode_type,
+        stabilizer_type=stabilizer_type, rgb=rgb,
+    )
+    d_r = _DIODE_PAD_RADIUS[diode_type]
+    for sw in switches:
+        p = placements[sw.id]
+        for x, y, _key in _diode_pads_world(
+            p.cx_mm, p.cy_mm, p.svg_rotation_deg, sw, diode_type
+        ):
+            pads.append((f"D{sw.id}", x, y, d_r))
+    if mcu_placement is not None:
+        rot = math.radians(mcu_placement.rotation_deg)
+        cos_r, sin_r = math.cos(rot), math.sin(rot)
+        for pin in range(1, 25):
+            if pin <= 12:
+                lx, ly = 0.0, (pin - 1) * 2.54
+            else:
+                lx, ly = 17.78, (24 - pin) * 2.54
+            x = mcu_placement.cx_mm + lx * cos_r - ly * sin_r
+            y = mcu_placement.cy_mm + lx * sin_r + ly * cos_r
+            pads.append((f"{MCU_REF} pin {pin}", x, y, 0.85))
+    if rgb:
+        for sw in switches:
+            ax, ay, lrot = _rgb_led_anchor(sw)
+            for num, (lx, ly) in RGB_LED_PAD_LOCAL.items():
+                x, y = _rgb_pad_world(ax, ay, lrot, lx, ly)
+                pads.append((f"LED{sw.id}", x, y, _RGB_LED_PAD_R))
+            bx, by, brot = _rgb_cap_anchor(sw)
+            for num, (lx, ly) in RGB_CAP_PAD_LOCAL.items():
+                x, y = _rgb_pad_world(bx, by, brot, lx, ly)
+                pads.append((f"C{sw.id}", x, y, _RGB_CAP_PAD_R))
+
+    violations: list[str] = []
+    seen_labels: set[str] = set()
+    for label, x, y, r in pads:
+        if label in seen_labels:
+            continue
+        pt = Point(x, y)
+        if not poly.contains(pt):
+            violations.append(f"{label} has a pad outside the PCB outline")
+            seen_labels.add(label)
+            continue
+        gap = poly.exterior.distance(pt) - r
+        if gap < PAD_EDGE_SETBACK_MM - 1e-6:
+            violations.append(
+                f"{label} pad is {max(gap, 0):.2f} mm from the PCB edge "
+                f"(min {PAD_EDGE_SETBACK_MM} mm)"
+            )
+            seen_labels.add(label)
+    return violations
 
 
 def _diode_footprint(
@@ -1954,15 +2079,15 @@ def _mounting_hole_footprint(hole: MountingHoleDef) -> str:
 _PATH_TOKEN = re.compile(r"([MLZ])\s*([-\d.]+)?\s*([-\d.]+)?", re.IGNORECASE)
 
 
-def _edge_cuts(path_d: str, grow_mm: float = 0.0) -> list[str]:
-    """Emit Edge.Cuts gr_line segments from the outline path. When
-    `grow_mm > 0`, Minkowski-dilate the polygon via Shapely's mitered
-    buffer so a rectangular plate stays rectangular."""
+def _edge_cuts(path_d: str, shrink_mm: float = 0.0) -> list[str]:
+    """Emit Edge.Cuts gr_line segments from the PCB outline: the plate
+    outline pulled in by `shrink_mm` (mitered, so a rectangular plate
+    stays rectangular)."""
     points = _parse_path_points(path_d)
     if len(points) < 2:
         return []
-    if grow_mm > 0:
-        points = _grow_polygon_points(points, grow_mm)
+    if shrink_mm > 0:
+        points = _shrink_outline_points(points, shrink_mm)
         if len(points) < 2:
             return []
     lines: list[str] = []
@@ -1993,6 +2118,38 @@ def _grow_polygon_points(
         poly = poly.buffer(0)
     grown = poly.buffer(grow_mm, join_style=2)  # mitered corners
     exterior = list(grown.exterior.coords)
+    return [(round(x, 4), round(y, 4)) for x, y in exterior]
+
+
+def _shrink_outline_points(
+    points: list[tuple[float, float]], shrink_mm: float
+) -> list[tuple[float, float]]:
+    """Pull the plate outline IN by `shrink_mm` to get the PCB edge.
+
+    Degenerate shrinks fail loudly instead of producing a broken board:
+    a shrink that consumes the whole outline, or splits a concave outline
+    into separate islands, raises ValueError with a user-facing message.
+    """
+    from shapely.geometry import Polygon
+
+    ring = points[:-1] if points[0] == points[-1] else points
+    if len(ring) < 3:
+        return points
+    poly = Polygon(ring)
+    if not poly.is_valid:
+        poly = poly.buffer(0)
+    shrunk = poly.buffer(-shrink_mm, join_style=2)
+    if shrunk.is_empty or shrunk.area < 1e-6:
+        raise ValueError(
+            f"outline shrink of {shrink_mm:g} mm removes the entire PCB "
+            f"outline — reduce the PCB inset"
+        )
+    if shrunk.geom_type == "MultiPolygon":
+        raise ValueError(
+            f"outline shrink of {shrink_mm:g} mm splits the PCB outline "
+            f"into {len(shrunk.geoms)} pieces — reduce the PCB inset"
+        )
+    exterior = list(shrunk.exterior.coords)
     return [(round(x, 4), round(y, 4)) for x, y in exterior]
 
 

@@ -194,7 +194,8 @@ function offsetPolygon(
     const dxFromOrig = nvx - verts[i].x
     const dyFromOrig = nvy - verts[i].y
     const dist = Math.hypot(dxFromOrig, dyFromOrig)
-    if (dist > miterLimit * growMm) {
+    // abs(): growMm may be negative (PCB inset) — the limit is a length.
+    if (dist > miterLimit * Math.abs(growMm)) {
       out.push({ x: e1.px, y: e1.py })
       out.push({ x: e2.px, y: e2.py })
     } else {
@@ -302,22 +303,17 @@ export function SvgPreview({
 
   const { svg_width_mm: w, svg_height_mm: h } = result
   // Plate-anchored viewBox: derived solely from the plate bbox + a fixed
-  // margin and any outline_grow_mm / user-edited outline vertices. The MCU
-  // and mounting holes are deliberately *excluded* — dragging them never
-  // shifts the canvas. Placing them outside the plate is an invalid
-  // layout anyway; if they end up clipped, drag them back in.
+  // margin and any user-edited outline vertices. The PCB inset shrinks
+  // INWARD, so it never needs extra canvas. The MCU and mounting holes
+  // are deliberately *excluded* — dragging them never shifts the canvas.
+  // Placing them outside the plate is an invalid layout anyway; if they
+  // end up clipped, drag them back in.
   const VIEW_MARGIN_MM = 2.0
   const padded = useMemo(() => {
     let xmin = -VIEW_MARGIN_MM
     let ymin = -VIEW_MARGIN_MM
     let xmax = w + VIEW_MARGIN_MM
     let ymax = h + VIEW_MARGIN_MM
-    if (result.outline_grow_mm > 0) {
-      xmin = Math.min(xmin, -result.outline_grow_mm - VIEW_MARGIN_MM)
-      ymin = Math.min(ymin, -result.outline_grow_mm - VIEW_MARGIN_MM)
-      xmax = Math.max(xmax, w + result.outline_grow_mm + VIEW_MARGIN_MM)
-      ymax = Math.max(ymax, h + result.outline_grow_mm + VIEW_MARGIN_MM)
-    }
     if (result.edited_outline_path_d) {
       // User-edited outline can extend past the original viewBox.
       const editVerts = parsePathVertices(result.edited_outline_path_d)
@@ -329,7 +325,7 @@ export function SvgPreview({
       }
     }
     return { xmin, ymin, w: xmax - xmin, h: ymax - ymin }
-  }, [w, h, result.outline_grow_mm, result.mcu_placement, result.edited_outline_path_d])
+  }, [w, h, result.mcu_placement, result.edited_outline_path_d])
   const viewBox = `${padded.xmin} ${padded.ymin} ${padded.w} ${padded.h}`
   const dotR = Math.min(w, h) * 0.012
   const tickLen = Math.min(w, h) * 0.045
@@ -427,9 +423,9 @@ export function SvgPreview({
     onMcuMove(nx, ny)
   }
 
-  // Effective plate snap lines: every axis-aligned edge of the final
-  // outline polygon (edited if present, else parsed; then dilated by
-  // outline_grow_mm), plus every vertex's X and Y as fallback snap
+  // Effective PCB-edge snap lines: every axis-aligned edge of the final
+  // outline polygon (edited if present, else parsed; then inset by
+  // outline_shrink_mm), plus every vertex's X and Y as fallback snap
   // candidates so modified (non-axis-aligned) edges still register their
   // endpoints as alignment cues.
   function getPlateSnapLines(): { xs: number[]; ys: number[] } {
@@ -445,8 +441,8 @@ export function SvgPreview({
         { x: 0, y: h },
       ]
     }
-    if (result.outline_grow_mm > 0) {
-      verts = offsetPolygon(verts, result.outline_grow_mm)
+    if (result.outline_shrink_mm > 0) {
+      verts = offsetPolygon(verts, -result.outline_shrink_mm)
     }
     const eps = 0.05
     const xs = new Set<number>()
@@ -739,17 +735,17 @@ export function SvgPreview({
           label: isCorner ? 'Plate corner' : `Plate node ${idx + 1}`,
         })
       })
-      // Grown outline (only when growth > 0). True mitered offset of the
-      // outline polygon — same algorithm the dashed-overlay path uses, so
-      // every snap target matches what the user sees.
-      if (result.outline_grow_mm > 0) {
-        const grownVerts = offsetPolygon(verts, result.outline_grow_mm)
-        grownVerts.forEach((v, idx) =>
+      // Shrunk PCB outline (only when inset > 0). True mitered offset of
+      // the outline polygon — same algorithm the dashed-overlay path uses,
+      // so every snap target matches what the user sees.
+      if (result.outline_shrink_mm > 0) {
+        const pcbVerts = offsetPolygon(verts, -result.outline_shrink_mm)
+        pcbVerts.forEach((v, idx) =>
           out.push({
             kind: 'corner',
             x: v.x,
             y: v.y,
-            label: `Grown outline node ${idx + 1}`,
+            label: `PCB outline node ${idx + 1}`,
           }),
         )
       }
@@ -853,21 +849,21 @@ export function SvgPreview({
     }
   }
 
-  // Grown outline: true mitered offset of the active base outline (the
-  // user-edited polygon if any, else the parsed outline). For a rectangular
-  // outline this still produces a rectangle `grow` mm bigger; for a
-  // polygonal outline the halo follows every notch — matching what
+  // Shrunk PCB outline: true mitered inward offset of the active base
+  // outline (the user-edited polygon if any, else the parsed outline).
+  // For a rectangular plate this produces a rectangle `shrink` mm smaller;
+  // for a polygonal outline the inset follows every notch — matching what
   // Shapely's buffer() will emit into Edge.Cuts on the PCB side.
   const grownOutlineVerts = useMemo(() => {
-    const grow = result.outline_grow_mm
-    if (!grow || grow <= 0) return null
+    const shrink = result.outline_shrink_mm
+    if (!shrink || shrink <= 0) return null
     const basePath =
       result.edited_outline_path_d || result.pcb_outline.path_d
     const verts = parsePathVertices(basePath)
     if (verts.length < 3) return null
-    return offsetPolygon(verts, grow)
+    return offsetPolygon(verts, -shrink)
   }, [
-    result.outline_grow_mm,
+    result.outline_shrink_mm,
     result.pcb_outline.path_d,
     result.edited_outline_path_d,
   ])
@@ -922,14 +918,15 @@ export function SvgPreview({
           onClick={handleOverlayClick}
         >
           {/* Outline rendering — three independent dashed/solid layers:
-              1. Grown halo around whichever base outline is active (only
-                 when outline_grow_mm > 0); dashed.
+              1. Shrunk PCB outline inside whichever base outline is
+                 active (only when outline_shrink_mm > 0); dashed.
               2. Original parsed outline (only when the user has edits, so
                  they can see what changed); dashed.
               3. Active base outline (edited if present, else parsed);
                  solid.
-              The dashed grown halo is what the PCB Edge.Cuts will use when
-              grow > 0 — applied on top of whatever base outline is active. */}
+              The dashed inset is what the PCB Edge.Cuts will use when
+              shrink > 0 — applied on top of whatever base outline is
+              active. */}
           {grownOutlinePath && (
             <path
               d={grownOutlinePath}
@@ -1380,10 +1377,10 @@ export function SvgPreview({
             <span className="dot dot-outline-dashed" /> original outline
           </span>
         )}
-        {result.outline_grow_mm > 0 && (
+        {result.outline_shrink_mm > 0 && (
           <span>
-            <span className="dot dot-outline-dashed" /> grown outline (+
-            {result.outline_grow_mm.toFixed(1)} mm)
+            <span className="dot dot-outline-dashed" /> PCB outline (−
+            {result.outline_shrink_mm.toFixed(1)} mm)
           </span>
         )}
         <span>
