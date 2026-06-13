@@ -154,6 +154,8 @@ export interface RouteJobStatus {
     // Pads the router claims it reached but whose wires don't actually
     // touch the pad after the splice — finish these in KiCad.
     unattached?: number
+    // GND/VCC pour islands the island-doctor couldn't auto-reconnect.
+    island_warnings?: number
     pass?: number
     log?: string
   }

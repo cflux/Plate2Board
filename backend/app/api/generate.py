@@ -21,6 +21,7 @@ from ..services.routing import client as routing_client
 from ..services.routing import jobs as routing_jobs
 from ..services.routing import runner as routing_runner
 from ..services.routing.dsn import pad_world_positions
+from ..services.routing.islands import reconnect_islands
 from ..services.routing.ses import apply_ses_to_pcb
 from ..services.schematic import generate_schematic
 
@@ -345,6 +346,7 @@ async def get_route_job(job_id: str) -> dict:
             "total": job.stats.total_count,
             "vias": job.stats.via_count,
             "unattached": job.stats.unattached_pads,
+            "island_warnings": job.stats.island_warnings,
             "pass": job.stats.pass_number,
             "log": job.stats.last_log,
         }
@@ -470,6 +472,16 @@ async def _run_routed_job(
                 job_id, splice_stats.unattached_pad_count,
             )
 
+        # Reconnect any GND/VCC pour islands the routed traces fenced off
+        # (vias where the net is on the other layer, else short jumpers).
+        await store.update(job_id, phase="reconnecting-islands", percent=94.0)
+        routed_pcb, island_warnings = reconnect_islands(routed_pcb)
+        if island_warnings:
+            logger.warning(
+                "routing job %s: %d island warning(s): %s",
+                job_id, len(island_warnings), "; ".join(island_warnings[:10]),
+            )
+
         await store.update(job_id, phase="packaging", percent=97.0)
         zip_bytes = generate_project_zip(
             req,
@@ -497,6 +509,7 @@ async def _run_routed_job(
             total_count=route_result.stats.total_net_count,
             via_count=route_result.stats.via_count or splice_stats.via_count,
             unattached_pads=splice_stats.unattached_pad_count,
+            island_warnings=len(island_warnings),
         )
         await store.update(
             job_id,

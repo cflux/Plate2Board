@@ -62,7 +62,8 @@ function RouteProgressBanner({
   // plus pads whose copper never actually attached after the splice.
   const unfinished =
     status.state === 'done' && status.stats
-      ? status.stats.unrouted + (status.stats.unattached ?? 0)
+      ? status.stats.unrouted + (status.stats.unattached ?? 0) +
+        (status.stats.island_warnings ?? 0)
       : 0
   const partial = unfinished > 0
   const failed = status.state === 'failed'

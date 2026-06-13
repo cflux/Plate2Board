@@ -33,6 +33,9 @@ class RouteStats:
     # the splice (see ses.find_unattached_pads) — shown to the user as
     # connections they must finish in KiCad, on top of `unrouted_count`.
     unattached_pads: int = 0
+    # GND/VCC pour islands the post-route island-doctor couldn't auto-
+    # reconnect — shown as connections to finish by hand in KiCad.
+    island_warnings: int = 0
     # Optional live signal from the freerouting log scraper — lets the UI
     # show "Pass 3 — score 991.2" instead of just a static percent.
     pass_number: int = 0

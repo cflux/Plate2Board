@@ -57,6 +57,45 @@ from app.services.routing.ses import (  # noqa: E402
     _parse_sexp,
     apply_ses_to_pcb,
 )
+from app.services.routing.islands import (  # noqa: E402
+    reconnect_islands,
+    _connectivity,
+    _cutouts,
+    _fill_regions,
+    _foreign_union,
+    _pads,
+    _segments,
+    _vias,
+    _zone_polys,
+)
+
+
+def _stranded_pour_pads(pcb_text: str) -> int:
+    """Total GND/VCC pour pads not in their net's anchor component, using
+    the island-doctor's own connectivity model (so bridge heals count)."""
+    root = _parse_sexp(pcb_text)
+    zones = _zone_polys(root)
+    zones.pop("__names__", None)
+    if not zones:
+        return 0
+    pads = _pads(root)
+    segs = _segments(pcb_text)
+    vias = _vias(pcb_text)
+    cutouts = _cutouts(root)
+    pour_layers: dict[int, list[str]] = {}
+    for (nc, layer) in zones:
+        pour_layers.setdefault(nc, []).append(layer)
+    stranded = 0
+    for net_code, layers in pour_layers.items():
+        foreign = {lyr: _foreign_union(net_code, lyr, pads, segs, vias)
+                   for lyr in ("F.Cu", "B.Cu")}
+        regions = {lyr: _fill_regions(zones[(net_code, lyr)], foreign[lyr], cutouts)
+                   for lyr in layers}
+        uf, net_pads, anchor = _connectivity(
+            net_code, layers, regions, pads, segs, vias)
+        stranded += sum(1 for i, x, y, r, plyrs in net_pads
+                        if uf.find(("pad", i)) != anchor)
+    return stranded
 
 ODD_ANGLES = (0.0, 7.0, 30.0, 45.0, 90.0, 113.0, 270.0)
 
@@ -369,6 +408,31 @@ def verify(
     ):
         print(f"{label} FAIL: no row/column layer discipline "
               f"(F.Cu should be more horizontal than B.Cu)")
+        ok = False
+
+    # Island doctor: reconnect GND/VCC pour fragments the traces fenced off.
+    # It must never raise, must be additive (stranded count can't go up),
+    # and must be idempotent (a second pass adds nothing).
+    before = _stranded_pour_pads(routed_pcb)
+    try:
+        healed_pcb, island_warnings = reconnect_islands(routed_pcb)
+    except Exception as exc:  # pragma: no cover - the pass swallows internally
+        print(f"{label} FAIL: island doctor raised: {exc}")
+        return False
+    after = _stranded_pour_pads(healed_pcb)
+    healed_again, _ = reconnect_islands(healed_pcb)
+    added_vias = healed_again.count("(via ") - healed_pcb.count("(via ")
+    added_segs = healed_again.count("(segment") - healed_pcb.count("(segment")
+    print(f"{label} island doctor: stranded pour pads {before}→{after}, "
+          f"{len(island_warnings)} warned; idempotent adds "
+          f"{added_vias} vias / {added_segs} segs")
+    if after > before:
+        print(f"{label} FAIL: island doctor increased stranded pads "
+              f"({before}→{after})")
+        ok = False
+    if added_vias or added_segs:
+        print(f"{label} FAIL: island doctor not idempotent "
+              f"(+{added_vias} vias, +{added_segs} segs on re-run)")
         ok = False
     return ok
 
