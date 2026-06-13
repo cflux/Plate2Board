@@ -532,13 +532,13 @@ def test_hotswap_emits_smd_socket_pads_on_b_cu() -> None:
     assert '"keeb:SW_Hotswap_Kailh_MX_1.00u"' in out
     # SMD pad 1 on B.Cu at (-7.085, -2.54).
     assert re.search(
-        r'\(pad "1" smd rect \(at -7\.085 -2\.54\) \(size 2\.55 2\.5\)\s*'
+        r'\(pad "1" smd rect \(at -7\.085 -2\.54 [-\d.]+\) \(size 2\.55 2\.5\)\s*'
         r'\(layers "B\.Cu" "B\.Paste" "B\.Mask"\)',
         out,
     )
     # SMD pad 2 on B.Cu at (5.842, -5.08).
     assert re.search(
-        r'\(pad "2" smd rect \(at 5\.842 -5\.08\)',
+        r'\(pad "2" smd rect \(at 5\.842 -5\.08 [-\d.]+\)',
         out,
     )
     # NPTH at switch pin positions (3 mm drill, larger than soldered's 1.5 mm).
@@ -567,7 +567,7 @@ def test_smd_diode_emits_sod123_on_b_cu() -> None:
     assert '"keeb:D_SOD-123"' in out
     # Pads on B.Cu, no thru-hole drill.
     assert re.search(
-        r'\(pad "1" smd rect \(at -1\.65 0\) \(size 1\.0 0\.6\)\s*'
+        r'\(pad "1" smd rect \(at -1\.65 0 [-\d.]+\) \(size 1\.0 0\.6\)\s*'
         r'\(layers "B\.Cu" "B\.Paste" "B\.Mask"\)',
         out,
     )
@@ -978,11 +978,13 @@ def test_rgb_emits_led_and_cap_per_switch_with_cutout() -> None:
     out = generate_pcb(_rgb_result(), rgb=True)
     assert out.count('(footprint "keeb:LED_SK6812MINI-E"') == 6
     assert out.count('(footprint "keeb:C_0603"') == 6
-    # Each LED carries the milled cutout slot + a B.SilkS pin-1 marker.
-    assert out.count("(drill oval 3.4 3.0)") == 6
     led_block = re.search(
         r'\(footprint "keeb:LED_SK6812MINI-E".+?\n\t\)', out, re.DOTALL
     ).group(0)
+    # The cutout is a milled board slot on Edge.Cuts (4 lines), NOT a
+    # copper NPTH pad — no copper square under the LED.
+    assert "np_thru_hole" not in led_block
+    assert led_block.count('(layer "Edge.Cuts")') == 4
     assert '"B.SilkS"' in led_block
     assert '(layers "B.Cu" "B.Paste" "B.Mask")' in led_block
     assert out.count("(") == out.count(")")
@@ -1269,3 +1271,79 @@ def test_pico_lifts_gpio_ceiling_for_rgb() -> None:
     # Pico accepts it (no GPIO-budget error; geometry permitting).
     out = generate_pcb(parse, mcu_type="pico", rgb=True)
     assert '(footprint "keeb:RaspberryPi_Pico"' in out
+
+
+# ---------------------------------------------------------------------------
+# Rotated-switch RGB layout fixes (v0.12.1)
+# ---------------------------------------------------------------------------
+
+
+def _rotated_rgb_parse(rot_deg: float = 10.0) -> ParseResult:
+    sw = _sw(1, 60.0, 60.0, rotation=rot_deg)
+    return _result(switches=[sw], width=120.0, height=120.0).model_copy(
+        update={"mcu_placement": McuPlacement(cx_mm=20.0, cy_mm=20.0, rotation_deg=0.0)}
+    )
+
+
+def test_rect_smd_pads_carry_footprint_rotation() -> None:
+    """LED + cap rect SMD pads must bake the footprint orientation into
+    their own (at … angle) so the rectangle rotates with the body (KiCad
+    treats board pad angles as absolute, not composed)."""
+    out = generate_pcb(_rotated_rgb_parse(10.0), diode_type="tht", rgb=True)
+    for fp, expect_rot in (
+        ("keeb:LED_SK6812MINI-E", "-190.000"),  # switch 10° + LED 180°
+        ("keeb:C_0603", "-10.000"),
+    ):
+        block = re.search(rf'\(footprint "{re.escape(fp)}".+?\n\t\)', out, re.DOTALL).group(0)
+        pads = re.findall(r'\(pad "\d" smd rect \(at [-\d.]+ [-\d.]+ ([-\d.]+)\)', block)
+        assert pads, f"{fp}: no rect SMD pads found"
+        assert all(p == expect_rot for p in pads), f"{fp}: pad angles {pads} != {expect_rot}"
+
+
+def test_smd_diode_pads_carry_rotation() -> None:
+    out = generate_pcb(_rotated_rgb_parse(10.0), diode_type="smd", rgb=False)
+    block = re.search(r'\(footprint "keeb:D_SOD-123".+?\n\t\)', out, re.DOTALL).group(0)
+    # SMD diode is switch_rot + 90 → -100 kicad.
+    angles = re.findall(r'\(pad "\d" smd rect \(at [-\d.]+ [-\d.]+ ([-\d.]+)\)', block)
+    assert angles == ["-100.000", "-100.000"], angles
+
+
+def test_led_cutout_is_edge_cuts_not_copper() -> None:
+    out = generate_pcb(_rotated_rgb_parse(10.0), diode_type="tht", rgb=True)
+    block = re.search(
+        r'\(footprint "keeb:LED_SK6812MINI-E".+?\n\t\)', out, re.DOTALL
+    ).group(0)
+    assert "np_thru_hole" not in block  # no copper-flooded cutout pad
+    assert block.count('(layer "Edge.Cuts")') == 4  # milled slot rectangle
+
+
+def test_tht_diode_clears_switch_pin_with_rgb_on_rotated_switch() -> None:
+    """The reported bug: RGB pushes the THT diode north onto the switch
+    pins, and same-net pads were allowed to overlap. The diode's link pad
+    must now physically clear the switch's link pin."""
+    parse = _rotated_rgb_parse(10.0)
+    out = generate_pcb(parse, diode_type="tht", rgb=True)
+
+    def pad_world(cx, cy, rotdeg, lx, ly):
+        r = math.radians(rotdeg)
+        c, s = math.cos(r), math.sin(r)
+        return (cx + lx * c + ly * s, cy - lx * s + ly * c)
+
+    def anchor(fp):
+        b = re.search(rf'\(footprint "{re.escape(fp)}".+?\n\t\)', out, re.DOTALL).group(0)
+        m = re.search(r'\(at ([-\d.]+) ([-\d.]+) ([-\d.]+)\)', b)
+        return b, float(m.group(1)), float(m.group(2)), float(m.group(3))
+
+    swb, scx, scy, srot = anchor("keeb:SW_Cherry_MX_PCB_1.00u")
+    slink = pad_world(scx, scy, srot, 2.54, -5.08)  # switch pin 2 (link)
+    db, dcx, dcy, drot = anchor("keeb:D_DO-35_SOD27_P7.62mm_Horizontal")
+    dlink = None
+    for m in re.finditer(
+        r'\(pad "\d" thru_hole oval \(at ([-\d.]+) [-\d.]+\).*?\(net \d+ "([^"]+)"\)',
+        db, re.DOTALL,
+    ):
+        if "NET-SW" in m.group(2):
+            dlink = pad_world(dcx, dcy, drot, float(m.group(1)), 0.0)
+    dist = math.hypot(dlink[0] - slink[0], dlink[1] - slink[1])
+    # THT pad radii 0.8 + 1.25 + 0.2 clearance.
+    assert dist >= 0.8 + 1.25 + 0.2 - 1e-6, f"diode link pad only {dist:.2f} mm from switch pin"

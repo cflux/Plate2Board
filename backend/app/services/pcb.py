@@ -476,6 +476,30 @@ def _switch_footprint(
     return _switch_hotswap(sw, nets)
 
 
+def _smd_rect_pad(
+    num: str,
+    lx: float,
+    ly: float,
+    w: float,
+    h: float,
+    layers: str,
+    rot: float,
+    net_attr: str = "",
+) -> str:
+    """A rectangular SMD pad with its orientation baked in.
+
+    In a KiCad board file a pad's `(at x y angle)` position is local
+    (rotates with the footprint), but the angle is ABSOLUTE — the
+    footprint orientation is not composed onto it. So a rect pad emitted
+    without an angle stays axis-aligned even on a rotated footprint
+    (circular/square pads hide this; rect pads don't). Pass the
+    footprint's `rot` so the rectangle turns with the body."""
+    return (
+        f'\t\t(pad "{num}" smd rect (at {lx} {ly} {rot:.3f}) (size {w} {h})\n'
+        f'\t\t\t(layers {layers}){net_attr} (uuid "{_u()}"))\n'
+    )
+
+
 def _switch_soldered(sw: SwitchDef, nets: dict[str, int]) -> str:
     fp_uuid = _u()
     ref = f"SW{sw.id}"
@@ -533,10 +557,14 @@ def _switch_hotswap(sw: SwitchDef, nets: dict[str, int]) -> str:
         f'\t\t\t(layers "*.Cu" "*.Mask") (uuid "{_u()}"))\n'
         + _switch_npth()
         # Kailh socket SMD pads on B.Cu (where the socket clips on).
-        + f'\t\t(pad "1" smd rect (at -7.085 -2.54) (size 2.55 2.5)\n'
-        f'\t\t\t(layers "B.Cu" "B.Paste" "B.Mask") (net {col_net} "{col_name}") (uuid "{_u()}"))\n'
-        f'\t\t(pad "2" smd rect (at 5.842 -5.08) (size 2.55 2.5)\n'
-        f'\t\t\t(layers "B.Cu" "B.Paste" "B.Mask") (net {link_net} "{link_name}") (uuid "{_u()}"))\n'
+        + _smd_rect_pad(
+            "1", -7.085, -2.54, 2.55, 2.5, '"B.Cu" "B.Paste" "B.Mask"', rot,
+            f' (net {col_net} "{col_name}")',
+        )
+        + _smd_rect_pad(
+            "2", 5.842, -5.08, 2.55, 2.5, '"B.Cu" "B.Paste" "B.Mask"', rot,
+            f' (net {link_net} "{link_name}")',
+        )
         + "\t)"
     )
 
@@ -943,6 +971,14 @@ def resolve_diode_placements(
         fixed_pads = fixed_pads + rgb_pads
     pad_r = _DIODE_PAD_RADIUS[diode_type]
     candidates = _diode_candidate_offsets(switch_type, diode_type)
+    # A SMD diode is *designed* to land its link pad on the switch's pin-2
+    # copper (a deliberate same-net connection, no trace), so same-net
+    # overlaps are allowed. A THT diode's pads are drilled holes: two THT
+    # pads on the same net must still keep physical clearance, or the
+    # diode hole overlaps the switch pin (reported with RGB pushing the
+    # diode north onto the pins). So THT enforces clearance regardless of
+    # net; SMD keeps the same-net allowance.
+    allow_same_net = diode_type == "smd"
 
     def conflict(pads: list[tuple[float, float, str]],
                  extra_pads: list[tuple[float, float, float, str]]) -> bool:
@@ -950,11 +986,10 @@ def resolve_diode_placements(
             for ox, oy, orad in npths:
                 if math.hypot(ox - px, oy - py) < orad + pad_r + _DIODE_HOLE_CLEARANCE_MM:
                     return True
-            for ox, oy, orad, okey in fixed_pads:
-                if okey != key and math.hypot(ox - px, oy - py) < orad + pad_r + _DIODE_PAD_CLEARANCE_MM:
-                    return True
-            for ox, oy, orad, okey in extra_pads:
-                if okey != key and math.hypot(ox - px, oy - py) < orad + pad_r + _DIODE_PAD_CLEARANCE_MM:
+            for ox, oy, orad, okey in (*fixed_pads, *extra_pads):
+                if allow_same_net and okey == key:
+                    continue
+                if math.hypot(ox - px, oy - py) < orad + pad_r + _DIODE_PAD_CLEARANCE_MM:
                     return True
         return False
 
@@ -1306,13 +1341,18 @@ def _rgb_led_footprint(
     pad_nets = _rgb_led_pad_nets(sw, chain_idx, n_total)
     pads: list[str] = []
     # The milled cutout the LED nests into (reverse-mount: body drops
-    # through, light shines out the front). Oval drill = routed slot.
-    pads.append(
-        f'\t\t(pad "" np_thru_hole rect (at 0 0) '
-        f"(size {RGB_CUTOUT_W_MM} {RGB_CUTOUT_H_MM}) "
-        f"(drill oval {RGB_CUTOUT_W_MM} {RGB_CUTOUT_H_MM})\n"
-        f'\t\t\t(layers "*.Cu" "*.Mask") (uuid "{_u()}"))\n'
-    )
+    # through, light shines out the front). This is a board cutout on
+    # Edge.Cuts — NOT a copper pad — so it has no copper (an earlier
+    # `np_thru_hole … "*.Cu"` flooded a copper square under the LED) and
+    # KiCad mills it as a real slot. Local coords rotate with the body.
+    hw, hh = RGB_CUTOUT_W_MM / 2, RGB_CUTOUT_H_MM / 2
+    cut = [(-hw, -hh), (hw, -hh), (hw, hh), (-hw, hh), (-hw, -hh)]
+    for (x1, y1), (x2, y2) in zip(cut, cut[1:]):
+        pads.append(
+            f"\t\t(fp_line (start {x1:g} {y1:g}) (end {x2:g} {y2:g}) "
+            f'(stroke (width 0.1) (type solid)) (layer "Edge.Cuts") '
+            f'(uuid "{_u()}"))\n'
+        )
     w, h = RGB_LED_PAD_SIZE
     for num, (lx, ly) in RGB_LED_PAD_LOCAL.items():
         net_name = pad_nets[num]
@@ -1320,8 +1360,9 @@ def _rgb_led_footprint(
         if net_name is not None:
             net_attr = f' (net {nets[net_name]} "{net_name}")'
         pads.append(
-            f'\t\t(pad "{num}" smd rect (at {lx} {ly}) (size {w} {h})\n'
-            f'\t\t\t(layers "B.Cu" "B.Paste" "B.Mask"){net_attr} (uuid "{_u()}"))\n'
+            _smd_rect_pad(
+                num, lx, ly, w, h, '"B.Cu" "B.Paste" "B.Mask"', rot, net_attr
+            )
         )
     return (
         f'\t(footprint "keeb:LED_SK6812MINI-E"\n'
@@ -1368,9 +1409,10 @@ def _rgb_cap_footprint(sw: SwitchDef, nets: dict[str, int]) -> str:
     for num, (lx, ly) in RGB_CAP_PAD_LOCAL.items():
         name = pad_nets[num]
         pads.append(
-            f'\t\t(pad "{num}" smd rect (at {lx} {ly}) (size {w} {h})\n'
-            f'\t\t\t(layers "B.Cu" "B.Paste" "B.Mask") '
-            f'(net {nets[name]} "{name}") (uuid "{_u()}"))\n'
+            _smd_rect_pad(
+                num, lx, ly, w, h, '"B.Cu" "B.Paste" "B.Mask"', rot,
+                f' (net {nets[name]} "{name}")',
+            )
         )
     return (
         f'\t(footprint "keeb:C_0603"\n'
@@ -1621,11 +1663,15 @@ def _diode_footprint_smd(
         f"\t\t(fp_line (start -0.8 -0.8) (end -0.8 0.8) "
         f'(stroke (width 0.2) (type solid)) (layer "B.SilkS") (uuid "{_u()}"))\n'
         # Pad 1 = K, pad 2 = A. Both on B.Cu.
-        f'\t\t(pad "1" smd rect (at -1.65 0) (size 1.0 0.6)\n'
-        f'\t\t\t(layers "B.Cu" "B.Paste" "B.Mask") (net {row_net} "{row_name}") (uuid "{_u()}"))\n'
-        f'\t\t(pad "2" smd rect (at 1.65 0) (size 1.0 0.6)\n'
-        f'\t\t\t(layers "B.Cu" "B.Paste" "B.Mask") (net {link_net} "{link_name}") (uuid "{_u()}"))\n'
-        f"\t)"
+        + _smd_rect_pad(
+            "1", -1.65, 0, 1.0, 0.6, '"B.Cu" "B.Paste" "B.Mask"', rot,
+            f' (net {row_net} "{row_name}")',
+        )
+        + _smd_rect_pad(
+            "2", 1.65, 0, 1.0, 0.6, '"B.Cu" "B.Paste" "B.Mask"', rot,
+            f' (net {link_net} "{link_name}")',
+        )
+        + "\t)"
     )
 
 
@@ -1686,6 +1732,7 @@ def _mcu_footprint(
     plate. TH profiles emit oval pads (pin 1 rect); the XIAO SMD profile
     emits F.Cu rect pads at the castellations instead."""
     fp_uuid = _u()
+    rot = _kicad_angle(rotation_deg)
     pad_lines: list[str] = []
     w, h = mcu.pad_size
     for pin in sorted(mcu.pins):
@@ -1697,9 +1744,10 @@ def _mcu_footprint(
             net_attr = f' (net {net_code} "{net_name}")'
         if mcu.drill_mm is None:
             pad_lines.append(
-                f'\t\t(pad "{pin}" smd rect (at {x:.4f} {y:.4f}) '
-                f'(size {w:g} {h:g}) (layers "F.Cu" "F.Paste" "F.Mask")'
-                f'{net_attr} (uuid "{_u()}"))'
+                _smd_rect_pad(
+                    str(pin), round(x, 4), round(y, 4), w, h,
+                    '"F.Cu" "F.Paste" "F.Mask"', rot, net_attr,
+                ).rstrip("\n")
             )
         else:
             shape = "rect" if pin == 1 else "oval"
@@ -1733,7 +1781,6 @@ def _mcu_footprint(
 
     pin_span_x = max(x for x, _y in mcu.pins.values())
     pin_span_y = max(y for _x, y in mcu.pins.values())
-    rot = _kicad_angle(rotation_deg)
     return (
         f'\t(footprint "{mcu.footprint_name}"\n'
         f'\t\t(layer "F.Cu")\n'
