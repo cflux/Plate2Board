@@ -64,12 +64,17 @@ ODD_ANGLES = (0.0, 7.0, 30.0, 45.0, 90.0, 113.0, 270.0)
 PAD_SLOP_MM = 0.2
 
 
-def build_parse(mcu_type: str = "pro_micro") -> ParseResult:
+def build_parse(mcu_type: str = "pro_micro", rgb: bool = False) -> ParseResult:
     # The Pico is 51 mm long — far too tall for the 60 mm fixture sized
     # for a Pro Micro. For big MCUs, drop onto a taller rectangular board
     # with the module parked below the switch field (the concave-outline
     # fence path is already covered by the Pro Micro variants).
-    big_mcu = mcu_type == "pico"
+    # The Pico is physically huge, and RGB packs LEDs + caps + the data
+    # chain onto B.Cu — both want the roomier rectangular board so the
+    # synthetic 7-switch arc's long data hops stay routable (real boards
+    # space keys on a grid; the concave-fence path is covered by the
+    # non-RGB variants on the notched board).
+    big_board = mcu_type == "pico" or rgb
     switches = [
         SwitchDef(
             id=i + 1,
@@ -93,7 +98,7 @@ def build_parse(mcu_type: str = "pro_micro") -> ParseResult:
         )
         for sid, local_x in ((1, -11.94), (2, 11.94))
     ]
-    if big_mcu:
+    if big_board:
         # Plain 200 × 120 board; Pico parked below the switches, well
         # clear of the 0.5 mm edge setback.
         return ParseResult(
@@ -217,7 +222,7 @@ def verify(
 ) -> bool:
     mcu_tag = "" if mcu_type == "pro_micro" else f"/{mcu_type}"
     label = f"[{switch_type}/{diode_type}{'/rgb' if rgb else ''}{mcu_tag}]"
-    parse = build_parse(mcu_type)
+    parse = build_parse(mcu_type, rgb)
     pcb_text = generate_pcb(
         parse, switch_type=switch_type, diode_type=diode_type,
         stabilizer_type="pcb_mount", rgb=rgb, mcu_type=mcu_type,
@@ -256,16 +261,21 @@ def verify(
         ok = False
 
     from app.services.routing.ses import parse_net_table
-    gnd_code = parse_net_table(pcb_text).get("GND")
+    net_table = parse_net_table(pcb_text)
+    gnd_code = net_table.get("GND")
+    # VCC is pour-carried too on RGB boards (F.Cu plane, split from the
+    # B.Cu GND pour) — its pads are fed by vias, not routed traces.
+    vcc_code = net_table.get("VCC") if rgb else None
+    pour_codes = {c for c in (gnd_code, vcc_code) if c is not None}
 
     pads, npths, segments, vias = collect_board_geometry(routed_pcb)
     nets_with_copper = {s[4] for s in segments} | {v[2] for v in vias}
     missed = []
     for ref, number, code, px, py, radius in pads:
-        if code == gnd_code:
-            # GND is carried by the copper pours (filled in KiCad), not
-            # routed traces — stitching vias put GND in nets_with_copper
-            # but no wire ever lands on a GND pad by design.
+        if code in pour_codes:
+            # GND/VCC are carried by the copper pours (filled in KiCad),
+            # not routed traces — their vias put them in nets_with_copper
+            # but no wire ever lands on a pour pad by design.
             continue
         if code not in nets_with_copper:
             missed.append((ref, number, "net has no copper at all"))
@@ -302,27 +312,27 @@ def verify(
     else:
         print(f"{label} no traces cross any of the {len(npths)} NPTHs")
 
-    # GND stitching vias are invisible to freerouting (GND isn't in the
-    # DSN network) — the via-position keepouts must keep routed copper of
-    # every other net clear of them. 0.19 ≈ the 0.2 netclass clearance
-    # minus float slack.
-    stitch = [(v[0], v[1]) for v in vias if gnd_code is not None and v[2] == gnd_code]
+    # Pour vias (GND stitching when non-RGB; per-key VCC vias when RGB)
+    # are invisible to freerouting (their net isn't in the DSN network) —
+    # the via-position keepouts must keep routed copper of every other net
+    # clear of them. 0.19 ≈ the 0.2 netclass clearance minus float slack.
+    pour_vias = [(v[0], v[1]) for v in vias if v[2] in pour_codes]
     via_hits = 0
-    for vx, vy in stitch:
+    for vx, vy in pour_vias:
         for x1, y1, x2, y2, code, width, _layer in segments:
-            if code == gnd_code:
+            if code in pour_codes:
                 continue
             if point_segment_distance(vx, vy, x1, y1, x2, y2) < 0.3 + width / 2.0 + 0.19:
                 via_hits += 1
         for ox, oy, ocode in vias:
-            if ocode != gnd_code and math.hypot(ox - vx, oy - vy) < 0.6 + 0.19:
+            if ocode not in pour_codes and math.hypot(ox - vx, oy - vy) < 0.6 + 0.19:
                 via_hits += 1
     if via_hits:
         print(f"{label} FAIL: routed copper within clearance of "
-              f"{via_hits} stitching via spot(s)")
+              f"{via_hits} pour-via spot(s)")
         ok = False
     else:
-        print(f"{label} routed copper clears all {len(stitch)} stitching vias")
+        print(f"{label} routed copper clears all {len(pour_vias)} pour vias")
 
     # Layer discipline: with the DSN autoroute_settings layer rules, F.Cu
     # should carry mostly horizontal copper (rows) and B.Cu mostly

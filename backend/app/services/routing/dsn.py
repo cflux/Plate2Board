@@ -72,6 +72,7 @@ from ..pcb import (
     _stab_sides,
     center_parse_on_page,
     compute_stitching_vias,
+    compute_vcc_vias,
     resolve_diode_placements,
 )
 
@@ -432,6 +433,7 @@ def _mcu_components(
     *,
     rgb: bool = False,
     route_gnd: bool = False,
+    pour_vcc: bool = False,
 ) -> list[Component]:
     # Only ROW/COL (+ RGB) pins get nets here by default — GND is carried
     # by the copper pours, not traces, so it stays out of the DSN network
@@ -454,7 +456,9 @@ def _mcu_components(
                 nets_per_pin[str(pin)] = f"COL{cols[c_idx]}"
             elif rgb and c_idx == len(cols):
                 nets_per_pin[str(pin)] = RGB_DATA_NET_FMT.format(0)
-    if rgb:
+    if rgb and not pour_vcc:
+        # VCC is pour-carried (F.Cu plane) under the split-plane scheme;
+        # the THT 5V pin reaches it directly, so keep it out of the DSN.
         nets_per_pin[str(mcu.power_5v_pin)] = VCC_NET_NAME
     if route_gnd:
         for pin in mcu.gnd_pins:
@@ -472,7 +476,7 @@ def _mcu_components(
 
 
 def _rgb_components(
-    parse: ParseResult, *, route_gnd: bool
+    parse: ParseResult, *, route_gnd: bool, pour_vcc: bool = False
 ) -> list[Component]:
     """One SK6812 MINI-E + one 100 nF cap per switch, on B.Cu. GND pins
     are netted only when GND must be routed (no pour); otherwise the pour
@@ -486,7 +490,9 @@ def _rgb_components(
         pad_nets = _rgb_led_pad_nets(sw, chain[sw.id], n)
         led_nets = {
             num: name for num, name in pad_nets.items()
-            if name is not None and (name != GND_NET_NAME or route_gnd)
+            if name is not None
+            and (name != GND_NET_NAME or route_gnd)
+            and (name != VCC_NET_NAME or not pour_vcc)
         }
         out.append(Component(
             image_name="led_sk6812_mini_e",
@@ -497,7 +503,9 @@ def _rgb_components(
             nets=led_nets,
         ))
         bx, by, cap_rot = _rgb_cap_anchor(sw)
-        cap_nets = {"1": VCC_NET_NAME}
+        cap_nets: dict[str, str] = {}
+        if not pour_vcc:
+            cap_nets["1"] = VCC_NET_NAME
         if route_gnd:
             cap_nets["2"] = GND_NET_NAME
         out.append(Component(
@@ -1029,17 +1037,22 @@ def _build_components(
     # GND is pour-carried when the pour exists; without it the RGB parts
     # still need ground, so GND becomes an ordinary routed net.
     route_gnd = rgb and not ground_pour
+    # VCC is pour-carried (F.Cu plane) only when RGB + the pour are on;
+    # without the pour it falls back to routed traces.
+    pour_vcc = rgb and ground_pour
     components: list[Component] = []
     components.extend(_switch_components(parse, nets, switch_type))
     components.extend(_diode_components(parse, nets, diode_type, placements))
     components.extend(
         _mcu_components(
             parse, nets, get_mcu_profile(mcu_type),
-            rgb=rgb, route_gnd=route_gnd,
+            rgb=rgb, route_gnd=route_gnd, pour_vcc=pour_vcc,
         )
     )
     if rgb:
-        components.extend(_rgb_components(parse, route_gnd=route_gnd))
+        components.extend(
+            _rgb_components(parse, route_gnd=route_gnd, pour_vcc=pour_vcc)
+        )
     return components
 
 
@@ -1130,12 +1143,21 @@ def pcb_to_dsn(
     keepouts.extend(_stabilizer_keepouts(parse, stabilizer_type))
     keepouts.extend(_mounting_hole_keepouts(parse))
     if ground_pour:
-        keepouts.extend(
-            _stitching_via_keepouts(
-                parse, switch_type, diode_type, stabilizer_type,
-                rgb=rgb, mcu_type=mcu_type,
+        if rgb:
+            # Split planes: VCC vias (one per LED/cap VCC pad) are real
+            # copper but VCC is pour-carried, so wall them off. GND is a
+            # single B.Cu plane here — no GND stitching vias.
+            keepouts.extend(
+                KeepoutCircle(VIA_PAD_DIAMETER_MM, x, y)
+                for x, y in compute_vcc_vias(list(parse.switches))
             )
-        )
+        else:
+            keepouts.extend(
+                _stitching_via_keepouts(
+                    parse, switch_type, diode_type, stabilizer_type,
+                    rgb=rgb, mcu_type=mcu_type,
+                )
+            )
 
     cutout_fences = list(fences)
     if rgb:

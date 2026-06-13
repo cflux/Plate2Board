@@ -958,20 +958,21 @@ def test_dsn_keepouts_at_stitching_via_positions() -> None:
 
 
 def test_dsn_rgb_nets_and_keepouts() -> None:
-    from app.services.pcb import _rgb_led_anchor
+    from app.services.pcb import _rgb_led_anchor, compute_vcc_vias
     from app.services.routing.dsn import _prepare_parse
 
     parse = _result_two_keys()
     dsn = pcb_to_dsn(parse, rgb=True)
-    # VCC + chain nets present with LED/cap pins; GND stays pour-carried.
-    assert '(net "VCC"' in dsn and "LED1-1" in dsn and "C1-1" in dsn
+    # Split planes (rgb + pour): both GND and VCC are pour-carried, so
+    # neither appears in the router network — only the data chain does.
     assert '(net "RGB_DATA0"' in dsn and '(net "RGB_DATA1"' in dsn
     assert '(net "GND"' not in dsn
-    assert '(class "power"' in dsn
-    # The MCU feeds the chain + supplies VCC from RAW.
+    assert '(net "VCC"' not in dsn
+    # The MCU feeds the chain; the 5V pin is NOT netted (reaches the F.Cu
+    # VCC pour directly).
     assert re.search(r'\(net "RGB_DATA0"\s*\(pins [^)]*U1-\d+', dsn)
-    assert re.search(r'\(net "VCC"\s*\(pins [^)]*U1-24', dsn)
-    # One cutout keepout polygon per LED, centered on the LED anchor.
+    # A VCC-via keepout sits over each VCC pad; cutout keepouts over each
+    # LED anchor. Collect every keepout centroid and check coverage.
     prepared = _prepare_parse(parse)
     structure = _find_child(_parse_dsn(dsn), "structure")
     centroids = []
@@ -985,6 +986,10 @@ def test_dsn_rgb_nets_and_keepouts() -> None:
         assert any(
             math.hypot(cx - ax, cy - ay) < 1e-3 for cx, cy in centroids
         ), f"no cutout keepout at LED anchor of SW{sw.id}"
+    for vx, vy in compute_vcc_vias(list(prepared.switches)):
+        assert any(
+            math.hypot(cx - vx, cy - vy) < 1e-3 for cx, cy in centroids
+        ), f"no keepout over VCC via at ({vx:.2f}, {vy:.2f})"
 
 
 def test_dsn_rgb_routes_gnd_when_pour_off() -> None:

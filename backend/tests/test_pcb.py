@@ -1347,3 +1347,61 @@ def test_tht_diode_clears_switch_pin_with_rgb_on_rotated_switch() -> None:
     dist = math.hypot(dlink[0] - slink[0], dlink[1] - slink[1])
     # THT pad radii 0.8 + 1.25 + 0.2 clearance.
     assert dist >= 0.8 + 1.25 + 0.2 - 1e-6, f"diode link pad only {dist:.2f} mm from switch pin"
+
+
+# ---------------------------------------------------------------------------
+# v0.12.2: THT diode north placement + VCC split-plane pour
+# ---------------------------------------------------------------------------
+
+from app.services.pcb import VCC_NET_NAME, compute_vcc_vias  # noqa: E402
+
+
+def test_tht_diode_moves_north_of_pins_with_rgb() -> None:
+    """RGB takes the south slot; the THT diode must sit well north of the
+    switch pin band (in the inter-row gap), not across it."""
+    parse = _rotated_rgb_parse(10.0)
+    out = generate_pcb(parse, diode_type="tht", rgb=True)
+    db = re.search(r'\(footprint "keeb:D_DO-35.+?\n\t\)', out, re.DOTALL).group(0)
+    m = re.search(r'\(at ([-\d.]+) ([-\d.]+) [-\d.]+\)', db)
+    dcx, dcy = float(m.group(1)), float(m.group(2))
+    sw = parse.switches[0]
+    # Diode anchor is north of the switch by more than the body half (7 mm).
+    # (Switch at 60,60; north = smaller y.)
+    assert dcy <= sw.cy_mm - 7.0, f"diode at y={dcy}, expected well north of {sw.cy_mm}"
+
+
+def test_rgb_split_planes_gnd_bottom_vcc_top() -> None:
+    out = generate_pcb(_rgb_result(), rgb=True)
+    zones = re.findall(
+        r'\(zone\n\t\t\(net \d+\)\n\t\t\(net_name "([^"]+)"\)\n\t\t\(layer "([^"]+)"\)',
+        out,
+    )
+    assert ("GND", "B.Cu") in zones
+    assert ("VCC", "F.Cu") in zones
+    assert ("GND", "F.Cu") not in zones  # GND is single-layer when split
+    assert ("VCC", "B.Cu") not in zones
+    assert len(zones) == 2
+
+
+def test_rgb_vcc_vias_one_per_vcc_pad_no_gnd_stitching() -> None:
+    parse = _rgb_result()
+    out = generate_pcb(parse, rgb=True)
+    vcc = int(re.search(r'\(net (\d+) "VCC"\)', out).group(1))
+    via_count = len(re.findall(rf'\(via \(at [-\d.]+ [-\d.]+\)[^\n]*\(net {vcc}\)', out))
+    # 6 LEDs + 6 caps = 12 VCC pads → 12 vias.
+    assert via_count == len(compute_vcc_vias(list(parse.switches))) == 12
+    # No GND stitching vias in the split-plane case (GND is single-layer).
+    gnd = int(re.search(r'\(net (\d+) "GND"\)', out).group(1))
+    assert not re.search(rf'\(via \(at [-\d.]+ [-\d.]+\)[^\n]*\(net {gnd}\)', out)
+
+
+def test_non_rgb_ground_pour_still_both_layers_with_stitching() -> None:
+    # Regression guard: without RGB the GND pour stays on both layers and
+    # keeps its stitching vias.
+    parse = _rgb_result()
+    out = generate_pcb(parse, rgb=False)  # ground_pour defaults on
+    zones = re.findall(r'\(net_name "GND"\)\n\t\t\(layer "([^"]+)"\)', out)
+    assert sorted(zones) == ["B.Cu", "F.Cu"]
+    assert '"VCC"' not in out
+    gnd = int(re.search(r'\(net (\d+) "GND"\)', out).group(1))
+    assert re.search(rf'\(via \(at [-\d.]+ [-\d.]+\)[^\n]*\(net {gnd}\)', out)

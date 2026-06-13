@@ -337,22 +337,40 @@ def generate_pcb(
     out.extend(_edge_cuts(base_outline, parse.outline_shrink_mm))
 
     if ground_pour and switches:
-        out.extend(
-            _gnd_stitching_vias(
-                switches,
-                parse,
-                nets,
-                base_outline,
-                switch_type=switch_type,
-                diode_type=diode_type,
-                stabilizer_type=stabilizer_type,
-                rgb=rgb,
-                mcu_type=mcu_type,
+        shrink = parse.outline_shrink_mm
+        if rgb:
+            # Split power planes: GND pour on B.Cu, VCC pour on F.Cu.
+            # The LED/cap VCC pads (B.Cu) reach the F.Cu VCC pour through
+            # a via-in-pad each; GND is single-layer so it needs no
+            # stitching. Both pours are filled by the user in KiCad.
+            out.extend(_vcc_vias(switches, nets))
+            out.extend(
+                _pour_zone(base_outline, shrink, nets[GND_NET_NAME],
+                           GND_NET_NAME, ("B.Cu",))
             )
-        )
-        out.extend(
-            _gnd_zones(base_outline, parse.outline_shrink_mm, nets[GND_NET_NAME])
-        )
+            out.extend(
+                _pour_zone(base_outline, shrink, nets[VCC_NET_NAME],
+                           VCC_NET_NAME, ("F.Cu",))
+            )
+        else:
+            # GND pour on both layers, tied by stitching vias.
+            out.extend(
+                _gnd_stitching_vias(
+                    switches,
+                    parse,
+                    nets,
+                    base_outline,
+                    switch_type=switch_type,
+                    diode_type=diode_type,
+                    stabilizer_type=stabilizer_type,
+                    rgb=rgb,
+                    mcu_type=mcu_type,
+                )
+            )
+            out.extend(
+                _pour_zone(base_outline, shrink, nets[GND_NET_NAME],
+                           GND_NET_NAME, ("F.Cu", "B.Cu"))
+            )
 
     out.append(")")
     return "\n".join(out) + "\n"
@@ -832,8 +850,13 @@ def _diode_candidate_offsets(
     else:
         off = DIODE_OFFSET_MM
         bases = [
-            (0.0, off, 0.0),      # default (below the switch)
-            (0.0, -off, 0.0),     # above
+            (0.0, off, 0.0),      # default (south, below the switch)
+            # North fallback (used when RGB takes the south slot): sit in
+            # the inter-row gap, clear of the switch's THT pin band
+            # (pins at y −2.54 / −5.08). The old (0, −5.5) was electrically
+            # clear but landed the diode across the pins — its body/leads
+            # mechanically collided with the switch legs.
+            (0.0, -(off + 3.0), 0.0),
             (off + 2.0, 0.0, 90.0),   # right side, body vertical
             (-(off + 2.0), 0.0, 90.0),  # left side
         ]
@@ -1194,23 +1217,29 @@ def _zone_polygon_rings(
     ] or [ring]
 
 
-def _gnd_zones(path_d: str, shrink_mm: float, gnd_code: int) -> list[str]:
-    """One unfilled GND pour per copper layer (per outline piece). The
-    fill itself is left to KiCad (press B after opening) — computing
-    thermal spokes / clearance carving server-side isn't realistic, and a
-    stale fill is worse than none. Thermal-relief pad connection so THT
-    pads stay hand-solderable."""
+def _pour_zone(
+    path_d: str,
+    shrink_mm: float,
+    net_code: int,
+    net_name: str,
+    layers: tuple[str, ...],
+) -> list[str]:
+    """Unfilled copper pour(s) for `net_name` on the given layer(s), one
+    per outline piece. The fill itself is left to KiCad (press B after
+    opening) — computing thermal spokes / clearance carving server-side
+    isn't realistic, and a stale fill is worse than none. Thermal-relief
+    pad connection so THT pads stay hand-solderable."""
     out: list[str] = []
     for ring in _zone_polygon_rings(path_d, shrink_mm):
         pts = "".join(f"\t\t\t\t(xy {x:.4f} {y:.4f})\n" for x, y in ring)
-        for layer in ("F.Cu", "B.Cu"):
+        for layer in layers:
             out.append(
                 f"\t(zone\n"
-                f"\t\t(net {gnd_code})\n"
-                f'\t\t(net_name "{GND_NET_NAME}")\n'
+                f"\t\t(net {net_code})\n"
+                f'\t\t(net_name "{net_name}")\n'
                 f'\t\t(layer "{layer}")\n'
                 f'\t\t(uuid "{_u()}")\n'
-                f'\t\t(name "GND_{layer}")\n'
+                f'\t\t(name "{net_name}_{layer}")\n'
                 f"\t\t(hatch edge 0.5)\n"
                 f"\t\t(connect_pads (clearance 0.5))\n"
                 f"\t\t(min_thickness 0.25)\n"
@@ -1227,6 +1256,33 @@ def _gnd_zones(path_d: str, shrink_mm: float, gnd_code: int) -> list[str]:
                 f"\t)"
             )
     return out
+
+
+def compute_vcc_vias(switches: list[SwitchDef]) -> list[tuple[float, float]]:
+    """One VCC via per VCC pad — each LED VDD pad and each decoupling-cap
+    `+` pad. With the RGB split-plane scheme (GND pour on B.Cu, VCC pour
+    on F.Cu) the LED/cap VCC pads live on B.Cu, so a via-in-pad ties each
+    to the F.Cu VCC pour. Deterministic, shared by the pcb emitter and
+    the dsn router keepouts (mirrors `compute_stitching_vias`)."""
+    out: list[tuple[float, float]] = []
+    for sw in sorted(switches, key=lambda s: s.id):
+        ax, ay, lrot = _rgb_led_anchor(sw)
+        lx, ly = RGB_LED_PAD_LOCAL["1"]  # LED VDD
+        out.append(_rgb_pad_world(ax, ay, lrot, lx, ly))
+        bx, by, brot = _rgb_cap_anchor(sw)
+        cx, cy = RGB_CAP_PAD_LOCAL["1"]  # cap +
+        out.append(_rgb_pad_world(bx, by, brot, cx, cy))
+    return out
+
+
+def _vcc_vias(switches: list[SwitchDef], nets: dict[str, int]) -> list[str]:
+    vcc = nets[VCC_NET_NAME]
+    return [
+        f"\t(via (at {x:.4f} {y:.4f}) "
+        f"(size {STITCH_VIA_SIZE_MM:.4f}) (drill {STITCH_VIA_DRILL_MM:.4f}) "
+        f'(layers "F.Cu" "B.Cu") (net {vcc}) (uuid "{_u()}"))'
+        for x, y in compute_vcc_vias(switches)
+    ]
 
 
 # ---------------------------------------------------------------------------
