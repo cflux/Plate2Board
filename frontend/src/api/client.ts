@@ -1,6 +1,7 @@
 import type {
   DiodeType,
   MatrixStrategy,
+  McuType,
   ParseResult,
   StabilizerType,
   SwitchDef,
@@ -40,8 +41,9 @@ async function postBody(path: string, body: unknown): Promise<string> {
 export function generateNetlist(
   switches: SwitchDef[],
   rgb: boolean = false,
+  mcuType: McuType = 'pro_micro',
 ): Promise<string> {
-  const params = new URLSearchParams({ rgb: String(rgb) })
+  const params = new URLSearchParams({ rgb: String(rgb), mcu_type: mcuType })
   return postBody(`/api/generate-netlist?${params}`, { switches })
 }
 
@@ -51,12 +53,14 @@ export function generateSchematic(
   diodeType: DiodeType = 'tht',
   groundPour: boolean = true,
   rgb: boolean = false,
+  mcuType: McuType = 'pro_micro',
 ): Promise<string> {
   const params = new URLSearchParams({
     switch_type: switchType,
     diode_type: diodeType,
     ground_pour: String(groundPour),
     rgb: String(rgb),
+    mcu_type: mcuType,
   })
   return postBody(`/api/generate-schematic?${params}`, { switches })
 }
@@ -68,6 +72,7 @@ export function generatePcb(
   stabilizerType: StabilizerType = 'pcb_mount',
   groundPour: boolean = true,
   rgb: boolean = false,
+  mcuType: McuType = 'pro_micro',
 ): Promise<string> {
   const params = new URLSearchParams({
     switch_type: switchType,
@@ -75,6 +80,7 @@ export function generatePcb(
     stabilizer_type: stabilizerType,
     ground_pour: String(groundPour),
     rgb: String(rgb),
+    mcu_type: mcuType,
   })
   return postBody(`/api/generate-pcb?${params}`, result)
 }
@@ -87,6 +93,7 @@ export async function generateProjectZip(
   stabilizerType: StabilizerType = 'pcb_mount',
   groundPour: boolean = true,
   rgb: boolean = false,
+  mcuType: McuType = 'pro_micro',
 ): Promise<Blob> {
   const params = new URLSearchParams({
     project_name: projectName,
@@ -95,6 +102,7 @@ export async function generateProjectZip(
     stabilizer_type: stabilizerType,
     ground_pour: String(groundPour),
     rgb: String(rgb),
+    mcu_type: mcuType,
   })
   const res = await fetch(`/api/generate-project?${params}`, {
     method: 'POST',
@@ -173,6 +181,7 @@ export async function startRoutedProject(
   stabilizerType: StabilizerType = 'pcb_mount',
   groundPour: boolean = true,
   rgb: boolean = false,
+  mcuType: McuType = 'pro_micro',
 ): Promise<RouteJobStart> {
   const params = new URLSearchParams({
     project_name: projectName,
@@ -181,6 +190,7 @@ export async function startRoutedProject(
     stabilizer_type: stabilizerType,
     ground_pour: String(groundPour),
     rgb: String(rgb),
+    mcu_type: mcuType,
   })
   const res = await fetch(`/api/generate-routed-project?${params}`, {
     method: 'POST',

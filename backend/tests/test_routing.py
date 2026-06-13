@@ -998,3 +998,49 @@ def test_dsn_rgb_routes_gnd_when_pour_off() -> None:
     # GND joins the power class alongside VCC.
     power_class = re.search(r'\(class "power"(.*?)\)\s*\)', dsn, re.DOTALL).group(1)
     assert '"GND"' in power_class and '"VCC"' in power_class
+
+
+# --- MCU form factors: DSN ↔ pcb agreement + nets ----------------------------
+
+
+@pytest.mark.parametrize("mcu_type", ["xiao", "xiao_smd", "pico"])
+def test_pad_world_positions_match_kicad_pcb_per_mcu(mcu_type) -> None:
+    """The DSN pad-world view must coincide with the kicad_pcb pads for
+    every MCU profile (catches a footprint/image padstack drift)."""
+    parse = _result_rotated()
+    pcb_text = generate_pcb(
+        parse, switch_type="soldered", diode_type="tht",
+        stabilizer_type="pcb_mount", mcu_type=mcu_type,
+    )
+    kicad_pads, _ = _kicad_pad_worlds(pcb_text)
+    by_net = pad_world_positions(
+        parse, switch_type="soldered", diode_type="tht", mcu_type=mcu_type
+    )
+    for (ref, number), ((kx, ky), net_name) in kicad_pads.items():
+        if not net_name or net_name == "GND":
+            continue
+        entries = by_net.get(net_name, [])
+        assert any(
+            math.hypot(px - kx, py - ky) < 1e-3 for px, py, _r in entries
+        ), f"{ref}-{number} ({net_name}) [{mcu_type}] missing from DSN view"
+
+
+def test_dsn_xiao_smd_mcu_pads_are_f_cu_only() -> None:
+    """The castellated-SMD XIAO is the only F.Cu-only MCU padstack — its
+    DSN image pins must reference that padstack, not a thru-hole one."""
+    from app.services.routing.dsn import MCU_PADSTACKS
+
+    ps = MCU_PADSTACKS["xiao_smd"]
+    assert ps.kind == "rect"
+    assert ps.layers == ("F.Cu",)
+    # And the TH XIAO padstack is a both-layer circle.
+    assert MCU_PADSTACKS["xiao"].kind == "circle"
+
+
+def test_dsn_pico_nets_present() -> None:
+    parse = _result_two_keys()
+    dsn = pcb_to_dsn(parse, mcu_type="pico", rgb=True, ground_pour=False)
+    # VBUS (pin 40) → VCC, and the GND pins route when the pour is off.
+    assert '(net "VCC"' in dsn and "U1-40" in dsn
+    gnd = re.search(r'\(net "GND"\s*\(pins ([^)]*)\)', dsn)
+    assert gnd and "U1-3" in gnd.group(1).split()

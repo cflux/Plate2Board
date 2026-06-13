@@ -5,6 +5,7 @@ export type SwitchType = 'soldered' | 'hotswap'
 export type DiodeType = 'tht' | 'smd'
 
 export type StabilizerType = 'pcb_mount' | 'plate_mount'
+export type McuType = 'pro_micro' | 'xiao' | 'xiao_smd' | 'pico'
 
 export interface SwitchDef {
   id: number

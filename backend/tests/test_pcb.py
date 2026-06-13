@@ -1172,3 +1172,100 @@ def test_shrink_applies_to_zones_vias_and_dsn_boundary() -> None:
     for m in re.finditer(r"\(via \(at ([-\d.]+) ([-\d.]+)\) \(size 0\.6000\)", out):
         x, y = float(m.group(1)), float(m.group(2))
         assert 5.0 < x < 95.0 and 5.0 < y < 95.0
+
+
+# ---------------------------------------------------------------------------
+# MCU form factors (XIAO / Pico)
+# ---------------------------------------------------------------------------
+
+from app.services.mcu import get_mcu_profile  # noqa: E402
+
+
+def _mcu_result() -> ParseResult:
+    # 2×3 = 5 pins, fits every MCU even with RGB. Centered on a roomy
+    # board so MCU + switch pads clear the 0.5 mm edge setback.
+    sws = [
+        _sw(r * 3 + c + 1, 40.0 + c * 19.05, 40.0 + r * 19.05, row=r, col=c)
+        for r in range(2)
+        for c in range(3)
+    ]
+    res = _result(switches=sws, width=160.0, height=160.0)
+    return res.model_copy(update={
+        "mcu_placement": McuPlacement(cx_mm=70.0, cy_mm=90.0, rotation_deg=0.0),
+    })
+
+
+@pytest.mark.parametrize(
+    "mcu_type,footprint,last_pin,last_xy",
+    [
+        ("xiao", "keeb:XIAO", 14, (15.24, 0.0)),
+        ("xiao_smd", "keeb:XIAO_SMD", 14, (15.24 + 0.4625, 0.0)),
+        ("pico", "keeb:RaspberryPi_Pico", 40, (17.78, 0.0)),
+    ],
+)
+def test_mcu_footprint_emitted(mcu_type, footprint, last_pin, last_xy) -> None:
+    out = generate_pcb(_mcu_result(), mcu_type=mcu_type)
+    assert f'(footprint "{footprint}"' in out
+    mcu_block = re.search(
+        rf'\(footprint "{re.escape(footprint)}".+?\n\t\)', out, re.DOTALL
+    ).group(0)
+    # The MCU anchor sits at the placement; pads are local, so the last
+    # pin's LOCAL position relative to the anchor must match the profile.
+    prof = get_mcu_profile(mcu_type)
+    assert prof.pins[last_pin] == pytest.approx(last_xy)
+    # Pad count matches the profile.
+    assert mcu_block.count('(pad "') == len(prof.pins)
+    assert out.count("(") == out.count(")")
+
+
+def test_xiao_smd_pads_are_smd_no_drill() -> None:
+    out = generate_pcb(_mcu_result(), mcu_type="xiao_smd")
+    block = re.search(
+        r'\(footprint "keeb:XIAO_SMD".+?\n\t\)', out, re.DOTALL
+    ).group(0)
+    assert "thru_hole" not in block
+    assert "(drill" not in block
+    assert block.count("smd rect") == 14
+    assert '(layers "F.Cu" "F.Paste" "F.Mask")' in block
+
+
+def test_xiao_th_pads_have_drill() -> None:
+    out = generate_pcb(_mcu_result(), mcu_type="xiao")
+    block = re.search(
+        r'\(footprint "keeb:XIAO".+?\n\t\)', out, re.DOTALL
+    ).group(0)
+    assert block.count("thru_hole") == 14
+    assert "(drill 0.889)" in block
+
+
+def test_mcu_net_mapping_per_profile() -> None:
+    # Pico GND pins all carry GND with the pour; VBUS carries VCC with RGB.
+    out = generate_pcb(_mcu_result(), mcu_type="pico", rgb=True)
+    block = re.search(
+        r'\(footprint "keeb:RaspberryPi_Pico".+?\n\t\)', out, re.DOTALL
+    ).group(0)
+    prof = get_mcu_profile("pico")
+    for g in prof.gnd_pins:
+        assert re.search(rf'\(pad "{g}" [^\n]*"GND"\)', block), f"pin {g} GND"
+    assert re.search(rf'\(pad "{prof.power_5v_pin}" [^\n]*"VCC"\)', block)
+    # First gpio pin past the 5-key matrix drives the RGB chain.
+    data_pin = prof.gpio_pins[2 + 3]
+    assert re.search(rf'\(pad "{data_pin}" [^\n]*"RGB_DATA0"\)', block)
+
+
+def test_pico_lifts_gpio_ceiling_for_rgb() -> None:
+    # 5 rows × 13 cols = 18 GPIO + 1 RGB = 19: rejected by Pro Micro (18),
+    # accepted by the Pico (26). Big board so pads clear the edge.
+    sws = [
+        _sw(r * 13 + c + 1, 25.0 + c * 19.05, 25.0 + r * 19.05, row=r, col=c)
+        for r in range(5)
+        for c in range(13)
+    ]
+    parse = _result(switches=sws, width=320.0, height=160.0).model_copy(
+        update={"mcu_placement": McuPlacement(cx_mm=160.0, cy_mm=8.0, rotation_deg=0.0)}
+    )
+    with pytest.raises(ValueError, match="Pro Micro"):
+        generate_pcb(parse, rgb=True)  # default pro_micro
+    # Pico accepts it (no GPIO-budget error; geometry permitting).
+    out = generate_pcb(parse, mcu_type="pico", rgb=True)
+    assert '(footprint "keeb:RaspberryPi_Pico"' in out

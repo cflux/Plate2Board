@@ -64,7 +64,12 @@ ODD_ANGLES = (0.0, 7.0, 30.0, 45.0, 90.0, 113.0, 270.0)
 PAD_SLOP_MM = 0.2
 
 
-def build_parse() -> ParseResult:
+def build_parse(mcu_type: str = "pro_micro") -> ParseResult:
+    # The Pico is 51 mm long — far too tall for the 60 mm fixture sized
+    # for a Pro Micro. For big MCUs, drop onto a taller rectangular board
+    # with the module parked below the switch field (the concave-outline
+    # fence path is already covered by the Pro Micro variants).
+    big_mcu = mcu_type == "pico"
     switches = [
         SwitchDef(
             id=i + 1,
@@ -88,6 +93,25 @@ def build_parse() -> ParseResult:
         )
         for sid, local_x in ((1, -11.94), (2, 11.94))
     ]
+    if big_mcu:
+        # Plain 200 × 120 board; Pico parked below the switches, well
+        # clear of the 0.5 mm edge setback.
+        return ParseResult(
+            svg_width_mm=200.0,
+            svg_height_mm=120.0,
+            pcb_outline=PcbOutline(
+                width_mm=200.0, height_mm=120.0,
+                path_d="M 0 0 L 200 0 L 200 120 L 0 120 Z",
+            ),
+            switches=switches,
+            stabilizers=stabs,
+            mounting_holes=[
+                MountingHoleDef(id=1, cx_mm=10.0, cy_mm=10.0, diameter_mm=2.2),
+            ],
+            unclassified=[],
+            mcu_placement=McuPlacement(cx_mm=90.0, cy_mm=62.0, rotation_deg=0.0),
+            outline_shrink_mm=1.0,
+        )
     return ParseResult(
         svg_width_mm=200.0,
         svg_height_mm=60.0,
@@ -187,12 +211,16 @@ def point_segment_distance(
     return math.hypot(px - (x1 + t * dx), py - (y1 + t * dy))
 
 
-def verify(switch_type: str, diode_type: str, rgb: bool = False) -> bool:
-    label = f"[{switch_type}/{diode_type}{'/rgb' if rgb else ''}]"
-    parse = build_parse()
+def verify(
+    switch_type: str, diode_type: str, rgb: bool = False,
+    mcu_type: str = "pro_micro",
+) -> bool:
+    mcu_tag = "" if mcu_type == "pro_micro" else f"/{mcu_type}"
+    label = f"[{switch_type}/{diode_type}{'/rgb' if rgb else ''}{mcu_tag}]"
+    parse = build_parse(mcu_type)
     pcb_text = generate_pcb(
         parse, switch_type=switch_type, diode_type=diode_type,
-        stabilizer_type="pcb_mount", rgb=rgb,
+        stabilizer_type="pcb_mount", rgb=rgb, mcu_type=mcu_type,
     )
     print(f"{label} routing via freerouting…", flush=True)
     # Routes through the same via-cost-ladder runner production uses.
@@ -201,7 +229,8 @@ def verify(switch_type: str, diode_type: str, rgb: bool = False) -> bool:
     # rather than waiting out the production timeout.
     result = asyncio.run(routing_runner.route_board(
         parse, switch_type=switch_type, diode_type=diode_type,
-        stabilizer_type="pcb_mount", rgb=rgb, timeout_s=240.0,
+        stabilizer_type="pcb_mount", rgb=rgb, mcu_type=mcu_type,
+        timeout_s=240.0,
     ))
     routed_pcb, stats = apply_ses_to_pcb(
         pcb_text,
@@ -209,7 +238,8 @@ def verify(switch_type: str, diode_type: str, rgb: bool = False) -> bool:
         total_connections=result.stats.total_net_count,
         unrouted_connections=result.stats.unrouted_net_count,
         pad_positions=pad_world_positions(
-            parse, switch_type=switch_type, diode_type=diode_type, rgb=rgb
+            parse, switch_type=switch_type, diode_type=diode_type,
+            rgb=rgb, mcu_type=mcu_type,
         ),
     )
     ok = True
@@ -335,20 +365,25 @@ def verify(switch_type: str, diode_type: str, rgb: bool = False) -> bool:
 
 def main() -> int:
     all_ok = True
-    for switch_type, diode_type, rgb in (
-        ("soldered", "tht", False),
-        ("soldered", "smd", False),
-        ("hotswap", "tht", False),
-        ("hotswap", "smd", False),
+    for switch_type, diode_type, rgb, mcu_type in (
+        ("soldered", "tht", False, "pro_micro"),
+        ("soldered", "smd", False, "pro_micro"),
+        ("hotswap", "tht", False, "pro_micro"),
+        ("hotswap", "smd", False, "pro_micro"),
         # RGB adds LED/cap pads + cutout keepouts + VCC/data nets on the
         # already-busy B.Cu — route the two extreme variants.
-        ("soldered", "tht", True),
-        ("hotswap", "smd", True),
+        ("soldered", "tht", True, "pro_micro"),
+        ("hotswap", "smd", True, "pro_micro"),
+        # MCU form factors: the castellated-SMD XIAO (F.Cu-only MCU pads)
+        # and the Pico (40-pin, RGB).
+        ("soldered", "tht", False, "xiao_smd"),
+        ("hotswap", "smd", True, "pico"),
     ):
         try:
-            all_ok &= verify(switch_type, diode_type, rgb)
+            all_ok &= verify(switch_type, diode_type, rgb, mcu_type)
         except Exception as exc:  # noqa: BLE001 — report and fail
-            print(f"[{switch_type}/{diode_type}{'/rgb' if rgb else ''}] ERROR: {exc}")
+            tag = "" if mcu_type == "pro_micro" else f"/{mcu_type}"
+            print(f"[{switch_type}/{diode_type}{'/rgb' if rgb else ''}{tag}] ERROR: {exc}")
             all_ok = False
     print("E2E RESULT:", "PASS" if all_ok else "FAIL")
     return 0 if all_ok else 1

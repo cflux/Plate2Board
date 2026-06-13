@@ -24,9 +24,10 @@ def test_single_switch_creates_switch_diode_mcu() -> None:
     assert '(comp (ref "SW1")' in out
     assert '(comp (ref "D1")' in out
     assert '(comp (ref "U1")' in out
-    # MCU is a Pro Micro module.
+    # MCU is a Pro Micro module (footprint matches the schematic's
+    # bundled keeb: library so "Update PCB from Schematic" resolves).
     assert "ProMicro" in out
-    assert "Module:Arduino_Pro_Micro" in out
+    assert "keeb:Arduino_Pro_Micro" in out
     # COL2ROW: SW.1 → COL, D pin 1 (cathode) → ROW, SW.2 ↔ D.2 (anode).
     assert re.search(
         r'\(net \(code "\d+"\) \(name "COL0"\)\s+\(node \(ref "SW1"\) \(pin "1"\)\)',

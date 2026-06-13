@@ -30,6 +30,7 @@ def generate_project_zip(
     *,
     ground_pour: bool = True,
     rgb: bool = False,
+    mcu_type: str = "pro_micro",
     pcb_text_override: str | None = None,
 ) -> bytes:
     """Bundle the project ZIP. By default the PCB is regenerated from
@@ -41,7 +42,7 @@ def generate_project_zip(
 
     sch_text = generate_schematic(
         parse.switches, switch_type=switch_type, diode_type=diode_type,
-        ground_pour=ground_pour, rgb=rgb,
+        ground_pour=ground_pour, rgb=rgb, mcu_type=mcu_type,
     )
     if pcb_text_override is not None:
         pcb_text = pcb_text_override
@@ -53,6 +54,7 @@ def generate_project_zip(
             stabilizer_type=stabilizer_type,
             ground_pour=ground_pour,
             rgb=rgb,
+            mcu_type=mcu_type,
         )
     pro_text = _project_file(project_name, _extract_root_uuid(sch_text))
 

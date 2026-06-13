@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { MouseEvent, PointerEvent as ReactPointerEvent } from 'react'
-import type { ParseResult, SwitchDef } from '../types'
+import type { McuType, ParseResult, SwitchDef } from '../types'
 
 interface Props {
   file: File
@@ -10,6 +10,7 @@ interface Props {
   onSelectSwitch: (id: number | null) => void
   onFlipStab: (id: number) => void
   onMcuMove?: (cx: number, cy: number) => void
+  mcuType?: McuType
   inspectMode?: boolean
   editPlateMode?: boolean
   addingHole?: boolean
@@ -30,29 +31,62 @@ const SNAP_AXIS_TOL_MM = 2.0
 // ~1.5 mm from the USB-end of the board and ~0.11 mm from the left long
 // edge. Pin 1 is the anchor (local (0, 0)); the body extends to (BODY_X,
 // BODY_Y) → (BODY_X + W, BODY_Y + H). The USB connector protrudes
-// MCU_USB_NOTCH_MM further beyond the board's USB-end edge.
+// mk.usbNotch further beyond the board's USB-end edge.
 //
 // Through-hole pads at the body's long edges have ~0.85 mm radius and
 // stick out past the body by ~0.74 mm on each side. The dashed marker
 // envelope is the union of the body rect + pad clearance so placing the
 // marker's edge against a plate edge keeps every pad inside the board.
-const MCU_BODY_W_MM = 18.0
-const MCU_BODY_H_MM = 33.0
-const MCU_BODY_X_OFFSET = -0.11
-const MCU_BODY_Y_OFFSET = -1.5
-const MCU_PIN_GRID_W = 17.78
-const MCU_PIN_GRID_H = 27.94
-const MCU_PAD_RADIUS_MM = 0.85
-const MCU_USB_NOTCH_MM = 4.0
-// Marker envelope = union of body extent and pad-clearance extent.
-const MCU_MARKER_X = Math.min(MCU_BODY_X_OFFSET, -MCU_PAD_RADIUS_MM)
-const MCU_MARKER_Y = Math.min(MCU_BODY_Y_OFFSET, -MCU_PAD_RADIUS_MM)
-const MCU_MARKER_W =
-  Math.max(MCU_BODY_X_OFFSET + MCU_BODY_W_MM, MCU_PIN_GRID_W + MCU_PAD_RADIUS_MM) -
-  MCU_MARKER_X
-const MCU_MARKER_H =
-  Math.max(MCU_BODY_Y_OFFSET + MCU_BODY_H_MM, MCU_PIN_GRID_H + MCU_PAD_RADIUS_MM) -
-  MCU_MARKER_Y
+// Per-MCU marker geometry (mm). bodyXOff/bodyYOff place pin 1 (the
+// anchor) relative to the body; pinGrid is the pad field extent; padR is
+// the pad clearance radius; usbNotch is the connector stub at the pin-1
+// end. Sources match the backend mcu.py profiles.
+interface McuMarker {
+  bodyW: number
+  bodyH: number
+  bodyXOff: number
+  bodyYOff: number
+  pinGridW: number
+  pinGridH: number
+  padR: number
+  usbNotch: number
+  label: string
+}
+const MCU_MARKERS: Record<McuType, McuMarker> = {
+  pro_micro: {
+    bodyW: 18.0, bodyH: 33.0, bodyXOff: -0.11, bodyYOff: -1.5,
+    pinGridW: 17.78, pinGridH: 27.94, padR: 0.85, usbNotch: 4.0,
+    label: 'Pro Micro',
+  },
+  xiao: {
+    bodyW: 17.8, bodyH: 21.0, bodyXOff: -1.28, bodyYOff: -2.88,
+    pinGridW: 15.24, pinGridH: 15.24, padR: 0.762, usbNotch: 3.0,
+    label: 'XIAO',
+  },
+  xiao_smd: {
+    bodyW: 17.8, bodyH: 21.0, bodyXOff: -1.28, bodyYOff: -2.88,
+    pinGridW: 15.24 + 0.925, pinGridH: 15.24, padR: 1.0, usbNotch: 3.0,
+    label: 'XIAO (SMD)',
+  },
+  pico: {
+    bodyW: 21.0, bodyH: 51.0, bodyXOff: -1.61, bodyYOff: -1.37,
+    pinGridW: 17.78, pinGridH: 48.26, padR: 0.8, usbNotch: 4.0,
+    label: 'Raspberry Pi Pico',
+  },
+}
+
+// Derive the marker envelope (union of body + pad-clearance extent) and
+// expose all geometry as one object the component references.
+function mcuMarker(mcuType: McuType) {
+  const m = MCU_MARKERS[mcuType] ?? MCU_MARKERS.pro_micro
+  const markerX = Math.min(m.bodyXOff, -m.padR)
+  const markerY = Math.min(m.bodyYOff, -m.padR)
+  const markerW =
+    Math.max(m.bodyXOff + m.bodyW, m.pinGridW + m.padR) - markerX
+  const markerH =
+    Math.max(m.bodyYOff + m.bodyH, m.pinGridH + m.padR) - markerY
+  return { ...m, markerX, markerY, markerW, markerH }
+}
 
 // Inspect mode: how close (in world mm) the cursor must be to a feature
 // before the readout snaps to it.
@@ -242,6 +276,7 @@ export function SvgPreview({
   onSelectSwitch,
   onFlipStab,
   onMcuMove,
+  mcuType = 'pro_micro',
   inspectMode = false,
   editPlateMode = false,
   addingHole = false,
@@ -254,6 +289,7 @@ export function SvgPreview({
   onAddHole,
   onMoveHole,
 }: Props) {
+  const mk = mcuMarker(mcuType)
   const [svgUrl, setSvgUrl] = useState<string | null>(null)
   const overlayRef = useRef<SVGSVGElement | null>(null)
   const mcuDragRef = useRef<{ pointerId: number; offsetX: number; offsetY: number } | null>(null)
@@ -479,10 +515,10 @@ export function SvgPreview({
     const cos = Math.cos(rad)
     const sin = Math.sin(rad)
     const corners: Array<[number, number]> = [
-      [MCU_BODY_X_OFFSET, MCU_BODY_Y_OFFSET],
-      [MCU_BODY_X_OFFSET + MCU_BODY_W_MM, MCU_BODY_Y_OFFSET],
-      [MCU_BODY_X_OFFSET + MCU_BODY_W_MM, MCU_BODY_Y_OFFSET + MCU_BODY_H_MM],
-      [MCU_BODY_X_OFFSET, MCU_BODY_Y_OFFSET + MCU_BODY_H_MM],
+      [mk.bodyXOff, mk.bodyYOff],
+      [mk.bodyXOff + mk.bodyW, mk.bodyYOff],
+      [mk.bodyXOff + mk.bodyW, mk.bodyYOff + mk.bodyH],
+      [mk.bodyXOff, mk.bodyYOff + mk.bodyH],
     ]
     let bodyXmin = Infinity
     let bodyXmax = -Infinity
@@ -771,18 +807,18 @@ export function SvgPreview({
       const sin = Math.sin(rad)
       const localCornerSets: Array<[number, number, string]> = []
       for (const [lx, ly] of [
-        [MCU_BODY_X_OFFSET, MCU_BODY_Y_OFFSET],
-        [MCU_BODY_X_OFFSET + MCU_BODY_W_MM, MCU_BODY_Y_OFFSET],
-        [MCU_BODY_X_OFFSET + MCU_BODY_W_MM, MCU_BODY_Y_OFFSET + MCU_BODY_H_MM],
-        [MCU_BODY_X_OFFSET, MCU_BODY_Y_OFFSET + MCU_BODY_H_MM],
+        [mk.bodyXOff, mk.bodyYOff],
+        [mk.bodyXOff + mk.bodyW, mk.bodyYOff],
+        [mk.bodyXOff + mk.bodyW, mk.bodyYOff + mk.bodyH],
+        [mk.bodyXOff, mk.bodyYOff + mk.bodyH],
       ]) {
         localCornerSets.push([lx, ly, 'MCU body corner'])
       }
       for (const [lx, ly] of [
-        [MCU_MARKER_X, MCU_MARKER_Y],
-        [MCU_MARKER_X + MCU_MARKER_W, MCU_MARKER_Y],
-        [MCU_MARKER_X + MCU_MARKER_W, MCU_MARKER_Y + MCU_MARKER_H],
-        [MCU_MARKER_X, MCU_MARKER_Y + MCU_MARKER_H],
+        [mk.markerX, mk.markerY],
+        [mk.markerX + mk.markerW, mk.markerY],
+        [mk.markerX + mk.markerW, mk.markerY + mk.markerH],
+        [mk.markerX, mk.markerY + mk.markerH],
       ]) {
         localCornerSets.push([lx, ly, 'MCU outline corner'])
       }
@@ -1143,16 +1179,16 @@ export function SvgPreview({
               <rect
                 x={
                   result.mcu_placement.cx_mm +
-                  MCU_BODY_X_OFFSET +
-                  MCU_BODY_W_MM * 0.30
+                  mk.bodyXOff +
+                  mk.bodyW * 0.30
                 }
                 y={
                   result.mcu_placement.cy_mm +
-                  MCU_BODY_Y_OFFSET -
-                  MCU_USB_NOTCH_MM
+                  mk.bodyYOff -
+                  mk.usbNotch
                 }
-                width={MCU_BODY_W_MM * 0.40}
-                height={MCU_USB_NOTCH_MM}
+                width={mk.bodyW * 0.40}
+                height={mk.usbNotch}
                 fill="rgba(60, 60, 70, 0.95)"
                 stroke="rgba(20, 20, 30, 0.95)"
                 strokeWidth={stroke * 0.6}
@@ -1161,10 +1197,10 @@ export function SvgPreview({
                   Placing this outline against the plate edge keeps every
                   pad safely inside the board. */}
               <rect
-                x={result.mcu_placement.cx_mm + MCU_MARKER_X}
-                y={result.mcu_placement.cy_mm + MCU_MARKER_Y}
-                width={MCU_MARKER_W}
-                height={MCU_MARKER_H}
+                x={result.mcu_placement.cx_mm + mk.markerX}
+                y={result.mcu_placement.cy_mm + mk.markerY}
+                width={mk.markerW}
+                height={mk.markerH}
                 fill="rgba(40, 70, 200, 0.10)"
                 stroke="rgba(40, 70, 200, 0.55)"
                 strokeWidth={stroke * 0.6}
@@ -1173,10 +1209,10 @@ export function SvgPreview({
               {/* Module body (18 × 33 mm). Pin 1 sits at the anchor, with
                   the body extending up and out around it per the offsets. */}
               <rect
-                x={result.mcu_placement.cx_mm + MCU_BODY_X_OFFSET}
-                y={result.mcu_placement.cy_mm + MCU_BODY_Y_OFFSET}
-                width={MCU_BODY_W_MM}
-                height={MCU_BODY_H_MM}
+                x={result.mcu_placement.cx_mm + mk.bodyXOff}
+                y={result.mcu_placement.cy_mm + mk.bodyYOff}
+                width={mk.bodyW}
+                height={mk.bodyH}
                 fill="rgba(40, 70, 200, 0.20)"
                 stroke="rgba(40, 70, 200, 0.95)"
                 strokeWidth={stroke}
@@ -1191,9 +1227,9 @@ export function SvgPreview({
                 strokeWidth={dotR * 0.15}
               >
                 <title>
-                  Pro Micro U1 — pin 1 (USB end){'\n'}
+                  {mk.label} U1 — pin 1 (USB end){'\n'}
                   ({result.mcu_placement.cx_mm.toFixed(2)}, {result.mcu_placement.cy_mm.toFixed(2)}) mm{'\n'}
-                  body {MCU_BODY_W_MM.toFixed(2)} × {MCU_BODY_H_MM.toFixed(2)} mm{'\n'}
+                  body {mk.bodyW.toFixed(2)} × {mk.bodyH.toFixed(2)} mm{'\n'}
                   rotation {result.mcu_placement.rotation_deg.toFixed(1)}°
                 </title>
               </circle>

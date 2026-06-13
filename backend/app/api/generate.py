@@ -14,6 +14,7 @@ from ..services.pcb import (
     SWITCH_TYPES,
     generate_pcb,
 )
+from ..services.mcu import MCU_TYPES
 from ..services.plate_svg import generate_plate_svg
 from ..services.project import DEFAULT_PROJECT_NAME, generate_project_zip
 from ..services.routing import client as routing_client
@@ -27,15 +28,29 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
+def _check_mcu_type(mcu_type: str) -> None:
+    if mcu_type not in MCU_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"mcu_type must be one of {sorted(MCU_TYPES)}, got {mcu_type!r}",
+        )
+
+
 class NetlistRequest(BaseModel):
     switches: list[SwitchDef]
 
 
 @router.post("/generate-netlist", response_class=PlainTextResponse)
 async def post_generate_netlist(
-    req: NetlistRequest, ground_pour: bool = True, rgb: bool = False
+    req: NetlistRequest,
+    ground_pour: bool = True,
+    rgb: bool = False,
+    mcu_type: str = "pro_micro",
 ) -> PlainTextResponse:
-    text = generate_netlist(req.switches, ground_pour=ground_pour, rgb=rgb)
+    _check_mcu_type(mcu_type)
+    text = generate_netlist(
+        req.switches, ground_pour=ground_pour, rgb=rgb, mcu_type=mcu_type
+    )
     return PlainTextResponse(
         content=text,
         headers={"Content-Disposition": 'attachment; filename="keyboard.net"'},
@@ -49,11 +64,13 @@ async def post_generate_schematic(
     diode_type: str = "tht",
     ground_pour: bool = True,
     rgb: bool = False,
+    mcu_type: str = "pro_micro",
 ) -> PlainTextResponse:
     if not req.switches:
         raise HTTPException(
             status_code=400, detail="cannot generate schematic from zero switches"
         )
+    _check_mcu_type(mcu_type)
     if switch_type not in SWITCH_TYPES:
         raise HTTPException(
             status_code=400,
@@ -67,7 +84,7 @@ async def post_generate_schematic(
     try:
         text = generate_schematic(
             req.switches, switch_type=switch_type, diode_type=diode_type,
-            ground_pour=ground_pour, rgb=rgb,
+            ground_pour=ground_pour, rgb=rgb, mcu_type=mcu_type,
         )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"SKiDL failed: {exc}") from exc
@@ -87,6 +104,7 @@ async def post_generate_pcb(
     stabilizer_type: str = "pcb_mount",
     ground_pour: bool = True,
     rgb: bool = False,
+    mcu_type: str = "pro_micro",
 ) -> PlainTextResponse:
     if not req.switches:
         raise HTTPException(
@@ -116,6 +134,7 @@ async def post_generate_pcb(
                 f"got {stabilizer_type!r}"
             ),
         )
+    _check_mcu_type(mcu_type)
     try:
         text = generate_pcb(
             req,
@@ -124,6 +143,7 @@ async def post_generate_pcb(
             stabilizer_type=stabilizer_type,
             ground_pour=ground_pour,
             rgb=rgb,
+            mcu_type=mcu_type,
         )
     except ValueError as exc:
         # Board-level validation (pad edge setback, degenerate shrink,
@@ -165,6 +185,7 @@ async def post_generate_project(
     stabilizer_type: str = "pcb_mount",
     ground_pour: bool = True,
     rgb: bool = False,
+    mcu_type: str = "pro_micro",
 ) -> Response:
     if not req.switches:
         raise HTTPException(
@@ -194,6 +215,7 @@ async def post_generate_project(
                 f"got {stabilizer_type!r}"
             ),
         )
+    _check_mcu_type(mcu_type)
     try:
         zip_bytes = generate_project_zip(
             req,
@@ -203,6 +225,7 @@ async def post_generate_project(
             stabilizer_type=stabilizer_type,
             ground_pour=ground_pour,
             rgb=rgb,
+            mcu_type=mcu_type,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -261,6 +284,7 @@ async def post_generate_routed_project(
     stabilizer_type: str = "pcb_mount",
     ground_pour: bool = True,
     rgb: bool = False,
+    mcu_type: str = "pro_micro",
 ) -> dict:
     """Kick off an auto-routed project build. Returns immediately with a
     job id; the actual routing happens in a background task. Poll
@@ -268,6 +292,7 @@ async def post_generate_routed_project(
     once `state == "done"` to download the routed ZIP.
     """
     _validate_project_args(req, switch_type, diode_type, stabilizer_type)
+    _check_mcu_type(mcu_type)
     # Pre-flight: run the full board validation (pad edge setback, shrink
     # degeneracy, GPIO budget) before spinning up a job, so the user gets
     # an instant 400 instead of a failed job.
@@ -279,6 +304,7 @@ async def post_generate_routed_project(
             stabilizer_type=stabilizer_type,
             ground_pour=ground_pour,
             rgb=rgb,
+            mcu_type=mcu_type,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -287,7 +313,7 @@ async def post_generate_routed_project(
     asyncio.create_task(
         _run_routed_job(
             job_id, req, project_name, switch_type, diode_type,
-            stabilizer_type, ground_pour, rgb,
+            stabilizer_type, ground_pour, rgb, mcu_type,
         )
     )
     return {
@@ -362,6 +388,7 @@ async def _run_routed_job(
     stabilizer_type: str,
     ground_pour: bool = True,
     rgb: bool = False,
+    mcu_type: str = "pro_micro",
 ) -> None:
     """Background task: full pipeline from ParseResult to routed ZIP.
 
@@ -383,6 +410,7 @@ async def _run_routed_job(
             stabilizer_type=stabilizer_type,
             ground_pour=ground_pour,
             rgb=rgb,
+            mcu_type=mcu_type,
         )
 
         await store.update(job_id, phase="routing", percent=20.0)
@@ -413,6 +441,7 @@ async def _run_routed_job(
             stabilizer_type=stabilizer_type,
             ground_pour=ground_pour,
             rgb=rgb,
+            mcu_type=mcu_type,
             progress_cb=on_progress,
         )
 
@@ -432,6 +461,7 @@ async def _run_routed_job(
                 stabilizer_type=stabilizer_type,
                 rgb=rgb,
                 ground_pour=ground_pour,
+                mcu_type=mcu_type,
             ),
         )
         if splice_stats.unattached_pad_count:
@@ -449,6 +479,7 @@ async def _run_routed_job(
             stabilizer_type=stabilizer_type,
             ground_pour=ground_pour,
             rgb=rgb,
+            mcu_type=mcu_type,
             pcb_text_override=routed_pcb,
         )
 

@@ -19,24 +19,14 @@ from .footprints import (
     DiodeType,
     SwitchType,
     diode_footprint,
-    mcu_footprint,
     switch_footprint,
 )
 from .matrix import renumber_switches
+from .mcu import DEFAULT_MCU_TYPE, get_mcu_profile
 
 MCU_REF = "U1"
 KICAD_SYMBOL_DIR = os.environ.get("KICAD_SYMBOL_DIR", "/usr/share/kicad/symbols")
 KEEB_SYMBOL_DIR = os.environ.get("KEEB_SYMBOL_DIR", "/opt/keeb-symbols")
-
-# Pro Micro pins available for matrix GPIO. Skips the GND pins (3, 4, 23 —
-# wired to the GND net when the ground pour is enabled), power (21, 24) and
-# RST (22). Order matches the silkscreen labels you'd read on the board:
-# left side D2..D9 first, then right side D10..A3.
-PRO_MICRO_GPIO_PINS = [
-    5, 6, 7, 8, 9, 10, 11, 12,    # left side: D2, D3, D4, D5, D6, D7, D8, D9
-    13, 14, 15, 16, 17, 18, 19, 20,  # right side: D10, D16, D14, D15, A0, A1, A2, A3
-    1, 2,  # TX0/RX1 — used last because some firmware reserves them for serial
-]
 
 
 def generate_schematic(
@@ -46,6 +36,7 @@ def generate_schematic(
     diode_type: DiodeType = "tht",
     ground_pour: bool = True,
     rgb: bool = False,
+    mcu_type: str = DEFAULT_MCU_TYPE,
 ) -> str:
     """Emit the .kicad_sch text. `switch_type` / `diode_type` select the
     footprint property that's written into each symbol — they MUST match
@@ -68,14 +59,16 @@ def generate_schematic(
         if path not in skidl.lib_search_paths[skidl.KICAD]:
             skidl.lib_search_paths[skidl.KICAD].append(path)
 
+    mcu_profile = get_mcu_profile(mcu_type)
+    gpio_pins = list(mcu_profile.gpio_pins)
     rows = sorted({s.row for s in switches})
     cols = sorted({s.col for s in switches})
     n_pins_needed = len(rows) + len(cols) + (1 if rgb else 0)
-    if n_pins_needed > len(PRO_MICRO_GPIO_PINS):
+    if n_pins_needed > len(gpio_pins):
         raise ValueError(
             f"matrix needs {n_pins_needed} GPIO pins"
-            f"{' (incl. 1 for the RGB chain)' if rgb else ''}, but Pro Micro "
-            f"only has {len(PRO_MICRO_GPIO_PINS)} available"
+            f"{' (incl. 1 for the RGB chain)' if rgb else ''}, but the "
+            f"{mcu_profile.display} only has {len(gpio_pins)} available"
         )
 
     SW = skidl.Part(
@@ -88,9 +81,9 @@ def generate_schematic(
     )
     mcu = skidl.Part(
         "Keyboard_MCU",
-        "ProMicro",
+        mcu_profile.symbol_name,
         ref=MCU_REF,
-        footprint=mcu_footprint(),
+        footprint=mcu_profile.footprint_name,
     )
 
     row_nets = {r: skidl.Net(f"ROW{r}") for r in rows}
@@ -109,10 +102,10 @@ def generate_schematic(
         s[2] += d["K"]
         row_nets[sw.row] += d["A"]
 
-    # Map rows then cols to Pro Micro GPIO pins in the order they appear
-    # in PRO_MICRO_GPIO_PINS (D2 first, then D3, ...). Firmware can re-map
-    # in `config.h` if a different physical pinout is desired.
-    pin_iter = iter(PRO_MICRO_GPIO_PINS)
+    # Map rows then cols to the MCU's GPIO pins in allocation order.
+    # Firmware can re-map in `config.h` if a different physical pinout is
+    # desired.
+    pin_iter = iter(gpio_pins)
     for r in rows:
         row_nets[r] += mcu[next(pin_iter)]
     for c in cols:
@@ -124,7 +117,7 @@ def generate_schematic(
     # would try to remove the zones' net.
     if ground_pour or rgb:
         gnd = skidl.Net("GND")
-        for pin in (3, 4, 23):
+        for pin in mcu_profile.gnd_pins:
             gnd += mcu[pin]
 
     if rgb:
@@ -145,8 +138,8 @@ def generate_schematic(
         from .pcb import rgb_chain_indices
 
         vcc = skidl.Net("VCC")
-        vcc += mcu[24]
-        data_pin = PRO_MICRO_GPIO_PINS[len(rows) + len(cols)]
+        vcc += mcu[mcu_profile.power_5v_pin]
+        data_pin = gpio_pins[len(rows) + len(cols)]
         chain = skidl.Net("RGB_DATA0")
         chain += mcu[data_pin]
         indices = rgb_chain_indices(switches)
@@ -176,7 +169,7 @@ def generate_schematic(
         text = Path(td, "keyboard.kicad_sch").read_text()
 
     text = _fix_visibility_tokens(text)
-    text = _reorganize_to_grid(text, switches, rgb=rgb)
+    text = _reorganize_to_grid(text, switches, mcu_profile, rgb=rgb)
     return text
 
 
@@ -244,7 +237,7 @@ _PAPER_RE = re.compile(r'\(paper "[^"]+"\)')
 
 
 def _reorganize_to_grid(
-    text: str, switches: list[SwitchDef], *, rgb: bool = False
+    text: str, switches: list[SwitchDef], mcu_profile, *, rgb: bool = False
 ) -> str:
     """Move each placed symbol (and its associated labels) to a deterministic
     grid. Diodes get rotated 270° so their cathode points down toward the
@@ -258,7 +251,7 @@ def _reorganize_to_grid(
         return text
 
     lib_pins = _parse_lib_pins(text)
-    targets = _grid_targets(switches, rgb=rgb)
+    targets = _grid_targets(switches, mcu_profile, rgb=rgb)
 
     # PHASE 1 — char-range deletions (N$ link labels). These have to happen
     # via char ranges because the last label in the file shares its closing
@@ -326,8 +319,10 @@ def _reorganize_to_grid(
             _set_diode_property_positions(new_lines, ps)
         # ProMicro's Value defaults to below the symbol. Move it above so
         # the part number reads cleanly above the body.
-        elif ps["lib_id"] == "Keyboard_MCU:ProMicro":
-            _set_mcu_property_positions(new_lines, ps)
+        elif ps["lib_id"].startswith("Keyboard_MCU:"):
+            _set_mcu_property_positions(
+                new_lines, ps, mcu_profile.sym_body_half_h
+            )
 
     for mov in movables:
         if mov["line_start"] not in associations:
@@ -492,7 +487,7 @@ def _grid_spacing(rgb: bool) -> tuple[float, float]:
 
 
 def _grid_targets(
-    switches: list[SwitchDef], *, rgb: bool = False
+    switches: list[SwitchDef], mcu_profile, *, rgb: bool = False
 ) -> dict[str, tuple[float, float, float]]:
     """Target (x, y, rotation_deg) per placed-symbol reference.
 
@@ -516,21 +511,16 @@ def _grid_targets(
             targets[f"C{sw.id}"] = (
                 sx + GRID_CAP_OFFSET_X_MM, sy + GRID_LED_OFFSET_Y_MM, 0.0
             )
-    targets[MCU_REF] = (GRID_HEADER_X_MM, _header_y(switches), 0.0)
+    targets[MCU_REF] = (GRID_HEADER_X_MM, _header_y(mcu_profile), 0.0)
     return targets
 
 
-# ProMicro symbol's top-most pin (pin 1) sits at lib Y = 13.97; after the
-# Y-mirror flip it lands at `anchor_y - 13.97` globally. The bounding-box
-# rectangle extends to lib Y = 16.51 (so 16.51 above anchor in screen).
-PRO_MICRO_TOP_PIN_LIB_Y = 13.97
-PRO_MICRO_BODY_HALF_HEIGHT = 16.51
-
-
-def _header_y(switches: list[SwitchDef]) -> float:
+def _header_y(mcu_profile) -> float:
     """Pick the MCU anchor Y so the symbol's top edge sits below the
     COL2ROW note (with NOTE_TO_J1_GAP_MM clearance)."""
-    needed = COL2ROW_NOTE_Y_MM + NOTE_TO_J1_GAP_MM + PRO_MICRO_BODY_HALF_HEIGHT
+    needed = (
+        COL2ROW_NOTE_Y_MM + NOTE_TO_J1_GAP_MM + mcu_profile.sym_body_half_h
+    )
     return max(GRID_HEADER_Y_MM, needed)
 
 
@@ -790,8 +780,8 @@ def _set_at_in_line(line: str, x: float, y: float, rot: float) -> str:
 DIODE_REFERENCE_OFFSET_X_MM = -5.0
 DIODE_VALUE_OFFSET_X_MM = 5.0
 
-# ProMicro Value text sits this far above the top edge of the symbol body.
-PRO_MICRO_VALUE_ABOVE_MARGIN_MM = 2.5
+# MCU Value text sits this far above the top edge of the symbol body.
+MCU_VALUE_ABOVE_MARGIN_MM = 2.5
 # How far outboard each Pro Micro pin's label is shifted (left labels go
 # further left, right labels go further right) so they don't crowd the body.
 MCU_LABEL_OUTBOARD_OFFSET_MM = 2.0
@@ -833,12 +823,14 @@ def _set_diode_property_positions(new_lines: list[str], ps: dict) -> None:
             in_ref = in_val = False
 
 
-def _set_mcu_property_positions(new_lines: list[str], ps: dict) -> None:
-    """Center the Pro Micro 'Value' text (e.g. 'ProMicro') above the symbol
-    body. The library symbol places it below by default; after the anchor
-    translation it lands below the body, which collides with COL labels."""
+def _set_mcu_property_positions(
+    new_lines: list[str], ps: dict, body_half_h: float
+) -> None:
+    """Center the MCU 'Value' text above the symbol body. The library
+    symbol places it below by default; after the anchor translation it
+    lands below the body, which collides with COL labels."""
     val_x = ps["new_x"]
-    val_y = ps["new_y"] - PRO_MICRO_BODY_HALF_HEIGHT - PRO_MICRO_VALUE_ABOVE_MARGIN_MM
+    val_y = ps["new_y"] - body_half_h - MCU_VALUE_ABOVE_MARGIN_MM
 
     in_val = False
     at_pat = re.compile(r"^\s+\(at\s+[-+\d.]+\s+[-+\d.]+\s+[-+\d.]+\s*\)\s*$")

@@ -38,6 +38,7 @@ import math
 from dataclasses import dataclass, field
 
 from ...models.schemas import ParseResult, SwitchDef
+from ..mcu import DEFAULT_MCU_TYPE, MCU_PROFILES, McuProfile, get_mcu_profile
 from ..pcb import (
     CHERRY_STAB_HOUSING_HOLE_MM,
     CHERRY_STAB_HOUSING_OFFSET_Y_MM,
@@ -47,10 +48,7 @@ from ..pcb import (
     DiodeType,
     GND_NET_NAME,
     HOTSWAP_PIN_NPTH_LOCAL,
-    MCU_GND_PINS,
-    MCU_RAW_PIN,
     MCU_REF,
-    PRO_MICRO_GPIO_PINS,
     RGB_CAP_PAD_LOCAL,
     RGB_CAP_PAD_SIZE,
     RGB_CUTOUT_H_MM,
@@ -225,7 +223,21 @@ PS_SW_TH = Padstack("Round_2p5_TH", "circle", 2.5, 2.5)
 PS_SW_HOTSWAP = Padstack("Smd_2p55x2p5_B", "rect", 2.55, 2.5, layers=(LAYER_B_CU,))
 PS_DIODE_TH = Padstack("Round_1p6_TH", "circle", 1.6, 1.6)
 PS_DIODE_SMD = Padstack("Smd_1p0x0p6_B", "rect", 1.0, 0.6, layers=(LAYER_B_CU,))
-PS_PROMICRO_TH = Padstack("Round_1p7_TH", "circle", 1.7, 1.7)
+def _mcu_padstack(mcu: McuProfile) -> Padstack:
+    """Padstack for an MCU profile: TH circle on both signal layers, or
+    an F.Cu-only SMD rect for the castellated-SMD XIAO."""
+    w, h = mcu.pad_size
+    if mcu.drill_mm is None:
+        return Padstack(
+            f"Smd_{w:g}x{h:g}_F".replace(".", "p"),
+            "rect", w, h, layers=(LAYER_F_CU,),
+        )
+    return Padstack(f"Round_{w:g}_TH".replace(".", "p"), "circle", w, h)
+
+
+MCU_PADSTACKS: dict[str, Padstack] = {
+    key: _mcu_padstack(p) for key, p in MCU_PROFILES.items()
+}
 PS_RGB_LED = Padstack(
     "Smd_1p6x0p8_B", "rect",
     RGB_LED_PAD_SIZE[0], RGB_LED_PAD_SIZE[1], layers=(LAYER_B_CU,),
@@ -240,7 +252,6 @@ ALL_PADSTACKS: tuple[Padstack, ...] = (
     PS_SW_HOTSWAP,
     PS_DIODE_TH,
     PS_DIODE_SMD,
-    PS_PROMICRO_TH,
     PS_RGB_LED,
     PS_RGB_CAP,
 )
@@ -287,18 +298,26 @@ def _diode_smd_image() -> Image:
     )
 
 
-def _pro_micro_image() -> Image:
-    """24-pin 2×12 thru-hole grid, mirrors `_pro_micro_footprint` in pcb.py."""
-    pins: list[ImagePin] = []
-    for pin in range(1, 25):
-        if pin <= 12:
-            x = 0.0
-            y = (pin - 1) * 2.54
-        else:
-            x = 17.78
-            y = (24 - pin) * 2.54
-        pins.append(ImagePin(str(pin), PS_PROMICRO_TH, x, y))
-    return Image(name="u_pro_micro", pins=pins)
+def _mcu_image_name(mcu_type: str) -> str:
+    return f"u_mcu_{mcu_type}"
+
+
+def _make_mcu_image_builder(mcu: McuProfile):
+    """Build an MCU DSN image from the profile's pin table, mirroring
+    `pcb._mcu_footprint` so the DSN and kicad_pcb pads coincide."""
+    ps = MCU_PADSTACKS[mcu.key]
+    name = _mcu_image_name(mcu.key)
+
+    def builder() -> Image:
+        return Image(
+            name=name,
+            pins=[
+                ImagePin(str(pin), ps, x, y)
+                for pin, (x, y) in sorted(mcu.pins.items())
+            ],
+        )
+
+    return builder
 
 
 def _rgb_led_image() -> Image:
@@ -328,9 +347,12 @@ IMAGE_BUILDERS = {
     "sw_cherry_mx_hotswap": _switch_hotswap_image,
     "d_diode_tht": _diode_tht_image,
     "d_diode_smd": _diode_smd_image,
-    "u_pro_micro": _pro_micro_image,
     "led_sk6812_mini_e": _rgb_led_image,
     "c_0603": _rgb_cap_image,
+    **{
+        _mcu_image_name(key): _make_mcu_image_builder(p)
+        for key, p in MCU_PROFILES.items()
+    },
 }
 
 
@@ -406,15 +428,16 @@ def _diode_components(
 def _mcu_components(
     parse: ParseResult,
     nets: dict[str, int],
+    mcu: McuProfile,
     *,
     rgb: bool = False,
     route_gnd: bool = False,
 ) -> list[Component]:
-    # Only ROW/COL (+ RGB) pins get nets here by default — GND (MCU pins
-    # 3/4/23) is carried by the copper pours, not traces, so it stays out
-    # of the DSN network unless the pour is disabled while RGB needs GND
-    # (`route_gnd`). Freerouting treats netless pads as plain obstacles,
-    # and the stitching vias are walled off via `_stitching_via_keepouts`.
+    # Only ROW/COL (+ RGB) pins get nets here by default — GND is carried
+    # by the copper pours, not traces, so it stays out of the DSN network
+    # unless the pour is disabled while RGB needs GND (`route_gnd`).
+    # Freerouting treats netless pads as plain obstacles, and the
+    # stitching vias are walled off via `_stitching_via_keepouts`.
     if parse.mcu_placement is None:
         return []
     m = parse.mcu_placement
@@ -422,7 +445,7 @@ def _mcu_components(
     cols = sorted({s.col for s in parse.switches})
     nets_per_pin: dict[str, str] = {}
     n_rows = len(rows)
-    for i, pin in enumerate(PRO_MICRO_GPIO_PINS):
+    for i, pin in enumerate(mcu.gpio_pins):
         if i < n_rows:
             nets_per_pin[str(pin)] = f"ROW{rows[i]}"
         else:
@@ -432,13 +455,13 @@ def _mcu_components(
             elif rgb and c_idx == len(cols):
                 nets_per_pin[str(pin)] = RGB_DATA_NET_FMT.format(0)
     if rgb:
-        nets_per_pin[str(MCU_RAW_PIN)] = VCC_NET_NAME
+        nets_per_pin[str(mcu.power_5v_pin)] = VCC_NET_NAME
     if route_gnd:
-        for pin in MCU_GND_PINS:
+        for pin in mcu.gnd_pins:
             nets_per_pin[str(pin)] = GND_NET_NAME
     return [
         Component(
-            image_name="u_pro_micro",
+            image_name=_mcu_image_name(mcu.key),
             ref=MCU_REF,
             place_x=m.cx_mm,
             place_y=m.cy_mm,
@@ -572,6 +595,7 @@ def _stitching_via_keepouts(
     diode_type: DiodeType,
     stabilizer_type: StabilizerType,
     rgb: bool = False,
+    mcu_type: str = DEFAULT_MCU_TYPE,
 ) -> list[KeepoutCircle]:
     """GND stitching vias are real copper on both layers, but GND never
     enters the DSN network (the pour carries it, not traces — see
@@ -590,6 +614,7 @@ def _stitching_via_keepouts(
         diode_type=diode_type,
         stabilizer_type=stabilizer_type,
         rgb=rgb,
+        mcu_type=mcu_type,
     )
     return [KeepoutCircle(VIA_PAD_DIAMETER_MM, x, y) for x, y in positions]
 
@@ -985,6 +1010,7 @@ def _build_components(
     *,
     rgb: bool = False,
     ground_pour: bool = True,
+    mcu_type: str = DEFAULT_MCU_TYPE,
 ) -> list[Component]:
     nets = _enumerate_nets(parse.switches)
     # Same resolver call generate_pcb makes on the same prepared parse, so
@@ -998,6 +1024,7 @@ def _build_components(
         diode_type=diode_type,
         stabilizer_type=stabilizer_type,
         rgb=rgb,
+        mcu_type=mcu_type,
     )
     # GND is pour-carried when the pour exists; without it the RGB parts
     # still need ground, so GND becomes an ordinary routed net.
@@ -1006,7 +1033,10 @@ def _build_components(
     components.extend(_switch_components(parse, nets, switch_type))
     components.extend(_diode_components(parse, nets, diode_type, placements))
     components.extend(
-        _mcu_components(parse, nets, rgb=rgb, route_gnd=route_gnd)
+        _mcu_components(
+            parse, nets, get_mcu_profile(mcu_type),
+            rgb=rgb, route_gnd=route_gnd,
+        )
     )
     if rgb:
         components.extend(_rgb_components(parse, route_gnd=route_gnd))
@@ -1021,6 +1051,7 @@ def pad_world_positions(
     stabilizer_type: StabilizerType = "pcb_mount",
     rgb: bool = False,
     ground_pour: bool = True,
+    mcu_type: str = DEFAULT_MCU_TYPE,
 ) -> dict[str, list[tuple[float, float, float]]]:
     """Net name → ``[(x_mm, y_mm, radius_mm)]`` of every connected pad, in
     KiCad Y-down coordinates after the same centering/renumbering
@@ -1037,7 +1068,7 @@ def pad_world_positions(
     parse = _prepare_parse(parse)
     components = _build_components(
         parse, switch_type, diode_type, stabilizer_type,
-        rgb=rgb, ground_pour=ground_pour,
+        rgb=rgb, ground_pour=ground_pour, mcu_type=mcu_type,
     )
     images = {
         name: IMAGE_BUILDERS[name]()
@@ -1069,6 +1100,7 @@ def pcb_to_dsn(
     via_costs: int = VIA_COSTS,
     ground_pour: bool = True,
     rgb: bool = False,
+    mcu_type: str = DEFAULT_MCU_TYPE,
 ) -> str:
     """Build a Specctra DSN file describing the board to freerouting.
 
@@ -1082,7 +1114,7 @@ def pcb_to_dsn(
     parse = _prepare_parse(parse)
     components = _build_components(
         parse, switch_type, diode_type, stabilizer_type,
-        rgb=rgb, ground_pour=ground_pour,
+        rgb=rgb, ground_pour=ground_pour, mcu_type=mcu_type,
     )
 
     used_images = {c.image_name for c in components}
@@ -1100,7 +1132,8 @@ def pcb_to_dsn(
     if ground_pour:
         keepouts.extend(
             _stitching_via_keepouts(
-                parse, switch_type, diode_type, stabilizer_type, rgb=rgb
+                parse, switch_type, diode_type, stabilizer_type,
+                rgb=rgb, mcu_type=mcu_type,
             )
         )
 

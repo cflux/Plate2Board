@@ -26,6 +26,7 @@ import type {
   StabilizerType,
   SwitchDef,
   SwitchType,
+  McuType,
 } from './types'
 
 // Maps the live route-job status into a short label for the routed-zip
@@ -128,6 +129,7 @@ export function App() {
   const [stabilizerType, setStabilizerType] = useState<StabilizerType>('pcb_mount')
   const [groundPour, setGroundPour] = useState(true)
   const [rgb, setRgb] = useState(false)
+  const [mcuType, setMcuType] = useState<McuType>('pro_micro')
   const [inspectMode, setInspectMode] = useState<boolean>(false)
   const [editPlateMode, setEditPlateMode] = useState<boolean>(false)
   const [selectedOutlineNodeIdx, setSelectedOutlineNodeIdx] = useState<number | null>(null)
@@ -610,13 +612,13 @@ export function App() {
   }
 
   function downloadNetlist() {
-    return downloadFile('net', () => generateNetlist(result!.switches, rgb), 'net')
+    return downloadFile('net', () => generateNetlist(result!.switches, rgb, mcuType), 'net')
   }
 
   function downloadSchematic() {
     return downloadFile(
       'sch',
-      () => generateSchematic(result!.switches, switchType, diodeType, groundPour, rgb),
+      () => generateSchematic(result!.switches, switchType, diodeType, groundPour, rgb, mcuType),
       'kicad_sch',
     )
   }
@@ -624,7 +626,7 @@ export function App() {
   function downloadPcb() {
     return downloadFile(
       'pcb',
-      () => generatePcb(result!, switchType, diodeType, stabilizerType, groundPour, rgb),
+      () => generatePcb(result!, switchType, diodeType, stabilizerType, groundPour, rgb, mcuType),
       'kicad_pcb',
     )
   }
@@ -651,6 +653,7 @@ export function App() {
         stabilizerType,
         groundPour,
         rgb,
+        mcuType,
       )
       const url = URL.createObjectURL(blob)
       const a = document.createElement('a')
@@ -689,7 +692,7 @@ export function App() {
     const baseName = file.name.replace(/\.svg$/i, '') || 'keyboard'
     try {
       const job = await startRoutedProject(
-        result, baseName, switchType, diodeType, stabilizerType, groundPour, rgb,
+        result, baseName, switchType, diodeType, stabilizerType, groundPour, rgb, mcuType,
       )
       while (!token.cancelled) {
         await new Promise((r) => setTimeout(r, 500))
@@ -882,9 +885,40 @@ export function App() {
               Off
             </button>
           </div>
+          <div className="toolbar toolbar-strategy">
+            <span className="toolbar-label">MCU:</span>
+            <button
+              className={mcuType === 'pro_micro' ? 'active' : ''}
+              onClick={() => setMcuType('pro_micro')}
+              title="SparkFun Pro Micro (ATmega32U4), 24-pin — 18 usable GPIO. The default."
+            >
+              Pro Micro
+            </button>
+            <button
+              className={mcuType === 'xiao' ? 'active' : ''}
+              onClick={() => setMcuType('xiao')}
+              title="Seeed XIAO (RP2040 / SAMD21 / nRF52840 / ESP32), 14-pin through-hole — 11 GPIO. Sized for macro pads."
+            >
+              XIAO
+            </button>
+            <button
+              className={mcuType === 'xiao_smd' ? 'active' : ''}
+              onClick={() => setMcuType('xiao_smd')}
+              title="XIAO mounted by its castellated edge pads — solder the module flat onto the PCB (sandwich mount). Same 11 GPIO."
+            >
+              XIAO SMD
+            </button>
+            <button
+              className={mcuType === 'pico' ? 'active' : ''}
+              onClick={() => setMcuType('pico')}
+              title="Raspberry Pi Pico (RP2040), 40-pin — 26 GPIO. 3.3 V logic drives the SK6812 data line directly (standard QMK practice)."
+            >
+              Pico
+            </button>
+          </div>
           {result.mcu_placement && (
             <div className="toolbar toolbar-strategy">
-              <span className="toolbar-label">MCU (Pro Micro):</span>
+              <span className="toolbar-label">MCU position:</span>
               <label className="toolbar-input">
                 X
                 <NumberInput
@@ -1128,6 +1162,7 @@ export function App() {
             />
           )}
           <SvgPreview
+            mcuType={mcuType}
             file={file}
             result={result}
             selectedSwitchIds={selectedSwitchIds}

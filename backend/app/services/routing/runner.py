@@ -39,6 +39,7 @@ async def route_board(
     stabilizer_type: StabilizerType = "pcb_mount",
     ground_pour: bool = True,
     rgb: bool = False,
+    mcu_type: str = "pro_micro",
     progress_cb: Optional[ProgressCB] = None,
     timeout_s: float | None = None,
 ) -> RouteResult:
@@ -58,6 +59,7 @@ async def route_board(
             via_costs=via_costs,
             ground_pour=ground_pour,
             rgb=rgb,
+            mcu_type=mcu_type,
         )
         try:
             result = await client.route(

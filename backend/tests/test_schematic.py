@@ -481,3 +481,25 @@ def test_rgb_schematic_has_led_chain_and_grid_targets() -> None:
         ), f"LED for col {c} not at grid target ({x}, {y})"
     off = generate_schematic(sws)
     assert "SK6812MINI-E" not in off
+
+
+@pytest.mark.parametrize(
+    "mcu_type,symbol",
+    [
+        ("xiao", "Keyboard_MCU:XIAO"),
+        ("xiao_smd", "Keyboard_MCU:XIAO"),
+        ("pico", "Keyboard_MCU:RaspberryPi_Pico"),
+    ],
+)
+def test_schematic_mcu_symbol_per_profile(mcu_type, symbol) -> None:
+    sws = [_sw(i + 1, 0, i) for i in range(3)]
+    text = generate_schematic(sws, mcu_type=mcu_type)
+    assert f'(lib_id "{symbol}")' in text
+    assert text.count("(") == text.count(")")
+
+
+def test_schematic_xiao_gpio_budget_error() -> None:
+    # 2 rows × 10 cols = 12 GPIO > XIAO's 11.
+    sws = [_sw(r * 10 + c + 1, r, c) for r in range(2) for c in range(10)]
+    with pytest.raises(ValueError, match="XIAO"):
+        generate_schematic(sws, mcu_type="xiao")

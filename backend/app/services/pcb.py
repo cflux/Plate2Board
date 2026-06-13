@@ -32,6 +32,7 @@ from ..models.schemas import (
     SwitchDef,
 )
 from .matrix import renumber_switches
+from .mcu import DEFAULT_MCU_TYPE, McuProfile, get_mcu_profile
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +41,9 @@ DIODE_OFFSET_MM = 5.5
 HEADER_GAP_MM = 12.0
 TRACE_WIDTH_MM = 0.25
 MCU_REF = "U1"
-MCU_FOOTPRINT = "keeb:Arduino_Pro_Micro"
+# Legacy alias — the Pro Micro profile is the default MCU. New code
+# should use `get_mcu_profile(mcu_type).footprint_name`.
+MCU_FOOTPRINT = get_mcu_profile(DEFAULT_MCU_TYPE).footprint_name
 
 # KiCad page sizes (landscape, mm). We pick the smallest one the board+grow
 # extents fit inside with a 20 mm margin so the title block + page border
@@ -53,11 +56,9 @@ PAPER_SIZES_MM: tuple[tuple[str, float, float], ...] = (
     ("A0", 1189.0, 841.0),
 )
 PAGE_MARGIN_MM = 20.0
-PRO_MICRO_GPIO_PINS = [
-    5, 6, 7, 8, 9, 10, 11, 12,
-    13, 14, 15, 16, 17, 18, 19, 20,
-    1, 2,
-]
+# Legacy aliases for the default (Pro Micro) profile — tests and the
+# parser default-placement math still reference them.
+PRO_MICRO_GPIO_PINS = list(get_mcu_profile(DEFAULT_MCU_TYPE).gpio_pins)
 
 SwitchType = Literal["soldered", "hotswap"]
 SWITCH_TYPES: tuple[SwitchType, ...] = ("soldered", "hotswap")
@@ -195,6 +196,7 @@ def generate_pcb(
     center_on_page: bool = True,
     ground_pour: bool = True,
     rgb: bool = False,
+    mcu_type: str = DEFAULT_MCU_TYPE,
 ) -> str:
     if switch_type not in SWITCH_TYPES:
         raise ValueError(
@@ -225,12 +227,13 @@ def generate_pcb(
     rows = sorted({s.row for s in switches})
     cols = sorted({s.col for s in switches})
 
+    mcu = get_mcu_profile(mcu_type)
     pins_needed = len(rows) + len(cols) + (1 if rgb else 0)
-    if pins_needed > len(PRO_MICRO_GPIO_PINS):
+    if pins_needed > len(mcu.gpio_pins):
         raise ValueError(
             f"matrix needs {pins_needed} GPIO pins"
-            f"{' (incl. 1 for the RGB chain)' if rgb else ''}, but Pro Micro "
-            f"only has {len(PRO_MICRO_GPIO_PINS)} available"
+            f"{' (incl. 1 for the RGB chain)' if rgb else ''}, but the "
+            f"{mcu.display} only has {len(mcu.gpio_pins)} available"
         )
 
     # Every pad must keep PAD_EDGE_SETBACK_MM of copper-to-edge clearance
@@ -253,6 +256,7 @@ def generate_pcb(
             diode_type=diode_type,
             stabilizer_type=stabilizer_type,
             rgb=rgb,
+            mcu_type=mcu_type,
         )
         if violations:
             shown = "; ".join(violations[:5])
@@ -283,6 +287,7 @@ def generate_pcb(
         diode_type=diode_type,
         stabilizer_type=stabilizer_type,
         rgb=rgb,
+        mcu_type=mcu_type,
     )
     ordered = sorted(switches, key=lambda s: s.id)
     for sw in ordered:
@@ -301,20 +306,20 @@ def generate_pcb(
             out.append(_rgb_cap_footprint(sw, nets))
 
     if switches:
-        # Pro Micro footprint is 2 × 12 thru-hole, 17.78 mm wide. Anchor at
-        # pin 1 (top-left of the module, which is the USB end on the
-        # physical Pro Micro). User-controlled placement via parse.mcu_placement;
-        # fall back to "off the right edge, vertically centered" for callers
-        # that didn't populate the field (older clients, raw tests).
+        # MCU module footprint anchored at pin 1 (the USB end).
+        # User-controlled placement via parse.mcu_placement; fall back to
+        # "off the right edge, vertically centered" for callers that
+        # didn't populate the field (older clients, raw tests).
         if parse.mcu_placement is not None:
             mcu_x = parse.mcu_placement.cx_mm
             mcu_y = parse.mcu_placement.cy_mm
             mcu_rot = parse.mcu_placement.rotation_deg
         else:
+            pin_span = max(y for _x, y in mcu.pins.values())
             mcu_x = parse.svg_width_mm + HEADER_GAP_MM
-            mcu_y = (parse.svg_height_mm - 11 * 2.54) / 2
+            mcu_y = (parse.svg_height_mm - pin_span) / 2
             mcu_rot = 0.0
-        out.append(_pro_micro_footprint(mcu_x, mcu_y, rows, cols, nets, mcu_rot))
+        out.append(_mcu_footprint(mcu, mcu_x, mcu_y, rows, cols, nets, mcu_rot))
 
     for switch, stabs in _pair_stabs_to_switches(switches, parse.stabilizers):
         if stabilizer_type == "pcb_mount":
@@ -342,6 +347,7 @@ def generate_pcb(
                 diode_type=diode_type,
                 stabilizer_type=stabilizer_type,
                 rgb=rgb,
+                mcu_type=mcu_type,
             )
         )
         out.extend(
@@ -712,8 +718,9 @@ _DIODE_PAD_CLEARANCE_MM = 0.2
 # --- Ground pour ------------------------------------------------------------
 
 GND_NET_NAME = "GND"
-# Physical Pro Micro ground pins: 3 + 4 (left side) and 23 (right side).
-MCU_GND_PINS = (3, 4, 23)
+# Legacy aliases for the default (Pro Micro) profile — per-MCU values
+# live in mcu.py and flow through the `mcu_type` parameters.
+MCU_GND_PINS = get_mcu_profile(DEFAULT_MCU_TYPE).gnd_pins
 # Stitching via geometry matches the Default netclass via (and
 # dsn.VIA_PAD_DIAMETER_MM / VIA_DRILL_DIAMETER_MM — dsn imports from us,
 # not vice versa, so the values are duplicated by convention).
@@ -731,9 +738,9 @@ ZONE_EDGE_INSET_MM = 0.3
 # --- Per-key RGB (SK6812 MINI-E, reverse-mount) -----------------------------
 
 VCC_NET_NAME = "VCC"
-# Pro Micro RAW pin — USB 5 V, feeds the LED chain at full brightness
-# without the regulator in the path.
-MCU_RAW_PIN = 24
+# Legacy alias: the default profile's USB-5V pin (Pro Micro RAW) — feeds
+# the LED chain at full brightness without the regulator in the path.
+MCU_RAW_PIN = get_mcu_profile(DEFAULT_MCU_TYPE).power_5v_pin
 RGB_DATA_NET_FMT = "RGB_DATA{}"
 # LED anchor in switch-local coords: south of the stem ("south-facing"),
 # clear of the 4 mm stem hole (cutout starts at y=3.2, stem ends at 2.0)
@@ -845,6 +852,7 @@ def _fixed_pad_obstacles(
     switches: list[SwitchDef],
     mcu_placement: McuPlacement | None,
     switch_type: SwitchType,
+    mcu: McuProfile | None = None,
 ) -> list[tuple[float, float, float, str]]:
     """All non-diode copper pads as world (x, y, bounding radius, net key).
     Net keys let same-net overlaps through (e.g. the designed soldered/SMD
@@ -856,25 +864,26 @@ def _fixed_pad_obstacles(
             key = f"COL{sw.col}" if role == "col" else f"LINK{sw.id}"
             out.append((x, y, r, key))
     if mcu_placement is not None:
+        if mcu is None:
+            mcu = get_mcu_profile(DEFAULT_MCU_TYPE)
         rows = sorted({s.row for s in switches})
         cols = sorted({s.col for s in switches})
         rot = math.radians(mcu_placement.rotation_deg)
         cos_r, sin_r = math.cos(rot), math.sin(rot)
         n_rows = len(rows)
         pin_net: dict[int, str] = {}
-        for i, pin in enumerate(PRO_MICRO_GPIO_PINS):
+        for i, pin in enumerate(mcu.gpio_pins):
             if i < n_rows:
                 pin_net[pin] = f"ROW{rows[i]}"
             elif i - n_rows < len(cols):
                 pin_net[pin] = f"COL{cols[i - n_rows]}"
-        for pin in range(1, 25):
-            if pin <= 12:
-                lx, ly = 0.0, (pin - 1) * 2.54
-            else:
-                lx, ly = 17.78, (24 - pin) * 2.54
+        for pin, (lx, ly) in sorted(mcu.pins.items()):
             x = mcu_placement.cx_mm + lx * cos_r - ly * sin_r
             y = mcu_placement.cy_mm + lx * sin_r + ly * cos_r
-            out.append((x, y, 0.85, pin_net.get(pin, f"{MCU_REF}-{pin}")))
+            out.append((
+                x, y, mcu.pad_obstacle_r_mm,
+                pin_net.get(pin, f"{MCU_REF}-{pin}"),
+            ))
     return out
 
 
@@ -902,6 +911,7 @@ def resolve_diode_placements(
     diode_type: DiodeType,
     stabilizer_type: StabilizerType,
     rgb: bool = False,
+    mcu_type: str = DEFAULT_MCU_TYPE,
 ) -> dict[int, DiodePlacement]:
     """Pick a conflict-free placement for every switch's diode.
 
@@ -921,7 +931,9 @@ def resolve_diode_placements(
     npths = _npth_obstacles(
         switches, stabilizers, mounting_holes, switch_type, stabilizer_type
     )
-    fixed_pads = _fixed_pad_obstacles(switches, mcu_placement, switch_type)
+    fixed_pads = _fixed_pad_obstacles(
+        switches, mcu_placement, switch_type, get_mcu_profile(mcu_type)
+    )
     if rgb:
         # The per-key LED cutout sits at (0, +4.7) switch-local — directly
         # under the THT diode's default anchor — so with RGB enabled most
@@ -993,6 +1005,7 @@ def compute_stitching_vias(
     diode_type: DiodeType,
     stabilizer_type: StabilizerType,
     rgb: bool = False,
+    mcu_type: str = DEFAULT_MCU_TYPE,
 ) -> list[tuple[float, float]]:
     """GND stitching via positions: a `STITCH_SPACING_MM` grid over the
     board, keeping `STITCH_EDGE_INSET_MM` inside the outline and clear of
@@ -1028,7 +1041,9 @@ def compute_stitching_vias(
     npths = _npth_obstacles(
         switches, stabilizers, mounting_holes, switch_type, stabilizer_type
     )
-    pads = _fixed_pad_obstacles(switches, mcu_placement, switch_type)
+    pads = _fixed_pad_obstacles(
+        switches, mcu_placement, switch_type, get_mcu_profile(mcu_type)
+    )
     if rgb:
         rgb_npths, rgb_pads = _rgb_obstacles(switches)
         npths = npths + rgb_npths
@@ -1036,7 +1051,7 @@ def compute_stitching_vias(
     placements = resolve_diode_placements(
         switches, stabilizers, mounting_holes, mcu_placement,
         switch_type=switch_type, diode_type=diode_type,
-        stabilizer_type=stabilizer_type, rgb=rgb,
+        stabilizer_type=stabilizer_type, rgb=rgb, mcu_type=mcu_type,
     )
     diode_pad_r = _DIODE_PAD_RADIUS[diode_type]
     for sw in switches:
@@ -1084,6 +1099,7 @@ def _gnd_stitching_vias(
     diode_type: DiodeType,
     stabilizer_type: StabilizerType,
     rgb: bool = False,
+    mcu_type: str = DEFAULT_MCU_TYPE,
 ) -> list[str]:
     """Emit `(via …)` tokens for every stitching position (format matches
     the routed-trace vias `ses._render_via` splices in)."""
@@ -1100,6 +1116,7 @@ def _gnd_stitching_vias(
         diode_type=diode_type,
         stabilizer_type=stabilizer_type,
         rgb=rgb,
+        mcu_type=mcu_type,
     )
     gnd = nets[GND_NET_NAME]
     return [
@@ -1426,6 +1443,7 @@ def validate_pad_setback(
     diode_type: DiodeType,
     stabilizer_type: StabilizerType,
     rgb: bool = False,
+    mcu_type: str = DEFAULT_MCU_TYPE,
 ) -> list[str]:
     """Return human-readable violations for every pad whose copper sits
     outside the PCB outline or closer than `PAD_EDGE_SETBACK_MM` to its
@@ -1451,7 +1469,7 @@ def validate_pad_setback(
     placements = resolve_diode_placements(
         switches, stabilizers, mounting_holes, mcu_placement,
         switch_type=switch_type, diode_type=diode_type,
-        stabilizer_type=stabilizer_type, rgb=rgb,
+        stabilizer_type=stabilizer_type, rgb=rgb, mcu_type=mcu_type,
     )
     d_r = _DIODE_PAD_RADIUS[diode_type]
     for sw in switches:
@@ -1461,16 +1479,13 @@ def validate_pad_setback(
         ):
             pads.append((f"D{sw.id}", x, y, d_r))
     if mcu_placement is not None:
+        mcu = get_mcu_profile(mcu_type)
         rot = math.radians(mcu_placement.rotation_deg)
         cos_r, sin_r = math.cos(rot), math.sin(rot)
-        for pin in range(1, 25):
-            if pin <= 12:
-                lx, ly = 0.0, (pin - 1) * 2.54
-            else:
-                lx, ly = 17.78, (24 - pin) * 2.54
+        for pin, (lx, ly) in sorted(mcu.pins.items()):
             x = mcu_placement.cx_mm + lx * cos_r - ly * sin_r
             y = mcu_placement.cy_mm + lx * sin_r + ly * cos_r
-            pads.append((f"{MCU_REF} pin {pin}", x, y, 0.85))
+            pads.append((f"{MCU_REF} pin {pin}", x, y, mcu.pad_obstacle_r_mm))
     if rgb:
         for sw in switches:
             ax, ay, lrot = _rgb_led_anchor(sw)
@@ -1614,24 +1629,28 @@ def _diode_footprint_smd(
     )
 
 
-def _pro_micro_pin_to_net(
-    pin: int, rows: list[int], cols: list[int], nets: dict[str, int]
+def _mcu_pin_to_net(
+    mcu: McuProfile,
+    pin: int,
+    rows: list[int],
+    cols: list[int],
+    nets: dict[str, int],
 ) -> tuple[int, str] | None:
-    """Map a Pro Micro pin number to its (net_code, net_name).
+    """Map an MCU physical pin number to its (net_code, net_name).
 
     Pin assignment matches the schematic: rows first, then cols, mapped
-    onto PRO_MICRO_GPIO_PINS in order; with RGB enabled the next free
-    GPIO after the matrix drives the LED chain (RGB_DATA0) and RAW
-    (pin 24) feeds the LED supply (VCC). The GND pins (3, 4, 23) join
-    the GND net when it exists; VCC-the-regulated-rail (21) and RST (22)
-    are left unconnected — wire those manually if needed.
+    onto the profile's `gpio_pins` in order; with RGB enabled the next
+    free GPIO after the matrix drives the LED chain (RGB_DATA0) and the
+    profile's USB-5V pin feeds the LED supply (VCC). The GND pins join
+    the GND net when it exists; every other pin (regulated rails, RST,
+    RUN, …) is left unconnected — wire those manually if needed.
     """
-    if pin in MCU_GND_PINS and GND_NET_NAME in nets:
+    if pin in mcu.gnd_pins and GND_NET_NAME in nets:
         return (nets[GND_NET_NAME], GND_NET_NAME)
-    if pin == MCU_RAW_PIN and VCC_NET_NAME in nets:
+    if pin == mcu.power_5v_pin and VCC_NET_NAME in nets:
         return (nets[VCC_NET_NAME], VCC_NET_NAME)
     n_rows = len(rows)
-    for i, p in enumerate(PRO_MICRO_GPIO_PINS):
+    for i, p in enumerate(mcu.gpio_pins):
         if p != pin:
             continue
         if i < n_rows:
@@ -1651,7 +1670,8 @@ def _pro_micro_pin_to_net(
     return None
 
 
-def _pro_micro_footprint(
+def _mcu_footprint(
+    mcu: McuProfile,
     cx_mm: float,
     cy_mm: float,
     rows: list[int],
@@ -1659,54 +1679,82 @@ def _pro_micro_footprint(
     nets: dict[str, int],
     rotation_deg: float = 0.0,
 ) -> str:
-    """Inline Pro Micro footprint — 24 thru-hole pads in a 2 × 12 grid at
-    2.54 mm pitch and 17.78 mm row spacing. Anchor at pin 1 (top-left in
-    local frame, which is the USB end on the physical Pro Micro).
-    Pins 1–12 down the left side; pins 13–24 up the right side (matching
-    the physical board's pin numbering). `rotation_deg` is in SVG
-    convention (CW positive); we negate to KiCad's CCW convention via
-    `_kicad_angle` so the rendered footprint matches the plate."""
+    """Inline MCU module footprint driven by the profile's pin table.
+    Anchor is pin 1 (the USB end of the physical module). `rotation_deg`
+    is in SVG convention (CW positive); we negate to KiCad's CCW
+    convention via `_kicad_angle` so the rendered footprint matches the
+    plate. TH profiles emit oval pads (pin 1 rect); the XIAO SMD profile
+    emits F.Cu rect pads at the castellations instead."""
     fp_uuid = _u()
     pad_lines: list[str] = []
-    for pin in range(1, 25):
-        if pin <= 12:
-            x = 0.0
-            y = (pin - 1) * 2.54
-        else:
-            x = 17.78
-            y = (24 - pin) * 2.54
-        net_assignment = _pro_micro_pin_to_net(pin, rows, cols, nets)
+    w, h = mcu.pad_size
+    for pin in sorted(mcu.pins):
+        x, y = mcu.pins[pin]
+        net_assignment = _mcu_pin_to_net(mcu, pin, rows, cols, nets)
         net_attr = ""
         if net_assignment is not None:
             net_code, net_name = net_assignment
             net_attr = f' (net {net_code} "{net_name}")'
-        shape = "rect" if pin == 1 else "oval"
-        pad_lines.append(
-            f'\t\t(pad "{pin}" thru_hole {shape} (at {x:.4f} {y:.4f}) '
-            f'(size 1.7 1.7) (drill 1) (layers "*.Cu" "*.Mask")'
-            f'{net_attr} (uuid "{_u()}"))'
-        )
+        if mcu.drill_mm is None:
+            pad_lines.append(
+                f'\t\t(pad "{pin}" smd rect (at {x:.4f} {y:.4f}) '
+                f'(size {w:g} {h:g}) (layers "F.Cu" "F.Paste" "F.Mask")'
+                f'{net_attr} (uuid "{_u()}"))'
+            )
+        else:
+            shape = "rect" if pin == 1 else "oval"
+            pad_lines.append(
+                f'\t\t(pad "{pin}" thru_hole {shape} (at {x:.4f} {y:.4f}) '
+                f'(size {w:g} {h:g}) (drill {mcu.drill_mm:g}) '
+                f'(layers "*.Cu" "*.Mask")'
+                f'{net_attr} (uuid "{_u()}"))'
+            )
 
+    # Body outline on F.Fab + a USB-end marker on F.SilkS (short bar at
+    # the pin-1 edge) so orientation is obvious on the board.
+    bx, by, bw, bh = mcu.body
+    fab = (
+        f"\t\t(fp_line (start {bx:g} {by:g}) (end {bx + bw:g} {by:g}) "
+        f'(stroke (width 0.1) (type solid)) (layer "F.Fab") (uuid "{_u()}"))\n'
+        f"\t\t(fp_line (start {bx + bw:g} {by:g}) (end {bx + bw:g} {by + bh:g}) "
+        f'(stroke (width 0.1) (type solid)) (layer "F.Fab") (uuid "{_u()}"))\n'
+        f"\t\t(fp_line (start {bx + bw:g} {by + bh:g}) (end {bx:g} {by + bh:g}) "
+        f'(stroke (width 0.1) (type solid)) (layer "F.Fab") (uuid "{_u()}"))\n'
+        f"\t\t(fp_line (start {bx:g} {by + bh:g}) (end {bx:g} {by:g}) "
+        f'(stroke (width 0.1) (type solid)) (layer "F.Fab") (uuid "{_u()}"))\n'
+    )
+    usb_w = bw * 0.3
+    usb_x0 = bx + (bw - usb_w) / 2
+    silk = (
+        f"\t\t(fp_line (start {usb_x0:.4f} {by:g}) "
+        f"(end {usb_x0 + usb_w:.4f} {by:g}) "
+        f'(stroke (width 0.3) (type solid)) (layer "F.SilkS") (uuid "{_u()}"))\n'
+    )
+
+    pin_span_x = max(x for x, _y in mcu.pins.values())
+    pin_span_y = max(y for _x, y in mcu.pins.values())
     rot = _kicad_angle(rotation_deg)
     return (
-        f'\t(footprint "{MCU_FOOTPRINT}"\n'
+        f'\t(footprint "{mcu.footprint_name}"\n'
         f'\t\t(layer "F.Cu")\n'
         f'\t\t(uuid "{fp_uuid}")\n'
         f"\t\t(at {cx_mm:.4f} {cy_mm:.4f} {rot:.3f})\n"
-        f'\t\t(descr "SparkFun Pro Micro - ATmega32U4 module, 24-pin DIP-style")\n'
-        f'\t\t(tags "Pro Micro Arduino ATmega32U4")\n'
-        f"\t\t(attr through_hole)\n"
-        # Anchor is pin 1 (a corner), so stack the labels around the body
-        # center (8.89, 13.97) — between the two pin rows — instead of the
-        # anchor, where they'd hang above the module and usually off-board.
+        f'\t\t(descr "{mcu.descr}")\n'
+        f'\t\t(tags "{mcu.tags}")\n'
+        f"\t\t(attr {'smd' if mcu.drill_mm is None else 'through_hole'})\n"
+        # Anchor is pin 1 (a corner), so stack the labels around the pin
+        # field's center instead of the anchor, where they would hang
+        # above the module and usually off-board.
         + _common_props(
             MCU_REF,
-            "ProMicro",
-            MCU_FOOTPRINT,
+            mcu.value,
+            mcu.footprint_name,
             rot,
             text_offset_y=1.5,
-            text_center=(17.78 / 2, 11 * 2.54 / 2),
+            text_center=(pin_span_x / 2, pin_span_y / 2),
         )
+        + fab
+        + silk
         + "\n".join(pad_lines)
         + "\n\t)"
     )
