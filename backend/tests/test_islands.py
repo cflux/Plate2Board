@@ -11,7 +11,7 @@ from __future__ import annotations
 import re
 
 from app.services.routing.islands import (
-    reconnect_islands, _pads, _cutouts, _parse_sexp,
+    reconnect_islands, _pads, _cutouts, _parse_sexp, _fill_regions,
 )
 
 
@@ -168,6 +168,26 @@ def test_fully_fenced_warns():
     assert "GND" in warnings[0]
     assert _via_count(out) == _via_count(board)
     assert _seg_count(out) == _seg_count(board)
+
+
+def test_fill_severs_subthickness_necks():
+    """KiCad won't flood copper thinner than min_thickness (0.25 mm), so two
+    blobs joined only by a hairline neck are really two islands. _fill_regions
+    must match: split on a 0.1 mm neck, stay whole on a 0.4 mm one."""
+    from shapely.geometry import Polygon
+
+    def dumbbell(neck_w):
+        h = neck_w / 2
+        return Polygon([
+            (0, 0), (10, 0), (10, 10), (0, 10), (0, 0),      # left box (closed)
+        ]).union(Polygon([
+            (20, 0), (30, 0), (30, 10), (20, 10),            # right box
+        ])).union(Polygon([
+            (10, 5 - h), (20, 5 - h), (20, 5 + h), (10, 5 + h),  # neck
+        ]))
+
+    assert len(_fill_regions(dumbbell(0.1), None, None)) == 2  # severed
+    assert len(_fill_regions(dumbbell(0.4), None, None)) == 1  # stays joined
 
 
 def test_no_zones_is_noop():

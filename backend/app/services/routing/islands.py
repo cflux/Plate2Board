@@ -49,6 +49,10 @@ TOUCH_TOL_MM = 0.5 + 0.05
 JUMPER_WIDTH_MM = POWER_TRACK_WIDTH_MM
 MAX_JUMPER_LEN_MM = 20.0
 MIN_REGION_AREA_MM2 = 0.05
+# KiCad won't flood copper thinner than the zone min_thickness (0.25 mm in
+# _pour_zone); half that is the opening radius that severs sub-min_thickness
+# necks so the approximate fill fragments the same way the real fill does.
+_FILL_OPEN_MM = 0.25 / 2
 MAX_PASSES = 3
 VIA_R = STITCH_VIA_SIZE_MM / 2.0
 # A bridge/jumper targets a point inside the anchor fill region; that
@@ -234,6 +238,14 @@ def _fill_regions(zone_poly, foreign, cutouts):
     if cutouts is not None:
         g = g.difference(cutouts)
     g = g.buffer(0)
+    # Sever necks thinner than KiCad's zone min_thickness: it won't flood a
+    # hairline, so two blobs joined only by one are really separate islands.
+    # A morphological opening (erode then dilate by half the min thickness)
+    # drops sub-min_thickness connections without shrinking the regions, so
+    # our fragmentation matches the real fill (we'd otherwise believe copper
+    # flows where it doesn't and skip a needed stitch).
+    opened = g.buffer(-_FILL_OPEN_MM, join_style=2).buffer(_FILL_OPEN_MM, join_style=2)
+    g = opened.buffer(0)
     regions = list(g.geoms) if g.geom_type == "MultiPolygon" else [g]
     return [r for r in regions if not r.is_empty and r.area >= MIN_REGION_AREA_MM2]
 
