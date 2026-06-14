@@ -57,6 +57,10 @@ VIA_R = STITCH_VIA_SIZE_MM / 2.0
 # the target this far inside the boundary so the via clears the edge (and any
 # foreign copper the region was carved around).
 TARGET_INSET_MM = VIA_R + CLEARANCE_MM
+# When the nearest island→plane crossing is blocked on the bridge layer, try
+# this many points sampled around the island boundary — a clear crossing
+# usually sits a few mm along the fence from the nearest one.
+_BRIDGE_SAMPLES = 24
 
 
 # ---------------------------------------------------------------------------
@@ -428,7 +432,7 @@ def _reconnect(pcb_text: str) -> tuple[str, list[str]]:
                 healed = _heal(
                     x, y, plyrs, layers, regions, uf, anchor,
                     pad_radius=r, foreign_by_layer=foreign_by_layer,
-                    cutouts=cutouts,
+                    cutouts=cutouts, pad_component=uf.find(("pad", i)),
                 )
                 if healed is None:
                     # Don't warn here — a pad we can't heal this pass may be
@@ -446,7 +450,8 @@ def _reconnect(pcb_text: str) -> tuple[str, list[str]]:
                         (lx1, ly1), (lx2, ly2) = path[k], path[k + 1]
                         added_segs.append(Segment(layer, JUMPER_WIDTH_MM,
                                                   lx1, ly1, lx2, ly2, net_code, net_name))
-                else:  # bridge: via — other-layer poly-line — via
+                else:  # bridge: a via at each end (each crosses from the pour
+                    # layer to the trace layer) joined by a trace on `other`.
                     path, other = payload
                     px, py = path[0]
                     qx, qy = path[-1]
@@ -551,69 +556,78 @@ def _find_path(start, target, layer, *, foreign_by_layer, cutouts):
 
 
 def _heal(x, y, pad_layers, pour_layers, regions, uf, anchor, *,
-          pad_radius, foreign_by_layer, cutouts):
+          pad_radius, foreign_by_layer, cutouts, pad_component):
     """Return ("via", (x,y)) | ("jumper", (points, layer))
-    | ("bridge", (points, other_layer)) | None."""
-    from shapely.geometry import LineString, Point
+    | ("bridge", (points, other_layer)) | None.
+
+    Heals the pad's stranded ISLAND on a pour layer to the anchor plane on the
+    same pour layer. Working region→region (not from the pad point) matters:
+    a VCC pad physically sits on B.Cu but VCC only pours on F.Cu (it reaches
+    the plane via a via-in-pad), so the break to repair is on F.Cu, and the
+    pad itself is boxed in by its LED's other B.Cu pads. We bridge between a
+    clear point in the island and the plane, straddling the fence trace, over
+    the other (clearer) layer."""
     from shapely.ops import nearest_points
+    from shapely.geometry import Point
 
     pt = Point(x, y)
-    # (a) cross-layer via: an anchor-connected region on a same-net layer
-    # overlaps near the pad (the pad's THT copper bridges to it). Only
-    # possible when the net pours on ≥2 layers (non-RGB GND-both-layers);
-    # for the RGB split planes the other layer is the other net, so this
-    # never fires.
+    # (a) cross-layer via: the pad's copper already reaches an anchor region
+    # on a *second* pour layer (net pours on ≥2 layers — non-RGB GND on both).
     if len(pour_layers) >= 2:
         for layer in pour_layers:
-            for ri, reg in enumerate(regions[layer]):
+            for ri, reg in enumerate(regions.get(layer, [])):
                 if uf.find(("r", layer, ri)) == anchor and \
                         reg.distance(pt) <= pad_radius + TOUCH_TOL_MM:
                     return ("via", (x, y))
-    # Nearest anchor-connected region on a layer the pad is on → (q, layer).
-    # `q` is pulled TARGET_INSET_MM inside the region so a via dropped there
-    # never lands on the region boundary (hence never on the board edge).
-    def _nearest_anchor(layer):
-        best = None
-        for ri, reg in enumerate(regions.get(layer, [])):
-            if uf.find(("r", layer, ri)) != anchor:
-                continue
-            inner = reg.buffer(-TARGET_INSET_MM)
-            q = reg.representative_point() if inner.is_empty \
-                else nearest_points(inner, pt)[0]
-            d = pt.distance(q)
-            if best is None or d < best[0]:
-                best = (d, (q.x, q.y))
-        return best
 
-    # (b) same-layer jumper: a clear (straight or L-shaped) corridor on the
-    # pad's own layer.
-    for layer in pad_layers:
-        if layer not in regions:
-            continue
-        near = _nearest_anchor(layer)
-        if not near or near[0] > MAX_JUMPER_LEN_MM:
-            continue
-        path = _find_path((x, y), near[1], layer,
-                          foreign_by_layer=foreign_by_layer, cutouts=cutouts)
-        if path is not None:
-            return ("jumper", (path, layer))
+    from shapely.ops import unary_union
 
-    # (c) via-pair bridge: hop to the OTHER layer, run a short same-net
-    # trace OVER the fence (the other layer's pour just retreats around
-    # it), hop back into the anchor plane. The other layer is usually far
-    # less congested in the dense centre, and a trace over a fence beats a
-    # corridor through it. Reuse the same clearance test on the other
-    # layer's foreign copper (its pour isn't an obstacle — only its
-    # signals/vias/pads are, which `_foreign_union` already captures).
-    for layer in pad_layers:
-        if layer not in regions:
+    def _inset(reg):
+        inner = reg.buffer(-TARGET_INSET_MM)
+        return reg if inner.is_empty else inner
+
+    def _candidates(src_geom, anc_geom):
+        """(dist, s, t) crossing candidates from the source island to the
+        plane: the globally-nearest pair plus points sampled around the
+        source boundary — the nearest gap is often blocked on the bridge
+        layer while a spot a few mm along it is clear."""
+        out = []
+        s0, t0 = nearest_points(src_geom, anc_geom)
+        out.append((s0.distance(t0), (s0.x, s0.y), (t0.x, t0.y)))
+        boundary = src_geom.boundary
+        if not boundary.is_empty and boundary.length > 0:
+            n = _BRIDGE_SAMPLES
+            for k in range(n):
+                sp = boundary.interpolate(k / n, normalized=True)
+                tp = nearest_points(anc_geom, sp)[0]
+                out.append((sp.distance(tp), (sp.x, sp.y), (tp.x, tp.y)))
+        return sorted(c for c in out if c[0] <= MAX_JUMPER_LEN_MM)
+
+    for al in regions:  # each pour layer that has fill regions
+        # Source = the pad's own stranded island(s) on this layer; anchor =
+        # the plane. Insetting keeps the via copper off the region boundary
+        # (and so off the board edge). Fall back to the pad point when the pad
+        # touches no region on this layer (e.g. a pad just outside the pour).
+        src = [_inset(reg) for ri, reg in enumerate(regions[al])
+               if uf.find(("r", al, ri)) == pad_component]
+        anc = [_inset(reg) for ri, reg in enumerate(regions[al])
+               if uf.find(("r", al, ri)) == anchor]
+        if not anc:
             continue
-        near = _nearest_anchor(layer)
-        if not near or near[0] > MAX_JUMPER_LEN_MM:
-            continue
-        other = "F.Cu" if layer == "B.Cu" else "B.Cu"
-        path = _find_path((x, y), near[1], other,
-                          foreign_by_layer=foreign_by_layer, cutouts=cutouts)
-        if path is not None:
-            return ("bridge", (path, other))
+        anc_geom = unary_union(anc)
+        src_geom = unary_union(src) if src else pt
+        other = "F.Cu" if al == "B.Cu" else "B.Cu"
+        for _d, s, t in _candidates(src_geom, anc_geom):
+            # (b) same-layer jumper: a clear thermal gap (not a fence) on `al`.
+            # Rare between two fill regions, but free of a via when it fits.
+            path = _find_path(s, t, al, foreign_by_layer=foreign_by_layer,
+                              cutouts=cutouts)
+            if path is not None:
+                return ("jumper", (path, al))
+            # (c) via-pair bridge: trace on the OTHER layer over the fence, a
+            # via at each end crossing back into the pour layer `al`.
+            path = _find_path(s, t, other, foreign_by_layer=foreign_by_layer,
+                              cutouts=cutouts)
+            if path is not None:
+                return ("bridge", (path, other))
     return None

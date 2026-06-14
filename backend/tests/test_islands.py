@@ -52,6 +52,11 @@ def _seg(x1, y1, x2, y2, layer, net, width=1.0):
             f'(layer "{layer}") (net {net}) (uuid "s"))')
 
 
+def _via(x, y, net):
+    return (f'  (via (at {x} {y}) (size 0.6) (drill 0.3) '
+            f'(layers "F.Cu" "B.Cu") (net {net}) (uuid "v"))')
+
+
 def _board(*parts):
     return "(kicad_pcb\n" + "\n".join(parts) + "\n)\n"
 
@@ -121,6 +126,31 @@ def test_bridge_via_kept_off_board_edge():
     # The pour's right edge (≈ the board edge) is x=40; no via may sit on it.
     on_edge = [v for v in vias if 39.5 < v[0] < 40.5]
     assert not on_edge, f"via dropped on the board edge: {on_edge}"
+
+
+def test_vcc_split_plane_pad_on_other_layer_heals():
+    """RGB split planes: VCC pours on F.Cu, but the VCC pad physically sits on
+    B.Cu and reaches the plane via a via-in-pad. A single F.Cu trace fences the
+    pad's via off the main VCC plane; B.Cu is clear. The doctor must bridge
+    over B.Cu (one new far via + a trace), not give up because the pad's layer
+    isn't a pour layer."""
+    board = _board(
+        _zone(77, "VCC", "F.Cu", 0, 0, 60, 40),
+        # MCU VCC pad anchors the main (left) F.Cu plane.
+        _fp("U1", 10, 20, [_pad(1, 0, 0, '"F.Cu"', net=77, name="VCC")]),
+        # LED VCC pad lives on B.Cu, tied up to F.Cu by its via-in-pad.
+        _fp("LED1", 45, 20, [_pad(1, 0, 0, '"B.Cu"', net=77, name="VCC")]),
+        _via(45, 20, 77),
+        _seg(30, -5, 30, 45, "F.Cu", 2),  # the ONE F.Cu trace fencing it off
+    )
+    out, warnings = reconnect_islands(board)
+    assert warnings == [], warnings
+    # Two vias (one in the island, one in the plane) joined by a B.Cu trace
+    # over the F.Cu fence — exactly "2 vias and a straight trace".
+    assert _via_count(out) - _via_count(board) == 2
+    assert _seg_count(out) - _seg_count(board) >= 1
+    # The repair trace runs on B.Cu (over the F.Cu fence).
+    assert re.search(r'\(segment[^\n]*\(layer "B\.Cu"\)[^\n]*\(net 77\)', out)
 
 
 def test_fully_fenced_warns():
