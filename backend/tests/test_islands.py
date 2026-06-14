@@ -103,6 +103,26 @@ def test_bridge_over_other_layer():
     assert '(layer "F.Cu")' in out  # the bridge trace runs over F.Cu
 
 
+def test_bridge_via_kept_off_board_edge():
+    """The stranded pad sits just outside the pour, past its right edge; a
+    foreign B wall blocks a same-layer jumper so the heal must bridge. The
+    bridge's far via must be pulled INSIDE the pour boundary (which follows
+    the board edge) — never dropped on it."""
+    board = _board(
+        _zone(1, "GND", "B.Cu", 0, 0, 40, 40),
+        _fp("U1", 20, 20, [_pad(1, 0, 0, '"B.Cu"', net=1, name="GND")]),
+        _fp("D1", 45, 20, [_pad(1, 0, 0, '"B.Cu"', net=1, name="GND")]),
+        _seg(42, -5, 42, 45, "B.Cu", 2),  # blocks a straight B jumper
+    )
+    out, warnings = reconnect_islands(board)
+    vias = [(float(a), float(b))
+            for a, b in re.findall(r"\(via \(at ([-\d.]+) ([-\d.]+)\)", out)]
+    assert vias, "expected a via-pair bridge"
+    # The pour's right edge (≈ the board edge) is x=40; no via may sit on it.
+    on_edge = [v for v in vias if 39.5 < v[0] < 40.5]
+    assert not on_edge, f"via dropped on the board edge: {on_edge}"
+
+
 def test_fully_fenced_warns():
     """Both layers walled at the same place: nothing can heal → one
     warning, no copper added."""

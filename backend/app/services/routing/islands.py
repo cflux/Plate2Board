@@ -51,6 +51,12 @@ MAX_JUMPER_LEN_MM = 20.0
 MIN_REGION_AREA_MM2 = 0.05
 MAX_PASSES = 3
 VIA_R = STITCH_VIA_SIZE_MM / 2.0
+# A bridge/jumper targets a point inside the anchor fill region; that
+# region's boundary follows the (already 0.3 mm edge-inset) pour outline, so
+# a target right on the boundary puts a via's copper at the board edge. Pull
+# the target this far inside the boundary so the via clears the edge (and any
+# foreign copper the region was carved around).
+TARGET_INSET_MM = VIA_R + CLEARANCE_MM
 
 
 # ---------------------------------------------------------------------------
@@ -549,6 +555,7 @@ def _heal(x, y, pad_layers, pour_layers, regions, uf, anchor, *,
     """Return ("via", (x,y)) | ("jumper", (points, layer))
     | ("bridge", (points, other_layer)) | None."""
     from shapely.geometry import LineString, Point
+    from shapely.ops import nearest_points
 
     pt = Point(x, y)
     # (a) cross-layer via: an anchor-connected region on a same-net layer
@@ -563,13 +570,17 @@ def _heal(x, y, pad_layers, pour_layers, regions, uf, anchor, *,
                         reg.distance(pt) <= pad_radius + TOUCH_TOL_MM:
                     return ("via", (x, y))
     # Nearest anchor-connected region on a layer the pad is on → (q, layer).
+    # `q` is pulled TARGET_INSET_MM inside the region so a via dropped there
+    # never lands on the region boundary (hence never on the board edge).
     def _nearest_anchor(layer):
         best = None
         for ri, reg in enumerate(regions.get(layer, [])):
             if uf.find(("r", layer, ri)) != anchor:
                 continue
-            q = reg.exterior.interpolate(reg.exterior.project(pt))
-            d = pt.distance(Point(q.x, q.y))
+            inner = reg.buffer(-TARGET_INSET_MM)
+            q = reg.representative_point() if inner.is_empty \
+                else nearest_points(inner, pt)[0]
+            d = pt.distance(q)
             if best is None or d < best[0]:
                 best = (d, (q.x, q.y))
         return best
